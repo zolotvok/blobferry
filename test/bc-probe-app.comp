@@ -1,0 +1,9 @@
+#version 450
+// bc-probe's "app" compute shader: writes its push-constant value to the push-constant address. Used to check that
+// the compat layer restores the app's compute pipeline and push constants after a BC decode. [Claude Opus 5.5]
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430) buffer Out { uint v; };
+layout(push_constant) uniform P { uint64_t addr; uint value; } p;
+void main() { Out(p.addr).v = p.value; }

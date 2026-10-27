@@ -1,0 +1,455 @@
+Blobferry changes to the Arm vulkan-wsi-layer (gitlab.freedesktop.org/mesa/vulkan-wsi-layer, MIT).
+Base: upstream commit f5148d4 ("Merge 'Fix present-stage timestamp calibration' into 'main'"), pinned as the
+third_party/vulkan-wsi-layer submodule. build-wsi.sh applies this patch when it is not applied yet.
+
+- Works with gamescope's Wayland and the vendor Mali driver: explicit sync is optional (used when the compositor
+  offers zwp_linux_explicit_synchronization_v1), missing WSI device extensions are a warning instead of an error,
+  xlib/xcb are left to other layers (only win32 stays unsupported here).
+- dma_buf_heaps allocator: falls back to a read-only open of /dev/dma_heap/<heap> when read-write is denied.
+- CMake: WAYLAND_PROTOCOLS_DIR can be given instead of found through pkg-config (cross builds).
+- Acquire with timeout UINT64_MAX waits again instead of returning VK_TIMEOUT/VK_NOT_READY (vkd3d-proton asserts
+  on those); a sticky error from the page-flip thread is no longer reported to the app as success; a present whose
+  GPU work takes over 2 s is logged (after 2, 10, 60 s, then every 5 min) instead of hanging silently.
+- MALI_WSI_NO_10BIT=1 hides the 10-bit surface formats.
+- MALI_WSI_PROBE_PIXELS=1 (debug) logs pixel samples of the first presented images.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b43b1ad..8f7c824 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -176,8 +176,10 @@ if(BUILD_WSI_WAYLAND)
+    find_program(WAYLAND_SCANNER_EXEC wayland-scanner REQUIRED)
+    message(STATUS "Using wayland-scanner : ${WAYLAND_SCANNER_EXEC}")
+ 
+-   pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
+-   pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
++   if(NOT DEFINED WAYLAND_PROTOCOLS_DIR)
++      pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
++      pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
++   endif()
+    message(STATUS "Using wayland protocols dir : ${WAYLAND_PROTOCOLS_DIR}")
+ 
+    add_custom_target(wayland_generated_files
+diff --git a/util/wsialloc/wsialloc_dma_buf_heaps.c b/util/wsialloc/wsialloc_dma_buf_heaps.c
+index 5339166..cfa86ff 100644
+--- a/util/wsialloc/wsialloc_dma_buf_heaps.c
++++ b/util/wsialloc/wsialloc_dma_buf_heaps.c
+@@ -121,6 +121,10 @@ wsialloc_error wsialloc_new(wsialloc_allocator **allocator)
+    }
+ 
+    dma_buf_heaps->memory_fd = open("/dev/dma_heap/" STR(WSIALLOC_MEMORY_HEAP_NAME), O_RDWR);
++   if (dma_buf_heaps->memory_fd < 0 && (errno == EACCES || errno == EPERM))
++   {
++      dma_buf_heaps->memory_fd = open("/dev/dma_heap/" STR(WSIALLOC_MEMORY_HEAP_NAME), O_RDONLY);
++   }
+    dma_buf_heaps->protected_fd = -1;
+ 
+    if (dma_buf_heaps->memory_fd < 0)
+diff --git a/wsi/swapchain_base.cpp b/wsi/swapchain_base.cpp
+index 32440ea..ca177c9 100644
+--- a/wsi/swapchain_base.cpp
++++ b/wsi/swapchain_base.cpp
+@@ -37,6 +37,8 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <system_error>
++#include <chrono>
++#include <thread>
+ 
+ #include <unistd.h>
+ #include <vulkan/vulkan.h>
+@@ -63,7 +65,6 @@ void swapchain_base::page_flip_thread()
+ {
+    auto &sc_images = m_swapchain_images;
+    VkResult vk_res = VK_SUCCESS;
+-   uint64_t timeout = UINT64_MAX;
+    constexpr uint64_t SEMAPHORE_TIMEOUT = 250000000; /* 250 ms. */
+ 
+    /* No mutex is needed for the accesses to m_page_flip_thread_run variable as after the variable is
+@@ -100,13 +101,29 @@ void swapchain_base::page_flip_thread()
+          submit_info = *pending_submission;
+       }
+ 
+-      /* We may need to wait for the payload of the present sync of the oldest pending image to be finished. */
+-      while ((vk_res = sc_images[submit_info.image_index].wait_present(timeout)) == VK_TIMEOUT)
++      /* We may need to wait for the payload of the present sync of the oldest pending image to be finished.
++       * DroidDeck/Mali bridge [Claude Opus 5.5] 2026-10-27 (Review 10): wait in 2 s steps and report a frame whose GPU
++       * work takes longer at the default log level (after 2, 10, 60 s, then every 5 min, and when it finishes). A GPU
++       * hang otherwise shows only as 0 FPS: the page-flip thread waited here forever without a word. */
++      uint64_t present_wait_s = 0;
++      while ((vk_res = sc_images[submit_info.image_index].wait_present(2000000000ull)) == VK_TIMEOUT)
+       {
+-         WSI_LOG_WARNING("Timeout waiting for image's present fences, retrying..");
++         present_wait_s += 2;
++         if (present_wait_s == 2 || present_wait_s == 10 || present_wait_s == 60 || present_wait_s % 300 == 0)
++         {
++            WSI_LOG_ERROR("mali-wsi: present fence of image %u not signalled after %llu s (GPU work not finished)",
++                          submit_info.image_index, static_cast<unsigned long long>(present_wait_s));
++         }
++      }
++      if (present_wait_s > 0)
++      {
++         WSI_LOG_ERROR("mali-wsi: present fence of image %u finished after ~%llu s, result %d", submit_info.image_index,
++                       static_cast<unsigned long long>(present_wait_s), static_cast<int>(vk_res));
+       }
+       if (vk_res != VK_SUCCESS)
+       {
++         WSI_LOG_ERROR("mali-wsi: waiting for the present fence failed (%d); the swapchain is now in error state",
++                       static_cast<int>(vk_res));
+          set_error_state(vk_res);
+          m_free_image_semaphore.post();
+       }
+@@ -203,11 +220,11 @@ void swapchain_base::unpresent_image(uint32_t presented_index, bool release_imag
+    m_swapchain_images[presented_index].set_status(should_keep_acquired ? swapchain_image::ACQUIRED :
+                                                                          swapchain_image::FREE);
+ 
+-   image_status_lock.unlock();
+    if (!should_keep_acquired)
+    {
+       m_free_image_semaphore.post();
+    }
++   image_status_lock.unlock();
+ }
+ 
+ swapchain_base::swapchain_base(layer::device_private_data &dev_data, const VkAllocationCallbacks *callbacks)
+@@ -418,10 +435,34 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
+-   TRY(wait_and_get_free_buffer(timeout));
++   /* DroidDeck/Mali bridge [Claude Opus 5.5] 2026-10-27 (Review 10): an acquire with timeout UINT64_MAX must not
++    * return VK_TIMEOUT or VK_NOT_READY (the spec allows neither); vkd3d-proton treats any positive result other than
++    * SUBOPTIMAL as success without an image index and asserts "swapchain_index != UINT32_MAX". Wait again instead,
++    * and say once per swapchain that it happened. */
++   VkResult wait_res = wait_and_get_free_buffer(timeout);
++   while (timeout == UINT64_MAX && (wait_res == VK_TIMEOUT || wait_res == VK_NOT_READY))
++   {
++      if (!m_infinite_acquire_retry_logged)
++      {
++         WSI_LOG_ERROR("mali-wsi: infinite acquire got %d from wait_and_get_free_buffer, waiting again",
++                       static_cast<int>(wait_res));
++         m_infinite_acquire_retry_logged = true;
++      }
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
++      wait_res = wait_and_get_free_buffer(timeout);
++   }
++   TRY(wait_res);
+    if (error_has_occured())
+    {
+-      return get_error_state();
++      /* A sticky positive error from the page-flip thread would reach the app as "success" (see above). */
++      VkResult err = get_error_state();
++      if (err > 0 && err != VK_SUBOPTIMAL_KHR)
++      {
++         WSI_LOG_ERROR("mali-wsi: swapchain error state %d is not an error code; reporting OUT_OF_DATE",
++                       static_cast<int>(err));
++         return VK_ERROR_OUT_OF_DATE_KHR;
++      }
++      return err;
+    }
+ 
+    util::unique_lock<util::recursive_mutex> image_status_lock(m_image_status_mutex);
+@@ -810,11 +851,16 @@ VkResult swapchain_base::wait_and_get_free_buffer(uint64_t timeout)
+        * the swapchain implementation may be able to get a buffer without
+        * waiting */
+ 
+-      retval = get_free_buffer(&timeout);
++      uint64_t remaining = timeout;
++      retval = get_free_buffer(&remaining);
+       if (retval == VK_SUCCESS)
+       {
+          /* the sub-implementation has done it's thing, so re-check the
+-          * semaphore */
++          * semaphore. DroidDeck/Mali bridge [Claude Opus 5.5] 2026-10-27: with the caller's timeout, not the 0 that
++          * get_free_buffer leaves. A buffer release can be dispatched on another thread (vkWaitForPresentKHR
++          * dispatches the same queue), which marks the image FREE before it posts the semaphore; waiting 0 in that
++          * window returned VK_NOT_READY to an acquire with timeout UINT64_MAX, and vkd3d-proton then asserted
++          * "swapchain_index != UINT32_MAX" (HZD, after ~5 min). */
+          retval = m_free_image_semaphore.wait(timeout);
+       }
+    }
+diff --git a/wsi/swapchain_base.hpp b/wsi/swapchain_base.hpp
+index 6b0f1b2..5af772d 100644
+--- a/wsi/swapchain_base.hpp
++++ b/wsi/swapchain_base.hpp
+@@ -359,6 +359,11 @@ protected:
+     */
+    bool m_page_flip_thread_run;
+ 
++   /**
++    * @brief An infinite acquire had to wait again after VK_TIMEOUT/VK_NOT_READY (logged once). DroidDeck/Mali bridge.
++    */
++   bool m_infinite_acquire_retry_logged = false;
++
+    /**
+     * @brief A semaphore to be signalled once a page flip event occurs.
+     */
+diff --git a/wsi/unsupported_surfaces.hpp b/wsi/unsupported_surfaces.hpp
+index 40b0bfc..72b15eb 100644
+--- a/wsi/unsupported_surfaces.hpp
++++ b/wsi/unsupported_surfaces.hpp
+@@ -50,7 +50,7 @@ namespace wsi
+ /* A list of platform-specific unsupported surface extensions
+    Not using the extension macros and symbols due to missing definitions for native platform symbols. */
+ static constexpr std::array unsupported_surfaces_ext_array = {
+-   "VK_KHR_win32_surface",    "VK_KHR_xlib_surface",    "VK_KHR_xcb_surface",
++   "VK_KHR_win32_surface",
+    "VK_EXT_metal_surface",    "VK_KHR_android_surface",
+ #if !BUILD_WSI_HEADLESS
+    "VK_EXT_headless_surface",
+diff --git a/wsi/wayland/surface.cpp b/wsi/wayland/surface.cpp
+index e47d675..444c905 100644
+--- a/wsi/wayland/surface.cpp
++++ b/wsi/wayland/surface.cpp
+@@ -262,22 +262,16 @@ bool surface::init()
+       return false;
+    }
+ 
+-   if (explicit_sync_interface.get() == nullptr)
++   if (explicit_sync_interface.get() != nullptr)
+    {
+-      WSI_LOG_ERROR("Failed to obtain zwp_linux_explicit_synchronization_v1 interface.");
+-      return false;
+-   }
+-
+-   auto surface_sync_obj =
+-      zwp_linux_explicit_synchronization_v1_get_synchronization(explicit_sync_interface.get(), wayland_surface);
+-   if (surface_sync_obj == nullptr)
+-   {
+-      WSI_LOG_ERROR("Failed to retrieve surface synchronization interface");
+-      return false;
++      auto surface_sync_obj =
++         zwp_linux_explicit_synchronization_v1_get_synchronization(explicit_sync_interface.get(), wayland_surface);
++      if (surface_sync_obj != nullptr)
++      {
++         surface_sync_interface.reset(surface_sync_obj);
++      }
+    }
+ 
+-   surface_sync_interface.reset(surface_sync_obj);
+-
+    VkResult vk_res = VK_SUCCESS;
+    if (presentation_time_interface.get() != nullptr)
+    {
+diff --git a/wsi/wayland/surface_properties.cpp b/wsi/wayland/surface_properties.cpp
+index 366e262..228e619 100644
+--- a/wsi/wayland/surface_properties.cpp
++++ b/wsi/wayland/surface_properties.cpp
+@@ -193,9 +193,17 @@ static VkResult surface_format_properties_map_add(VkPhysicalDevice phys_dev, sur
+ static VkResult surface_format_properties_map_init(VkPhysicalDevice phys_dev, surface_format_properties_map &format_map,
+                                                    const util::vector<util::drm::drm_format_pair> &drm_format_list)
+ {
++   /* DroidDeck/Mali bridge [Claude Opus 5.5] 2026-10-26: MALI_WSI_NO_10BIT=1 hides the 10-bit surface formats
++    * (vkd3d-proton then blits into an 8-bit swapchain). Test switch only: HZD's black screen stayed with 8-bit too. */
++   const char *no_10bit_env = std::getenv("MALI_WSI_NO_10BIT");
++   const bool no_10bit = no_10bit_env && std::strcmp(no_10bit_env, "1") == 0;
+    for (const auto &drm_format : drm_format_list)
+    {
+       const VkFormat vk_format = util::drm::drm_to_vk_format(drm_format.fourcc);
++      if (no_10bit && (vk_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || vk_format == VK_FORMAT_A2R10G10B10_UNORM_PACK32))
++      {
++         continue;
++      }
+       if (vk_format != VK_FORMAT_UNDEFINED && format_map.find(vk_format) == format_map.end())
+       {
+          TRY_LOG_CALL(surface_format_properties_map_add(phys_dev, format_map, vk_format, drm_format));
+@@ -376,7 +384,7 @@ static bool check_wl_protocols(struct wl_display *display)
+       return false;
+    }
+ 
+-   return (supported.dmabuf && supported.explicit_sync);
++   return supported.dmabuf;
+ }
+ 
+ VWL_VKAPI_CALL(VkBool32)
+@@ -384,12 +392,7 @@ GetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physical_device,
+                                                struct wl_display *display)
+ {
+    UNUSED(queue_index);
+-   bool dev_supports_sync =
+-      sync_fd_fence_sync::is_supported(layer::instance_private_data::get(physical_device), physical_device);
+-   if (!dev_supports_sync)
+-   {
+-      return VK_FALSE;
+-   }
++   UNUSED(physical_device);
+ 
+    if (!check_wl_protocols(display))
+    {
+diff --git a/wsi/wayland/swapchain.cpp b/wsi/wayland/swapchain.cpp
+index 0e0e8ed..68b963d 100644
+--- a/wsi/wayland/swapchain.cpp
++++ b/wsi/wayland/swapchain.cpp
+@@ -34,6 +34,9 @@
+ #include <cstdio>
+ #include <climits>
+ #include <functional>
++#include <sys/mman.h>
++#include <sys/ioctl.h>
++#include <linux/dma-buf.h>
+ 
+ #include "swapchain.hpp"
+ #include "util/drm/drm_utils.hpp"
+@@ -68,7 +71,13 @@ public:
+       assert(m_buffer != nullptr);
+    }
+ 
+-   ~wayland_image_data() override = default;
++   ~wayland_image_data() override
++   {
++      if (probe_fd >= 0)
++         close(probe_fd);
++   }
++
++   int probe_fd = -1; /* dup of plane 0's dma-buf, only with MALI_WSI_PROBE_PIXELS=1 [Claude Opus 5.5] */
+ 
+    wl_buffer *get_buffer()
+    {
+@@ -288,7 +297,8 @@ VkResult swapchain::init_image_factory(const VkSwapchainCreateInfoKHR &swapchain
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+ 
+-   m_image_factory.init(std::move(image_handle_creator), std::move(backing_memory_creator), true, false);
++   bool has_explicit_sync = (m_wsi_surface->get_surface_sync_interface() != nullptr);
++   m_image_factory.init(std::move(image_handle_creator), std::move(backing_memory_creator), has_explicit_sync, !has_explicit_sync);
+    return VK_SUCCESS;
+ }
+ 
+@@ -386,19 +396,65 @@ VkResult swapchain::allocate_and_bind_swapchain_image(swapchain_image &image)
+       return VK_ERROR_INITIALIZATION_FAILED;
+    }
+ 
++   const char *probe_env = std::getenv("MALI_WSI_PROBE_PIXELS");
++   const int probe_fd = probe_env && std::strcmp(probe_env, "1") == 0 ?
++                           dup(backing_memory.get_external_memory().get_buffer_fds()[0]) : -1;
++
+    TRY_LOG_CALL(backing_memory.import_and_bind(image.get_image()));
+ 
+    auto image_data = m_allocator.make_unique<wayland_image_data>(std::move(buffer));
+    if (image_data == nullptr)
+    {
++      if (probe_fd >= 0)
++         close(probe_fd);
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
++   image_data->probe_fd = probe_fd;
+    image.set_data(std::move(image_data));
+    return VK_SUCCESS;
+ }
+ 
++/* DroidDeck/Mali bridge debug [Claude Opus 5.5] 2026-10-26: MALI_WSI_PROBE_PIXELS=1 logs, for the first presents
++ * and every 300th, the centre pixel and a sampled checksum of the frame being attached (CPU read of the dma-buf after
++ * the GPU is done). Tells a black frame from a frame the compositor does not show. */
++static void probe_pixels(image_backing_memory_external &mem, int fd, const VkExtent3D &extent, uint64_t n)
++{
++   external_memory &ext = mem.get_external_memory();
++   const size_t stride = static_cast<size_t>(ext.get_strides()[0]);
++   const size_t offset = ext.get_offsets()[0];
++   const size_t size = offset + stride * extent.height;
++   if (fd < 0 || stride == 0)
++      return;
++   void *map = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
++   if (map == MAP_FAILED)
++   {
++      fprintf(stderr, "mali-wsi: probe: mmap of the frame failed (%d)\n", errno);
++      return;
++   }
++   struct dma_buf_sync sync = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
++   ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
++   const uint8_t *base = static_cast<const uint8_t *>(map) + offset;
++   const uint32_t centre = *reinterpret_cast<const uint32_t *>(base + (extent.height / 2) * stride + (extent.width / 2) * 4);
++   uint64_t sum = 0, nonzero = 0;
++   for (uint32_t y = 0; y < extent.height; y += extent.height / 16 + 1)
++      for (uint32_t x = 0; x < extent.width; x += extent.width / 16 + 1)
++      {
++         uint32_t v = *reinterpret_cast<const uint32_t *>(base + y * stride + x * 4);
++         sum += v & 0x00ffffff;
++         nonzero += (v & 0x00ffffff) != 0;
++      }
++   sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
++   ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
++   munmap(map, size);
++   fprintf(stderr, "mali-wsi: probe: present %llu %ux%u centre 0x%08x, %llu/289 samples non-black, rgb sum %llu\n",
++           static_cast<unsigned long long>(n), extent.width, extent.height, centre,
++           static_cast<unsigned long long>(nonzero), static_cast<unsigned long long>(sum));
++}
++
+ void swapchain::present_image(const pending_present_request &pending_present)
+ {
++   static const bool probe = std::getenv("MALI_WSI_PROBE_PIXELS") && std::strcmp(std::getenv("MALI_WSI_PROBE_PIXELS"), "1") == 0;
++   static uint64_t probe_count = 0;
+    auto &image = m_swapchain_images[pending_present.image_index];
+    auto image_data = image.get_data<wayland_image_data>();
+ 
+@@ -410,18 +466,32 @@ void swapchain::present_image(const pending_present_request &pending_present)
+ 
+    wl_surface_attach(m_surface, image_data->get_buffer(), 0, 0);
+ 
+-   auto present_sync_fd = static_cast<sync_fd_fence_sync *>(image.get_present_fence())->export_sync_fd();
+-   if (!present_sync_fd.has_value())
++   if (m_wsi_surface->get_surface_sync_interface() != nullptr && image.get_present_fence())
+    {
+-      WSI_LOG_ERROR("Failed to export present fence.");
+-      set_error_state(VK_ERROR_SURFACE_LOST_KHR);
++      auto present_sync_fd = static_cast<sync_fd_fence_sync *>(image.get_present_fence())->export_sync_fd();
++      if (!present_sync_fd.has_value())
++      {
++         WSI_LOG_ERROR("Failed to export present fence.");
++         set_error_state(VK_ERROR_SURFACE_LOST_KHR);
++      }
++      else if (present_sync_fd->is_valid())
++      {
++         zwp_linux_surface_synchronization_v1_set_acquire_fence(m_wsi_surface->get_surface_sync_interface(),
++                                                                present_sync_fd->get());
++      }
+    }
+-   else if (present_sync_fd->is_valid())
++   else if (image.get_present_fence())
+    {
+-      zwp_linux_surface_synchronization_v1_set_acquire_fence(m_wsi_surface->get_surface_sync_interface(),
+-                                                             present_sync_fd->get());
++      image.get_present_fence()->wait_payload(UINT64_MAX);
+    }
+ 
++   if (probe && (probe_count < 8 || probe_count % 300 == 0))
++   {
++      probe_pixels(swapchain_image_factory::get_backing_memory_from_image<image_backing_memory_external>(image),
++                   image_data->probe_fd, get_image_factory().get_image_handle_creator().get_image_create_info().extent, probe_count);
++   }
++   probe_count++;
++
+    /* TODO: work out damage */
+    wl_surface_damage(m_surface, 0, 0, INT32_MAX, INT32_MAX);
+ 
+@@ -521,7 +591,12 @@ VkResult swapchain::get_free_buffer(uint64_t *timeout)
+       res = dispatch_queue(m_display, m_buffer_queue, ms_timeout);
+    } while (!free_image_found() && res > 0);
+ 
+-   if (res > 0)
++   if (free_image_found())
++   {
++      *timeout = 0;
++      return VK_SUCCESS;
++   }
++   else if (res > 0)
+    {
+       *timeout = 0;
+       return VK_SUCCESS;
+diff --git a/wsi/wsi_factory.cpp b/wsi/wsi_factory.cpp
+index ad88b77..9187295 100644
+--- a/wsi/wsi_factory.cpp
++++ b/wsi/wsi_factory.cpp
+@@ -204,12 +204,7 @@ VkResult add_device_extensions_required_by_layer(VkPhysicalDevice phys_dev,
+       bool supported = available_device_extensions.contains(extensions_required_by_layer);
+       if (!supported)
+       {
+-         /* Can we accept failure? The layer unconditionally advertises support for this platform and the loader uses
+-          * this information to enable its own support of the vkCreate*SurfaceKHR entrypoints. The rest of the Vulkan
+-          * stack may not support this extension so we cannot blindly fall back to it.
+-          * For now treat this as an error.
+-          */
+-         return VK_ERROR_INITIALIZATION_FAILED;
++         WSI_LOG_WARNING("Some WSI required device extensions were not reported in available_device_extensions; proceeding because Mali bridge ICD supports them natively.");
+       }
+ 
+       TRY_LOG_CALL(extensions_to_enable.add(extensions_required_by_layer));

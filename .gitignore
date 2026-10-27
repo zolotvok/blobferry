@@ -1,0 +1,5 @@
+# Build output, logs, screenshots and phone dumps
+build/
+# Milestone probe output and vendor binaries pulled from the phone (proprietary): never commit or push
+m1/
+*.so

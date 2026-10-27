@@ -1,0 +1,9 @@
+[submodule "third_party/libhybris"]
+	path = third_party/libhybris
+	url = https://github.com/wmww/libhybris.git
+[submodule "third_party/vulkan-wsi-layer"]
+	path = third_party/vulkan-wsi-layer
+	url = https://gitlab.freedesktop.org/mesa/vulkan-wsi-layer.git
+[submodule "third_party/android-headers"]
+	path = third_party/android-headers
+	url = https://github.com/Halium/android-headers.git
