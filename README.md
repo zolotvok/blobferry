@@ -34,7 +34,12 @@ the Mali driver offers:
 - BC1-BC7 textures decoded on the GPU (compute or fragment shaders), with AFRC-compressed shadow images to save memory;
 - SPIR-V patching that removes ClipDistance/CullDistance where the driver lacks them;
 - feature masking and a polygon-mode override;
-- emulated `VK_EXT_memory_budget` and `VK_EXT_map_memory_placed`.
+- emulated `VK_EXT_memory_budget` and `VK_EXT_map_memory_placed`;
+- a fix for a vendor driver hang: a fragment shader that writes `gl_FragDepth` in a pass without a depth attachment
+  (vkd3d-proton's depth-to-colour copy does this) gets that output removed, which Vulkan discards anyway;
+- optional render-target compression: STORAGE usage turns compression off on this driver, so colour targets are
+  created without it, and the ones the game really uses as UAVs are learned per game;
+- a built-in GPU profiler: per render pass / dispatch GPU time, and the pass a GPU hang is stuck in.
 
 The layer is implicit and turns on only with `ENABLE_MALI_COMPAT=1` (the DroidDeck fork sets it for bridge games).
 
@@ -48,6 +53,7 @@ In short (2026-10-27):
 | Tomb Raider (2013) | DX11 → DXVK | benchmark avg 54 FPS |
 | The Witcher 3 (classic) | DX11 → DXVK | in game, ~22 FPS |
 | Horizon Zero Dawn | DX12 → vkd3d-proton | benchmark completes (avg 13 FPS); much of the world geometry is missing |
+| The Witcher 3 (current release) | DX12 → vkd3d-proton | in game, ~20-24 FPS; the prologue runs, one GPU hang left later in the game |
 
 ## Building
 
@@ -76,13 +82,20 @@ git submodule update --init
 | `MALI_COMPAT_DEBUG=1`, `MALI_COMPAT_STATS=1` | compat layer logging and counters |
 | `MALI_COMPAT_BC_AFRC=0` | uncompressed BC shadow images (needs much more GPU memory) |
 | `MALI_WSI_NO_10BIT=1` | hide 10-bit surface formats |
+| `MALI_COMPAT_FRAGDEPTH_FIX=0` | turn off the FragDepth fix (on by default) |
+| `MALI_COMPAT_RT_COMPRESS=1` | render-target compression; learned UAV targets in `/root/mali-rt-keep-<process>.txt` |
+| `MALI_COMPAT_GPU_TIME=1` | GPU profiler: top passes/dispatches every 5 s and STUCK lines for hangs in `/root/mali-gputime-<thread>.txt` |
+| `MALI_COMPAT_GT_TRACE=<hash>` | with the profiler: log every pass that uses the shader with this hash |
+| `MALI_COMPAT_DUMP_HASH=<hash>[,..]` | write shaders with these hashes to `/root/mali-spv-<hash>.spv` |
+| `MALI_COMPAT_DEPTH_NOCOMP=1` | create sampled depth/stencil images uncompressed (experiment) |
 
 ## Repository layout
 
 - `src/icd/`: ICD shim
 - `src/compat/`: compat layer; `bc/` holds the BC decode shaders and their generated SPIR-V headers
 - `patches/vulkan-wsi-layer/`: changes to the Arm WSI layer
-- `test/`: small Vulkan probes and SPIR-V patcher tests
+- `test/`: small Vulkan probes (incl. `rt-comp-probe.c` for render-target compression) and SPIR-V patch tests
+  (`spirv-patch-check.sh`, `fragdepth-host.c`)
 - `third_party/`: libhybris, vulkan-wsi-layer and android-headers as git submodules
 
 ## How it was made

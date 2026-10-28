@@ -558,6 +558,9 @@ struct CmdBufData {
     bool descriptor_buffers;        // vkCmdBindDescriptorBuffersEXT was recorded since begin
     uint32_t push_count;            // records in push[], oldest first
     struct PushRec push[PUSH_RECS];
+    VkPipeline gfx_pipeline;        // last app graphics pipeline (GPU timing)
+    int32_t gt_rec;                 // GPU timing record of the open render pass, -1 if none
+    VkImageView gt_src;             // first image view of the last push-descriptor write (GPU timing details)
     struct CmdBufData *next;
 };
 
@@ -633,6 +636,8 @@ struct DeviceData {
     bool afrc; // VK_EXT_image_compression_control enabled by the layer for the BC shadows
     bool zero_divisor_emulated; // divisor 0 -> UINT32_MAX (the vendor lacks vertexAttributeInstanceRateZeroDivisor)
     PFN_vkCmdSetVertexInputEXT fpCmdSetVertexInputEXT;
+    PFN_vkCreateComputePipelines fpCreateComputePipelinesReal; // for the GPU timing's pipeline hashes
+    struct GpuTime *gt; // MALI_COMPAT_GPU_TIME
 };
 
 #define MAX_INSTANCES 32
@@ -734,6 +739,7 @@ static struct CmdBufData *cmd_data(VkCommandBuffer cmd) {
     if (!entry && (entry = calloc(1, sizeof *entry))) {
         entry->cmdbuf = cmd;
         entry->dev = dev;
+        entry->gt_rec = -1;
         entry->next = g_cmdbufs[bkt];
         g_cmdbufs[bkt] = entry;
     }
@@ -853,6 +859,9 @@ static void reset_cmd_data(struct DeviceData *dev_data, VkCommandBuffer cmd, boo
     e->compute_pipeline = VK_NULL_HANDLE;
     e->descriptor_buffers = false;
     e->push_count = 0;
+    e->gfx_pipeline = VK_NULL_HANDLE;
+    e->gt_rec = -1;
+    e->gt_src = VK_NULL_HANDLE;
     if (remove) {
         free(e->staging_resources);
         free(e);
@@ -1203,24 +1212,237 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_EnumerateDeviceExtensionProperties(
 }
 
 // -----------------------------------------------------------------------------
+// GPU timing, MALI_COMPAT_GPU_TIME=1: shader and pipeline identities. [Claude Opus 5.5] 2026-10-28
+// Every shader gets the FNV-1a hash of its SPIR-V words as the app passed them (before the clip/cull patch; the
+// timing report and MALI_COMPAT_DUMP_HASH use it). MALI_COMPAT_DUMP_HASH=<hex>[,<hex>...] writes matching shaders to
+// /root/mali-spv-<hash>.spv when they are created. The timing itself is further down (gt_*).
+// -----------------------------------------------------------------------------
+static bool g_gpu_time;
+static uint32_t g_dump_hashes[16];
+static uint32_t g_dump_hash_count;
+static uint32_t g_gt_trace; // MALI_COMPAT_GT_TRACE=<hex>: write every pass whose fragment/compute shader has this hash
+
+static uint32_t spv_hash(const uint32_t *code, size_t bytes) {
+    uint32_t h = 2166136261u;
+    for (size_t w = 0; w < bytes / 4; w++) h = (h ^ code[w]) * 16777619u;
+    return h;
+}
+
+static void spv_dump_if_wanted(const uint32_t *code, size_t bytes, uint32_t hash) {
+    for (uint32_t i = 0; i < g_dump_hash_count; i++)
+        if (g_dump_hashes[i] == hash) {
+            char path[64];
+            snprintf(path, sizeof path, "/root/mali-spv-%08x.spv", hash);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(code, 1, bytes, f); fclose(f); }
+            fprintf(stderr, "mali-compat: dumped shader %08x (%zu bytes) to %s\n", hash, bytes, path);
+        }
+}
+
+// handle -> hash tables (shader modules; pipelines with up to 3 stage hashes)
+struct HashNode { uint64_t handle; uint32_t hash[3]; uint32_t stages[3]; struct HashNode *next; };
+#define HASH_BUCKETS 4096
+static struct HashNode *g_module_hash[HASH_BUCKETS], *g_pipeline_hash[HASH_BUCKETS];
+static pthread_mutex_t g_hash_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void hash_put(struct HashNode **table, uint64_t handle, const uint32_t *hash, const uint32_t *stages, uint32_t n) {
+    struct HashNode *e = calloc(1, sizeof *e);
+    if (!e) return;
+    e->handle = handle;
+    for (uint32_t i = 0; i < n && i < 3; i++) { e->hash[i] = hash[i]; e->stages[i] = stages ? stages[i] : 0; }
+    uint32_t b = handle_bucket(handle, HASH_BUCKETS);
+    pthread_mutex_lock(&g_hash_mutex);
+    e->next = table[b];
+    table[b] = e;
+    pthread_mutex_unlock(&g_hash_mutex);
+}
+
+static bool hash_get(struct HashNode **table, uint64_t handle, struct HashNode *out) {
+    bool found = false;
+    pthread_mutex_lock(&g_hash_mutex);
+    for (struct HashNode *e = table[handle_bucket(handle, HASH_BUCKETS)]; e; e = e->next)
+        if (e->handle == handle) { *out = *e; found = true; break; }
+    pthread_mutex_unlock(&g_hash_mutex);
+    return found;
+}
+
+// Images and views, for the details of a STUCK or traced pass (GPU timing only). Entries are not removed: a reused
+// handle gets a newer entry in front, which is the one found.
+struct ImgNode {
+    uint64_t handle;
+    VkImage image;                  // views: the image; images: itself
+    VkFormat format;
+    uint32_t w, h, mip, mips, layer, layers, samples, usage;
+    struct ImgNode *next;
+};
+static struct ImgNode *g_img_info[HASH_BUCKETS], *g_view_info[HASH_BUCKETS];
+
+static void img_put(struct ImgNode **table, struct ImgNode n) {
+    struct ImgNode *e = malloc(sizeof *e);
+    if (!e) return;
+    *e = n;
+    uint32_t b = handle_bucket(n.handle, HASH_BUCKETS);
+    pthread_mutex_lock(&g_hash_mutex);
+    e->next = table[b];
+    table[b] = e;
+    pthread_mutex_unlock(&g_hash_mutex);
+}
+
+static bool img_get(struct ImgNode **table, uint64_t handle, struct ImgNode *out) {
+    bool found = false;
+    pthread_mutex_lock(&g_hash_mutex);
+    for (struct ImgNode *e = table[handle_bucket(handle, HASH_BUCKETS)]; e; e = e->next)
+        if (e->handle == handle) { *out = *e; found = true; break; }
+    pthread_mutex_unlock(&g_hash_mutex);
+    return found;
+}
+
+// Stage hashes of a pipeline being created: inline SPIR-V (maintenance5) or the module's hash.
+static uint32_t stage_hashes(const VkPipelineShaderStageCreateInfo *st, uint32_t count, uint32_t *hash, uint32_t *stages) {
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < count && n < 3; s++) {
+        const VkShaderModuleCreateInfo *sm = find_struct(st[s].pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+        struct HashNode mod;
+        if (sm) {
+            hash[n] = spv_hash(sm->pCode, sm->codeSize);
+            spv_dump_if_wanted(sm->pCode, sm->codeSize, hash[n]);
+        } else if (hash_get(g_module_hash, (uint64_t)st[s].module, &mod)) {
+            hash[n] = mod.hash[0];
+        } else {
+            hash[n] = 0;
+        }
+        stages[n++] = st[s].stage;
+    }
+    return n;
+}
+
+// -----------------------------------------------------------------------------
+// FragDepth fix (default on; MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off): a fragment shader that writes gl_FragDepth in a pipeline without a depth/stencil
+// attachment gets that output turned into a private variable (and its Depth* execution mode dropped). Vulkan says the
+// write is simply discarded; the vendor driver instead hangs the GPU on vkd3d's depth->colour copy pass, whose shader
+// writes o_color and gl_FragDepth (Witcher 3 DX12, 2026-10-28: STUCK on fs:2b070dee with an R32F target, no depth).
+// Module shaders that write FragDepth are kept (code copy) so their pipelines can get a patched module. [Claude Opus 5.5]
+// -----------------------------------------------------------------------------
+static bool g_fragdepth_fix;
+
+static bool spv_writes_fragdepth(const uint32_t *code, size_t bytes) {
+    size_t n = bytes / 4;
+    if (n < 5 || code[0] != 0x07230203) return false;
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = code[i] >> 16, op = code[i] & 0xffff;
+        if (!wc || i + wc > n) return false;
+        if (op == 71 && wc >= 4 && code[i + 2] == 11 && code[i + 3] == 22) return true; // OpDecorate BuiltIn FragDepth
+        i += wc;
+    }
+    return false;
+}
+
+static uint32_t *spv_strip_fragdepth(const uint32_t *code, size_t bytes, size_t *out_bytes) {
+    size_t n = bytes / 4;
+    if (n < 5 || code[0] != 0x07230203) return NULL;
+    uint32_t fd = 0;
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = code[i] >> 16, op = code[i] & 0xffff;
+        if (!wc || i + wc > n) return NULL;
+        if (op == 71 && wc >= 4 && code[i + 2] == 11 && code[i + 3] == 22) fd = code[i + 1];
+        i += wc;
+    }
+    if (!fd) return NULL;
+    bool v14 = code[1] >= 0x00010400; // from SPIR-V 1.4 on, Private variables belong in the entry point interface
+    uint32_t *out = malloc((n + 8) * sizeof *out);
+    if (!out) return NULL;
+    memcpy(out, code, 5 * sizeof *out);
+    uint32_t ptr = code[3];
+    out[3] = code[3] + 1;
+    size_t o = 5;
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = code[i] >> 16, op = code[i] & 0xffff;
+        if (op == 71 && code[i + 1] == fd) { i += wc; continue; }                         // decorations of gl_FragDepth
+        if (op == 16 && wc >= 3 && code[i + 2] >= 12 && code[i + 2] <= 16 && code[i + 2] != 13) { i += wc; continue; } // Depth* modes
+        if (op == 15 && !v14) {                                                            // OpEntryPoint: drop fd
+            size_t start = o;
+            out[o++] = 0;
+            for (uint32_t k = 1; k < wc; k++) if (!(k >= 3 && code[i + k] == fd && k > 3)) out[o++] = code[i + k];
+            out[start] = (uint32_t)((o - start) << 16) | 15;
+            i += wc;
+            continue;
+        }
+        if (op == 59 && wc >= 4 && code[i + 2] == fd) {                                    // the variable itself
+            uint32_t pointee = 0;
+            for (size_t j = 5; j < n;) {
+                uint32_t wj = code[j] >> 16;
+                if ((code[j] & 0xffff) == 32 && code[j + 1] == code[i + 1]) { pointee = code[j + 3]; break; }
+                j += wj ? wj : 1;
+            }
+            if (!pointee) { free(out); return NULL; }
+            out[o++] = (4u << 16) | 32; out[o++] = ptr; out[o++] = 6; out[o++] = pointee; // OpTypePointer Private
+            out[o++] = code[i]; out[o++] = ptr; out[o++] = fd; out[o++] = 6;               // OpVariable ... Private
+            for (uint32_t k = 4; k < wc; k++) out[o++] = code[i + k];
+            i += wc;
+            continue;
+        }
+        memcpy(out + o, code + i, wc * sizeof *out);
+        o += wc;
+        i += wc;
+    }
+    *out_bytes = o * sizeof *out;
+    return out;
+}
+
+struct CodeNode { uint64_t module; uint32_t *code; size_t bytes; struct CodeNode *next; };
+static struct CodeNode *g_fragdepth_modules[HASH_BUCKETS];
+
+static void fragdepth_module_put(VkShaderModule m, const uint32_t *code, size_t bytes) {
+    struct CodeNode *e = malloc(sizeof *e);
+    if (!e || !(e->code = malloc(bytes))) { free(e); return; }
+    memcpy(e->code, code, bytes);
+    e->bytes = bytes;
+    e->module = (uint64_t)m;
+    uint32_t b = handle_bucket(e->module, HASH_BUCKETS);
+    pthread_mutex_lock(&g_hash_mutex);
+    e->next = g_fragdepth_modules[b];
+    g_fragdepth_modules[b] = e;
+    pthread_mutex_unlock(&g_hash_mutex);
+}
+
+static const struct CodeNode *fragdepth_module_get(VkShaderModule m) {
+    const struct CodeNode *found = NULL;
+    pthread_mutex_lock(&g_hash_mutex);
+    for (struct CodeNode *e = g_fragdepth_modules[handle_bucket((uint64_t)m, HASH_BUCKETS)]; e; e = e->next)
+        if (e->module == (uint64_t)m) { found = e; break; }
+    pthread_mutex_unlock(&g_hash_mutex);
+    return found;
+}
+
+// -----------------------------------------------------------------------------
 // Device Level Interceptions
 // -----------------------------------------------------------------------------
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
     VkDevice device, const VkShaderModuleCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkShaderModule *pShaderModule) {
     struct DeviceData *d = get_device_data(device);
+    uint32_t hash = 0;
+    if (g_gpu_time || g_dump_hash_count) {
+        hash = spv_hash(pCreateInfo->pCode, pCreateInfo->codeSize);
+        spv_dump_if_wanted(pCreateInfo->pCode, pCreateInfo->codeSize, hash);
+    }
     size_t patched_bytes = 0;
     uint32_t *patched = compat_patch_spirv(pCreateInfo->pCode, pCreateInfo->codeSize, &patched_bytes);
 
+    VkResult r;
     if (patched) {
         VkShaderModuleCreateInfo mod_ci = *pCreateInfo;
         mod_ci.pCode = patched;
         mod_ci.codeSize = patched_bytes;
-        VkResult r = d->fpCreateShaderModule(device, &mod_ci, pAllocator, pShaderModule);
+        r = d->fpCreateShaderModule(device, &mod_ci, pAllocator, pShaderModule);
         free(patched);
-        return r;
+    } else {
+        r = d->fpCreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
     }
-    return d->fpCreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
+    if (r == VK_SUCCESS && g_gpu_time && pShaderModule) hash_put(g_module_hash, (uint64_t)*pShaderModule, &hash, NULL, 1);
+    if (r == VK_SUCCESS && g_fragdepth_fix && pShaderModule && spv_writes_fragdepth(pCreateInfo->pCode, pCreateInfo->codeSize))
+        fragdepth_module_put(*pShaderModule, pCreateInfo->pCode, pCreateInfo->codeSize);
+    return r;
 }
 
 // Debug aid: with /root/mali-spv-inflight present, each thread writes the pipeline it is about to create (flags,
@@ -1320,6 +1542,64 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
     VkPipelineRasterizationStateCreateInfo *rast_copies = (VkPipelineRasterizationStateCreateInfo *)malloc(
         createInfoCount * sizeof(VkPipelineRasterizationStateCreateInfo));
 
+    // GPU timing: the stage hashes, taken before the clip/cull patch below rewrites inline SPIR-V
+    uint32_t (*gt_hash)[6] = (g_gpu_time || g_dump_hash_count) ? calloc(createInfoCount, sizeof *gt_hash) : NULL;
+    uint32_t *gt_n = gt_hash ? calloc(createInfoCount, sizeof *gt_n) : NULL;
+    for (uint32_t i = 0; gt_n && i < createInfoCount; i++)
+        gt_n[i] = stage_hashes(pCreateInfos[i].pStages, pCreateInfos[i].stageCount, gt_hash[i], gt_hash[i] + 3);
+
+    // FragDepth without a depth/stencil attachment (MALI_COMPAT_FRAGDEPTH_FIX): own stage arrays, patched modules
+    VkPipelineShaderStageCreateInfo *fd_stages = NULL;
+    VkShaderModule fd_modules[16];
+    uint32_t fd_module_count = 0;
+    VkShaderModuleCreateInfo fd_inline[16];
+    uint32_t fd_inline_count = 0;
+    uint32_t *fd_codes[32];
+    uint32_t fd_code_count = 0;
+    if (g_fragdepth_fix) {
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < createInfoCount; i++) total += pCreateInfos[i].stageCount;
+        fd_stages = total ? malloc(total * sizeof *fd_stages) : NULL;
+        for (uint32_t i = 0, base = 0; fd_stages && i < createInfoCount; base += pCreateInfos[i].stageCount, i++) {
+            const VkPipelineRenderingCreateInfo *ri = find_struct(pCreateInfos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO);
+            if (pCreateInfos[i].renderPass || !ri || ri->depthAttachmentFormat || ri->stencilAttachmentFormat) continue;
+            bool changed = false;
+            memcpy(fd_stages + base, pCreateInfos[i].pStages, pCreateInfos[i].stageCount * sizeof *fd_stages);
+            for (uint32_t st = 0; st < pCreateInfos[i].stageCount; st++) {
+                VkPipelineShaderStageCreateInfo *sg = &fd_stages[base + st];
+                if (sg->stage != VK_SHADER_STAGE_FRAGMENT_BIT || fd_code_count >= 32) continue;
+                const VkShaderModuleCreateInfo *sm = find_struct(sg->pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+                const struct CodeNode *cn = sm ? NULL : fragdepth_module_get(sg->module);
+                const uint32_t *code = sm ? sm->pCode : cn ? cn->code : NULL;
+                size_t bytes = sm ? sm->codeSize : cn ? cn->bytes : 0;
+                size_t out_bytes = 0;
+                uint32_t *patched = code ? spv_strip_fragdepth(code, bytes, &out_bytes) : NULL;
+                if (!patched) continue;
+                fd_codes[fd_code_count++] = patched;
+                if (sm && fd_inline_count < 16 && sg->pNext == (const void *)sm) {
+                    // inline SPIR-V at the head of the stage chain: replaced by a copy (one such struct per chain)
+                    fd_inline[fd_inline_count] = *sm;
+                    fd_inline[fd_inline_count].pCode = patched;
+                    fd_inline[fd_inline_count].codeSize = out_bytes;
+                    sg->pNext = &fd_inline[fd_inline_count++];
+                    changed = true;
+                } else if (!sm && fd_module_count < 16) {
+                    VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, out_bytes, patched};
+                    if (d->fpCreateShaderModule(device, &mci, NULL, &fd_modules[fd_module_count]) == VK_SUCCESS) {
+                        sg->module = fd_modules[fd_module_count++];
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) {
+                modified[i].pStages = fd_stages + base;
+                static _Atomic int logged;
+                if (atomic_fetch_add(&logged, 1) < 8)
+                    fprintf(stderr, "mali-compat: FragDepth write removed from a fragment shader (pipeline without depth/stencil attachment)\n");
+            }
+        }
+    }
+
     // Also check for inline VkShaderModuleCreateInfo in stage pNext (VK_KHR_maintenance5)
     for (uint32_t i = 0; i < createInfoCount; i++) {
         if (modified[i].pRasterizationState) {
@@ -1373,8 +1653,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
     }
     if (g_log_pipelines)
         for (uint32_t i = 0; i < createInfoCount; i++) log_pipeline(&modified[i], res);
+    if (g_gpu_time && gt_n && res == VK_SUCCESS && pPipelines)
+        for (uint32_t i = 0; i < createInfoCount; i++)
+            if (pPipelines[i]) hash_put(g_pipeline_hash, (uint64_t)pPipelines[i], gt_hash[i], gt_hash[i] + 3, gt_n[i]);
+    free(gt_hash);
+    free(gt_n);
+    for (uint32_t k = 0; k < fd_module_count; k++) d->fpDestroyShaderModule(device, fd_modules[k], NULL);
+    for (uint32_t k = 0; k < fd_code_count; k++) free(fd_codes[k]);
+    free(fd_stages);
     free(rast_copies);
     free(modified);
+    return res;
+}
+
+// Only hooked for the GPU timing (and MALI_COMPAT_DUMP_HASH): records the compute shader's hash.
+static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
+    VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
+    const VkComputePipelineCreateInfo *pCreateInfos, const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines) {
+    struct DeviceData *d = get_device_data(device);
+    VkResult res = d->fpCreateComputePipelinesReal(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        uint32_t hash[1], stage[1];
+        uint32_t n = stage_hashes(&pCreateInfos[i].stage, 1, hash, stage);
+        if (g_gpu_time && res == VK_SUCCESS && pPipelines && pPipelines[i])
+            hash_put(g_pipeline_hash, (uint64_t)pPipelines[i], hash, stage, n);
+    }
     return res;
 }
 
@@ -1427,6 +1730,117 @@ static void log_image(struct DeviceData *d, VkDevice device, const VkImageCreate
     pthread_mutex_unlock(&m);
 }
 
+// -----------------------------------------------------------------------------
+// Render-target compression, MALI_COMPAT_RT_COMPRESS=1. [Claude Opus 5.5] 2026-10-28
+// The vendor driver turns AFBC off for every image with STORAGE usage, for all colour formats, and offers no
+// fixed-rate compression for them either (test/rt-comp-probe.c). DXVK adds STORAGE to each render target the game
+// creates with a UAV bind flag, so all of The Witcher 3's 1600x720 colour targets ran uncompressed (image log
+// 2026-10-28: 106 targets, comp 0x4). With the switch on, colour targets are created without STORAGE. A storage view
+// on such an image means the game does use it as a UAV: its signature (format, size, mips, layers) is appended to
+// /root/mali-rt-keep-<comm>.txt, and from the next launch on, images with that signature keep STORAGE. In the launch
+// that learns a signature, that UAV use is invalid (expect glitches there), which is why it is logged.
+// -----------------------------------------------------------------------------
+static bool g_rt_compress;
+// MALI_COMPAT_DEPTH_NOCOMP=1: depth/stencil images that shaders read are created uncompressed (no AFBC). The current
+// Witcher 3 (DX12) hangs the GPU in vkd3d's depth->colour copy pass, which texelFetches the depth aspect of its
+// D32_SFLOAT_S8_UINT depth buffer (GPU timing STUCK lines, 2026-10-28); test whether compression is the trigger.
+static bool g_depth_nocomp;
+struct RTSig { VkFormat format; uint32_t width, height, mips, layers; };
+#define RT_KEEP_MAX 256
+static struct RTSig g_rt_keep[RT_KEEP_MAX];
+static uint32_t g_rt_keep_count;
+static char g_rt_keep_path[96];
+struct RTNode { VkImage image; struct RTSig sig; VkImageUsageFlags usage; struct RTNode *next; };
+#define RT_BUCKETS 1024
+static struct RTNode *g_rt_images[RT_BUCKETS];
+static pthread_mutex_t g_rt_mutex = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint32_t g_rt_stripped, g_rt_kept;
+
+static struct RTSig rt_sig(const VkImageCreateInfo *ci) {
+    return (struct RTSig){ci->format, ci->extent.width, ci->extent.height, ci->mipLevels, ci->arrayLayers};
+}
+
+static bool rt_keep_has_locked(struct RTSig s) {
+    for (uint32_t i = 0; i < g_rt_keep_count; i++)
+        if (!memcmp(&g_rt_keep[i], &s, sizeof s)) return true;
+    return false;
+}
+
+static void rt_keep_load(void) {
+    char comm[32] = "unknown";
+    FILE *f = fopen("/proc/self/comm", "r");
+    if (f) {
+        if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0;
+        fclose(f);
+    }
+    for (char *c = comm; *c; c++)
+        if (*c == '/' || *c == ' ' || *c == '\\') *c = '_';
+    snprintf(g_rt_keep_path, sizeof g_rt_keep_path, "/root/mali-rt-keep-%s.txt", comm);
+    pthread_mutex_lock(&g_rt_mutex);
+    g_rt_keep_count = 0;
+    if ((f = fopen(g_rt_keep_path, "r"))) {
+        struct RTSig s;
+        int fmt;
+        while (g_rt_keep_count < RT_KEEP_MAX && fscanf(f, "%d %u %u %u %u", &fmt, &s.width, &s.height, &s.mips, &s.layers) == 5) {
+            s.format = (VkFormat)fmt;
+            g_rt_keep[g_rt_keep_count++] = s;
+        }
+        fclose(f);
+    }
+    pthread_mutex_unlock(&g_rt_mutex);
+    fprintf(stderr, "mali-compat: rt-compress on, %u UAV target signatures kept from %s\n", g_rt_keep_count, g_rt_keep_path);
+}
+
+// A UAV view on a stripped target: remember its signature for the next launches.
+static void rt_learn(struct RTSig s) {
+    pthread_mutex_lock(&g_rt_mutex);
+    if (!rt_keep_has_locked(s) && g_rt_keep_count < RT_KEEP_MAX) {
+        g_rt_keep[g_rt_keep_count++] = s;
+        FILE *f = fopen(g_rt_keep_path, "a");
+        if (f) {
+            fprintf(f, "%d %u %u %u %u\n", s.format, s.width, s.height, s.mips, s.layers);
+            fclose(f);
+        }
+        fprintf(stderr, "mali-compat: rt-compress: UAV view on compressed target fmt %d %ux%u mips %u layers %u; "
+                "learned, keeps STORAGE from the next launch\n", s.format, s.width, s.height, s.mips, s.layers);
+    }
+    pthread_mutex_unlock(&g_rt_mutex);
+}
+
+static void rt_track(VkImage img, struct RTSig s, VkImageUsageFlags usage) {
+    struct RTNode *e = calloc(1, sizeof *e);
+    if (!e) return;
+    e->image = img;
+    e->sig = s;
+    e->usage = usage;
+    uint32_t b = handle_bucket((uint64_t)(uintptr_t)img, RT_BUCKETS);
+    pthread_mutex_lock(&g_rt_mutex);
+    e->next = g_rt_images[b];
+    g_rt_images[b] = e;
+    pthread_mutex_unlock(&g_rt_mutex);
+}
+
+static bool rt_find(VkImage img, struct RTNode *out) {
+    bool found = false;
+    pthread_mutex_lock(&g_rt_mutex);
+    for (struct RTNode *e = g_rt_images[handle_bucket((uint64_t)(uintptr_t)img, RT_BUCKETS)]; e; e = e->next)
+        if (e->image == img) { *out = *e; found = true; break; }
+    pthread_mutex_unlock(&g_rt_mutex);
+    return found;
+}
+
+static void rt_untrack(VkImage img) {
+    pthread_mutex_lock(&g_rt_mutex);
+    for (struct RTNode **pp = &g_rt_images[handle_bucket((uint64_t)(uintptr_t)img, RT_BUCKETS)]; *pp; pp = &(*pp)->next)
+        if ((*pp)->image == img) {
+            struct RTNode *e = *pp;
+            *pp = e->next;
+            free(e);
+            break;
+        }
+    pthread_mutex_unlock(&g_rt_mutex);
+}
+
 // The create info the driver gets for an app image: BC formats become their RGBA8/RG16/RGBA16F shadow (format list
 // mapped, fixed-rate compression when offered) and Wine's HOST_ALLOCATION external memory is unlinked. Used by
 // vkCreateImage and by the vkGetDeviceImage*Requirements queries, which must answer for the same image: vkd3d-proton
@@ -1447,6 +1861,7 @@ struct image_fixup {
     VkImageCompressionControlEXT *app_cc; // the app's own compression control, overridden for the call
     VkImageCompressionControlEXT app_cc_saved;
     VkBaseOutStructure *host_prev, *host_ext;
+    bool rt_stripped; // colour target created without the app's STORAGE (MALI_COMPAT_RT_COMPRESS)
 };
 
 static void fixup_begin(struct DeviceData *d, const VkImageCreateInfo *ci, struct image_fixup *fx) {
@@ -1524,6 +1939,34 @@ static void fixup_begin(struct DeviceData *d, const VkImageCreateInfo *ci, struc
             }
         }
     }
+    if (g_rt_compress && !fx->is_bc && (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+        (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+        pthread_mutex_lock(&g_rt_mutex);
+        bool keep = rt_keep_has_locked(rt_sig(ci));
+        pthread_mutex_unlock(&g_rt_mutex);
+        if (!keep) {
+            fx->use = &fx->mod;
+            fx->mod.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+            fx->rt_stripped = true;
+        }
+    }
+    if (g_depth_nocomp && d->afrc && !fx->is_bc && (ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        ((ci->format >= VK_FORMAT_D16_UNORM && ci->format <= VK_FORMAT_D32_SFLOAT_S8_UINT))) {
+        VkImageCompressionControlEXT *app_cc = (VkImageCompressionControlEXT *)find_struct(fx->mod.pNext,
+            VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT);
+        fx->use = &fx->mod;
+        if (app_cc) {
+            fx->app_cc = app_cc;
+            fx->app_cc_saved = *app_cc;
+            app_cc->flags = VK_IMAGE_COMPRESSION_DISABLED_EXT;
+            app_cc->compressionControlPlaneCount = 0;
+            app_cc->pFixedRateFlags = NULL;
+        } else {
+            fx->afrc = (VkImageCompressionControlEXT){VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT, (void *)fx->mod.pNext,
+                                                      VK_IMAGE_COMPRESSION_DISABLED_EXT, 0, NULL};
+            fx->mod.pNext = &fx->afrc;
+        }
+    }
     // Wine on WoW64 chains HOST_ALLOCATION external memory into every image; the vendor refuses such images
     // (-1000158000) but binds a plain image to host-pointer memory fine (test/img-probe.c): unlink it for the call.
     for (VkBaseOutStructure *prev = (VkBaseOutStructure *)fx->use, *st = prev->pNext; st; prev = st, st = st->pNext) {
@@ -1595,6 +2038,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImage(
         }
     }
     if (res == VK_SUCCESS && g_log_images && pImage && *pImage) log_image(d, device, fx.use, *pImage, is_bc);
+    if (res == VK_SUCCESS && g_gpu_time && pImage && *pImage)
+        img_put(g_img_info, (struct ImgNode){(uint64_t)*pImage, *pImage, pCreateInfo->format, pCreateInfo->extent.width,
+                pCreateInfo->extent.height, 0, pCreateInfo->mipLevels, 0, pCreateInfo->arrayLayers, pCreateInfo->samples,
+                pCreateInfo->usage, NULL});
+    if (res == VK_SUCCESS && g_rt_compress && pImage && *pImage && (pCreateInfo->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+        (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !is_bc) {
+        if (fx.rt_stripped) {
+            rt_track(*pImage, rt_sig(pCreateInfo), fx.mod.usage);
+            atomic_fetch_add(&g_rt_stripped, 1);
+        } else {
+            atomic_fetch_add(&g_rt_kept, 1);
+        }
+    }
     if (res == VK_SUCCESS && is_bc && pImage && *pImage) {
         register_bc_image(*pImage, pCreateInfo->format, fx.mod.format, pCreateInfo->extent);
         LOG("emulating BC image %p: orig=%d -> decoded=%d (%ux%u)",
@@ -1608,10 +2064,11 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyImage(
     VkDevice device, VkImage image, const VkAllocationCallbacks *pAllocator) {
     struct DeviceData *d = get_device_data(device);
     unregister_bc_image(image);
+    if (g_rt_compress) rt_untrack(image);
     d->fpDestroyImage(device, image, pAllocator);
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImageView(
+static VkResult create_image_view(
     VkDevice device, const VkImageViewCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkImageView *pView) {
     struct DeviceData *d = get_device_data(device);
@@ -1623,7 +2080,38 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImageView(
         return d->fpCreateImageView(device, &mod, pAllocator, pView);
     }
 
+    // A storage view on a target created without STORAGE: learn it, and keep the view itself valid (DXVK chains the
+    // view's own usage; a view usage the image lacks is invalid) by asking for the image's other usages instead.
+    struct RTNode rt;
+    VkImageViewUsageCreateInfo *vu;
+    if (g_rt_compress && rt_find(pCreateInfo->image, &rt) &&
+        (vu = (VkImageViewUsageCreateInfo *)find_struct(pCreateInfo->pNext, VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO)) &&
+        (vu->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+        rt_learn(rt.sig);
+        VkImageUsageFlags saved = vu->usage;
+        vu->usage = (saved & ~VK_IMAGE_USAGE_STORAGE_BIT) & rt.usage;
+        if (!vu->usage) vu->usage = rt.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        VkResult res = d->fpCreateImageView(device, pCreateInfo, pAllocator, pView);
+        vu->usage = saved;
+        return res;
+    }
+
     return d->fpCreateImageView(device, pCreateInfo, pAllocator, pView);
+}
+
+// GPU timing: remembers what each view shows, for the STUCK/TRACE details.
+static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImageView(
+    VkDevice device, const VkImageViewCreateInfo *pCreateInfo,
+    const VkAllocationCallbacks *pAllocator, VkImageView *pView) {
+    VkResult res = create_image_view(device, pCreateInfo, pAllocator, pView);
+    if (g_gpu_time && res == VK_SUCCESS && pView) {
+        struct ImgNode img = {0};
+        img_get(g_img_info, (uint64_t)pCreateInfo->image, &img);
+        const VkImageSubresourceRange *r = &pCreateInfo->subresourceRange;
+        img_put(g_view_info, (struct ImgNode){(uint64_t)*pView, pCreateInfo->image, pCreateInfo->format, img.w, img.h,
+                r->baseMipLevel, r->levelCount, r->baseArrayLayer, r->layerCount, img.samples, r->aspectMask, NULL});
+    }
+    return res;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBufferView(
@@ -1907,6 +2395,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdBindPipeline(VkCommandBuffer command
     struct CmdBufData *c = cmd_data(commandBuffer);
     if (!c) { get_device_data_by_cmd(commandBuffer)->fpCmdBindPipeline(commandBuffer, bindPoint, pipeline); return; }
     if (bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) c->compute_pipeline = pipeline;
+    else if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) c->gfx_pipeline = pipeline;
     c->dev->fpCmdBindPipeline(commandBuffer, bindPoint, pipeline);
 }
 
@@ -2162,6 +2651,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_ResetCommandPool(
                     e->compute_pipeline = VK_NULL_HANDLE;
                     e->descriptor_buffers = false;
                     e->push_count = 0;
+                    e->gfx_pipeline = VK_NULL_HANDLE;
+                    e->gt_rec = -1;
+                    e->gt_src = VK_NULL_HANDLE;
                 }
             }
         }
@@ -2197,6 +2689,529 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyCommandPool(
 }
 
 // -----------------------------------------------------------------------------
+// GPU timing, MALI_COMPAT_GPU_TIME=1. [Claude Opus 5.5] 2026-10-28
+// Where the GPU time goes, without root or vendor tools: a timestamp pair around every render pass and every compute
+// dispatch, read back by a collector thread and summed per (kind, pipeline, render area). Every 5 s the top entries go
+// to /root/mali-gputime-<comm>.txt: share of the measured time, average and worst duration, count, draws, pipeline and
+// its shader hashes (see spv_hash). A pass whose start timestamp landed but whose end has not after 2 s is written as
+// STUCK: the work a GPU hang sits in; when the query reads start failing (device lost), the passes in flight are
+// written as INFLIGHT. Both timestamps are BOTTOM_OF_PIPE, so a duration runs from the end of the previous work to
+// the end of this one: idle gaps count to the next pass. For a pass, "pipe" is the pipeline of its first draw.
+// Needs hostQueryReset (enabled by the layer at vkCreateDevice). Only hooked while the switch is on.
+// -----------------------------------------------------------------------------
+#define GT_SLOTS 16384
+enum { GT_PASS = 1, GT_DISPATCH = 2 };
+struct GtRec {
+    _Atomic int state; // 0 free, 1 recorded
+    uint8_t kind;
+    bool stuck_reported, inflight;
+    uint32_t w, h, colors, draws;
+    VkPipeline pipeline;
+    uint64_t t_ns; // when recorded
+    // details for STUCK / TRACE lines: attachments, rendering layer count, first draw, source view
+    VkImageView color0, depth, src;
+    uint32_t rlayers, vcount, icount;
+};
+struct GtAgg { uint8_t kind; uint32_t w, h, colors; VkPipeline pipeline; uint64_t sum_ns, max_ns, draws; uint32_t count; };
+#define GT_AGG 4096
+struct GpuTime {
+    struct DeviceData *d;
+    VkQueryPool pool;
+    double period_ns;
+    pthread_mutex_t m;
+    uint32_t next;
+    struct GtRec rec[GT_SLOTS];
+    struct GtAgg agg[GT_AGG];
+    uint32_t recorded, dropped;
+    char path[96];
+    pthread_t thread;
+    _Atomic bool stop;
+    PFN_vkCmdWriteTimestamp fpCmdWriteTimestamp;
+    PFN_vkGetQueryPoolResults fpGetQueryPoolResults;
+    PFN_vkResetQueryPool fpResetQueryPool;
+    PFN_vkDestroyQueryPool fpDestroyQueryPool;
+    PFN_vkCmdBeginRendering fpCmdBeginRendering;
+    PFN_vkCmdEndRendering fpCmdEndRendering;
+    PFN_vkCmdBeginRenderPass fpCmdBeginRenderPass;
+    PFN_vkCmdEndRenderPass fpCmdEndRenderPass;
+    PFN_vkCmdBeginRenderPass2 fpCmdBeginRenderPass2;
+    PFN_vkCmdEndRenderPass2 fpCmdEndRenderPass2;
+    PFN_vkCmdDispatchIndirect fpCmdDispatchIndirect;
+    PFN_vkCmdDraw fpCmdDraw;
+    PFN_vkCmdDrawIndexed fpCmdDrawIndexed;
+    PFN_vkCmdDrawIndirect fpCmdDrawIndirect;
+    PFN_vkCmdDrawIndexedIndirect fpCmdDrawIndexedIndirect;
+    PFN_vkCmdDrawIndirectCount fpCmdDrawIndirectCount;
+    PFN_vkCmdDrawIndexedIndirectCount fpCmdDrawIndexedIndirectCount;
+    PFN_vkCmdPushDescriptorSetKHR fpCmdPushDescriptorSetKHR;
+    PFN_vkCmdDrawMultiEXT fpCmdDrawMultiEXT;
+    PFN_vkCmdDrawMultiIndexedEXT fpCmdDrawMultiIndexedEXT;
+    PFN_vkCmdDrawMeshTasksEXT fpCmdDrawMeshTasksEXT;
+    PFN_vkCmdDrawMeshTasksIndirectEXT fpCmdDrawMeshTasksIndirectEXT;
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT fpCmdDrawMeshTasksIndirectCountEXT;
+    PFN_vkCmdDispatchBase fpCmdDispatchBase;
+};
+
+// Calls per hooked entry point, printed with each report: shows which draw path the app really uses.
+enum { GTC_DRAW, GTC_DRAW_INDEXED, GTC_DRAW_INDIRECT, GTC_DRAW_INDEXED_INDIRECT, GTC_DRAW_INDIRECT_COUNT,
+       GTC_DRAW_INDEXED_INDIRECT_COUNT, GTC_DRAW_MULTI, GTC_DRAW_MULTI_INDEXED, GTC_MESH, GTC_MESH_INDIRECT,
+       GTC_MESH_INDIRECT_COUNT, GTC_DISPATCH, GTC_DISPATCH_INDIRECT, GTC_DISPATCH_BASE, GTC_RENDERING, GTC_RENDERPASS, GTC_N };
+static const char *const g_gtc_name[GTC_N] = {"Draw", "DrawIndexed", "DrawIndirect", "DrawIndexedIndirect", "DrawIndirectCount",
+    "DrawIndexedIndirectCount", "DrawMultiEXT", "DrawMultiIndexedEXT", "DrawMeshTasksEXT", "DrawMeshTasksIndirectEXT",
+    "DrawMeshTasksIndirectCountEXT", "Dispatch", "DispatchIndirect", "DispatchBase", "BeginRendering", "BeginRenderPass"};
+static _Atomic uint64_t g_gtc[GTC_N];
+#define GTC(i) atomic_fetch_add_explicit(&g_gtc[i], 1, memory_order_relaxed)
+
+static uint64_t gt_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void gt_free_slot(struct GpuTime *g, uint32_t i) {
+    g->fpResetQueryPool(g->d->device, g->pool, 2 * i, 2);
+    atomic_store(&g->rec[i].state, 0);
+}
+
+// Takes a slot and writes the start timestamp; -1 when the ring is full of pending records (counted as dropped).
+static int32_t gt_begin(struct CmdBufData *c, VkCommandBuffer cmd, uint8_t kind, uint32_t w, uint32_t h, uint32_t colors,
+                        VkPipeline pipeline) {
+    struct GpuTime *g = c ? c->dev->gt : NULL;
+    if (!g || !g->pool) return -1;
+    pthread_mutex_lock(&g->m);
+    uint32_t i = g->next;
+    g->next = (i + 1) % GT_SLOTS;
+    struct GtRec *r = &g->rec[i];
+    if (atomic_load(&r->state)) { g->dropped++; pthread_mutex_unlock(&g->m); return -1; }
+    r->kind = kind; r->w = w; r->h = h; r->colors = colors; r->draws = 0; r->pipeline = pipeline;
+    r->stuck_reported = r->inflight = false;
+    r->color0 = r->depth = r->src = VK_NULL_HANDLE;
+    r->rlayers = r->vcount = r->icount = 0;
+    r->t_ns = gt_now();
+    atomic_store(&r->state, 1);
+    g->recorded++;
+    pthread_mutex_unlock(&g->m);
+    g->fpCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->pool, 2 * i);
+    return (int32_t)i;
+}
+
+static void gt_end(struct CmdBufData *c, VkCommandBuffer cmd, int32_t i) {
+    if (i >= 0) c->dev->gt->fpCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->dev->gt->pool, 2 * i + 1);
+}
+
+static void gt_pipe_desc(VkPipeline p, char *out, size_t len) {
+    struct HashNode h;
+    int n = snprintf(out, len, "pipe %p", (void *)p);
+    if (p && hash_get(g_pipeline_hash, (uint64_t)p, &h))
+        for (int s = 0; s < 3 && h.stages[s]; s++) {
+            const char *nm = h.stages[s] == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : h.stages[s] == VK_SHADER_STAGE_FRAGMENT_BIT ? "fs"
+                           : h.stages[s] == VK_SHADER_STAGE_COMPUTE_BIT ? "cs" : "st";
+            n += snprintf(out + n, len - n, " %s:%08x", nm, h.hash[s]);
+        }
+}
+
+static void gt_view_desc(const char *name, VkImageView v, struct ImgNode *out, char *buf, size_t len) {
+    struct ImgNode n = {0};
+    if (!v) { snprintf(buf, len, " %s -", name); memset(out, 0, sizeof *out); return; }
+    if (!img_get(g_view_info, (uint64_t)v, &n)) { snprintf(buf, len, " %s view %p (unknown)", name, (void *)v); memset(out, 0, sizeof *out); return; }
+    struct ImgNode im = {0};
+    img_get(g_img_info, (uint64_t)n.image, &im);
+    snprintf(buf, len, " %s img %p fmt %d (view %d) %ux%u x%u mips, view mip %u+%u layer %u+%u of %u, aspect 0x%x, samples %u",
+             name, (void *)n.image, im.format, n.format, im.w, im.h, im.mips, n.mip, n.mips, n.layer, n.layers, im.layers,
+             n.usage, im.samples);
+    *out = n;
+}
+
+static void gt_line_rec(FILE *f, const char *tag, const struct GtRec *r, double age_s, double dur_ms) {
+    char desc[160], c0[200], dp[200], src[200];
+    struct ImgNode nc, nd, ns;
+    gt_pipe_desc(r->pipeline, desc, sizeof desc);
+    gt_view_desc("color0", r->color0, &nc, c0, sizeof c0);
+    gt_view_desc("depth", r->depth, &nd, dp, sizeof dp);
+    gt_view_desc("src", r->src, &ns, src, sizeof src);
+    bool same = ns.image && (ns.image == nc.image || ns.image == nd.image);
+    fprintf(f, "%s %s %ux%u c%u draws %u (first: %u verts x %u inst) rlayers %u, %s %.1f %s, %s%s%s%s%s\n", tag,
+            r->kind == GT_PASS ? "pass" : "dispatch", r->w, r->h, r->colors, r->draws, r->vcount, r->icount, r->rlayers,
+            dur_ms >= 0 ? "took" : "recorded", dur_ms >= 0 ? dur_ms : age_s, dur_ms >= 0 ? "ms" : "s ago", desc, c0, dp, src,
+            same ? "  SAME-IMAGE" : "");
+}
+
+// MALI_COMPAT_GT_TRACE: does this record's pipeline have the traced fragment/compute shader?
+static bool gt_traced(const struct GtRec *r) {
+    struct HashNode h;
+    if (!g_gt_trace || !r->pipeline || !hash_get(g_pipeline_hash, (uint64_t)r->pipeline, &h)) return false;
+    for (int i = 0; i < 3; i++) if (h.hash[i] == g_gt_trace) return true;
+    return false;
+}
+
+static int gt_cmp(const void *a, const void *b) {
+    const struct GtAgg *x = a, *y = b;
+    return x->sum_ns < y->sum_ns ? 1 : x->sum_ns > y->sum_ns ? -1 : 0;
+}
+
+static void gt_report(struct GpuTime *g, double interval_s) {
+    struct GtAgg *v = malloc(sizeof g->agg);
+    if (!v) return;
+    uint32_t n = 0;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < GT_AGG; i++)
+        if (g->agg[i].count) { v[n++] = g->agg[i]; total += g->agg[i].sum_ns; }
+    qsort(v, n, sizeof *v, gt_cmp);
+    FILE *f = fopen(g->path, "a");
+    if (f) {
+        time_t t = time(NULL);
+        struct tm tm;
+        localtime_r(&t, &tm);
+        pthread_mutex_lock(&g->m);
+        uint32_t rec = g->recorded, drop = g->dropped;
+        g->recorded = g->dropped = 0;
+        pthread_mutex_unlock(&g->m);
+        fprintf(f, "=== %02d:%02d:%02d  %.1f s: measured %.0f ms GPU time (%.0f %% of the interval), %u records, %u dropped\n",
+                tm.tm_hour, tm.tm_min, tm.tm_sec, interval_s, total / 1e6, 100.0 * total / (interval_s * 1e9), rec, drop);
+        fprintf(f, "calls since start:");
+        for (int k = 0; k < GTC_N; k++) {
+            uint64_t c = atomic_load(&g_gtc[k]);
+            if (c) fprintf(f, " %s %llu", g_gtc_name[k], (unsigned long long)c);
+        }
+        fprintf(f, "\n");
+        for (uint32_t i = 0; i < n && i < 25; i++) {
+            char desc[160];
+            gt_pipe_desc(v[i].pipeline, desc, sizeof desc);
+            fprintf(f, "%5.1f%%  avg %7.3f ms  max %7.2f ms  n %5u  %-8s %4ux%-4u c%u draws %5.1f  %s\n",
+                    total ? 100.0 * v[i].sum_ns / total : 0, v[i].sum_ns / 1e6 / v[i].count, v[i].max_ns / 1e6, v[i].count,
+                    v[i].kind == GT_PASS ? "pass" : "dispatch", v[i].w, v[i].h, v[i].colors,
+                    (double)v[i].draws / v[i].count, desc);
+        }
+        fclose(f);
+    }
+    free(v);
+    memset(g->agg, 0, sizeof g->agg);
+}
+
+// Dispatches are grouped per pipeline; passes per render area and colour target count with draws or without (a pass
+// with draws runs many pipelines, so grouping it by its first one scattered the heavy passes; "pipe" is then the
+// first draw's pipeline of the last pass seen in the group).
+static void gt_add(struct GpuTime *g, const struct GtRec *r, uint64_t ns) {
+    VkPipeline kp = r->kind == GT_PASS ? (r->draws ? (VkPipeline)(uintptr_t)1 : VK_NULL_HANDLE) : r->pipeline;
+    uint64_t key = (uint64_t)(uintptr_t)kp ^ ((uint64_t)r->kind << 56) ^ ((uint64_t)r->w << 36) ^ ((uint64_t)r->h << 16) ^ r->colors;
+    uint32_t b = handle_bucket(key, GT_AGG);
+    for (uint32_t probe = 0; probe < GT_AGG; probe++, b = (b + 1) % GT_AGG) {
+        struct GtAgg *a = &g->agg[b];
+        bool a_draws = a->kind == GT_PASS && a->draws, match_kp = r->kind == GT_PASS ? (a_draws == (r->draws != 0)) : a->pipeline == r->pipeline;
+        if (!a->count) {
+            *a = (struct GtAgg){r->kind, r->w, r->h, r->colors, r->pipeline, 0, 0, 0, 0};
+        } else if (a->kind != r->kind || a->w != r->w || a->h != r->h || a->colors != r->colors || !match_kp) {
+            continue;
+        }
+        if (r->kind == GT_PASS && r->pipeline) a->pipeline = r->pipeline;
+        a->sum_ns += ns;
+        if (ns > a->max_ns) a->max_ns = ns;
+        a->draws += r->draws;
+        a->count++;
+        return;
+    }
+}
+
+static void *gt_thread(void *arg) {
+    struct GpuTime *g = arg;
+    uint64_t last = gt_now();
+    bool lost = false;
+    while (!atomic_load(&g->stop)) {
+        usleep(250000);
+        uint64_t now = gt_now();
+        for (uint32_t i = 0; i < GT_SLOTS && !lost; i++) {
+            struct GtRec *r = &g->rec[i];
+            if (!atomic_load(&r->state)) continue;
+            uint64_t v[4] = {0};
+            VkResult res = g->fpGetQueryPoolResults(g->d->device, g->pool, 2 * i, 2, sizeof v, v, 2 * sizeof(uint64_t),
+                                                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            double age = (now - r->t_ns) / 1e9;
+            if (res < 0) {
+                // The device is gone: write what was running on the GPU and stop reading.
+                FILE *f = fopen(g->path, "a");
+                if (f) {
+                    fprintf(f, "=== query read failed (%d): passes in flight at that point:\n", res);
+                    for (uint32_t k = 0; k < GT_SLOTS; k++)
+                        if (atomic_load(&g->rec[k].state) && g->rec[k].inflight)
+                            gt_line_rec(f, "INFLIGHT", &g->rec[k], (now - g->rec[k].t_ns) / 1e9, -1);
+                    fclose(f);
+                }
+                lost = true;
+                break;
+            }
+            if (v[1] && v[3]) {
+                // end before start: the slot was rewritten (command buffer resubmitted after the slot was reused)
+                uint64_t ns = v[2] >= v[0] ? (uint64_t)((double)(v[2] - v[0]) * g->period_ns) : 0;
+                if (gt_traced(r)) {
+                    FILE *f = fopen(g->path, "a");
+                    if (f) { gt_line_rec(f, "TRACE", r, age, ns / 1e6); fclose(f); }
+                }
+                gt_add(g, r, ns);
+                gt_free_slot(g, i);
+            } else if (v[1]) {
+                r->inflight = age > 0.5;
+                if (age > 2.0 && !r->stuck_reported) {
+                    FILE *f = fopen(g->path, "a");
+                    if (f) { gt_line_rec(f, "STUCK", r, age, -1); fclose(f); }
+                    r->stuck_reported = true;
+                }
+                if (age > 60.0) gt_free_slot(g, i);
+            } else if (age > 10.0) {
+                gt_free_slot(g, i); // recorded but never executed (command buffer reset or not submitted)
+            }
+        }
+        if (now - last >= 5000000000ull && !lost) {
+            gt_report(g, (now - last) / 1e9);
+            last = now;
+        }
+    }
+    return NULL;
+}
+
+static void gt_init(struct DeviceData *d, PFN_vkGetDeviceProcAddr gdpa) {
+    struct GpuTime *g = calloc(1, sizeof *g);
+    if (!g) return;
+    g->d = d;
+    pthread_mutex_init(&g->m, NULL);
+    #define GT_LOAD(fn) g->fp##fn = (PFN_vk##fn)gdpa(d->device, "vk" #fn)
+    #define GT_LOAD_KHR(fn) if (!(GT_LOAD(fn))) g->fp##fn = (PFN_vk##fn)gdpa(d->device, "vk" #fn "KHR")
+    GT_LOAD(CmdWriteTimestamp);
+    GT_LOAD(GetQueryPoolResults);
+    GT_LOAD(DestroyQueryPool);
+    GT_LOAD(CmdBeginRenderPass);
+    GT_LOAD(CmdEndRenderPass);
+    GT_LOAD(CmdDispatchIndirect);
+    GT_LOAD(CmdDraw);
+    GT_LOAD(CmdDrawIndexed);
+    GT_LOAD(CmdDrawIndirect);
+    GT_LOAD(CmdDrawIndexedIndirect);
+    if (!(GT_LOAD(ResetQueryPool))) g->fpResetQueryPool = (PFN_vkResetQueryPool)gdpa(d->device, "vkResetQueryPoolEXT");
+    GT_LOAD_KHR(CmdBeginRendering);
+    GT_LOAD_KHR(CmdEndRendering);
+    GT_LOAD_KHR(CmdBeginRenderPass2);
+    GT_LOAD_KHR(CmdEndRenderPass2);
+    GT_LOAD_KHR(CmdDrawIndirectCount);
+    GT_LOAD_KHR(CmdDrawIndexedIndirectCount);
+    GT_LOAD(CmdDrawMultiEXT);
+    GT_LOAD(CmdDrawMultiIndexedEXT);
+    GT_LOAD(CmdDrawMeshTasksEXT);
+    GT_LOAD(CmdDrawMeshTasksIndirectEXT);
+    GT_LOAD(CmdDrawMeshTasksIndirectCountEXT);
+    GT_LOAD_KHR(CmdDispatchBase);
+    g->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)gdpa(d->device, "vkCmdPushDescriptorSetKHR");
+    if (!g->fpCmdPushDescriptorSetKHR) g->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)gdpa(d->device, "vkCmdPushDescriptorSet");
+    #undef GT_LOAD
+    #undef GT_LOAD_KHR
+    PFN_vkCreateQueryPool create = (PFN_vkCreateQueryPool)gdpa(d->device, "vkCreateQueryPool");
+    VkPhysicalDeviceProperties2 props = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    if (d->instance_data && d->instance_data->fpGetPhysicalDeviceProperties2)
+        d->instance_data->fpGetPhysicalDeviceProperties2(d->physical_device, &props);
+    g->period_ns = props.properties.limits.timestampPeriod > 0 ? props.properties.limits.timestampPeriod : 1.0;
+    VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * GT_SLOTS};
+    // The hooks are already handed out and pass through d->gt's function pointers, so d->gt stays even without a pool.
+    d->gt = g;
+    if (!create || !g->fpCmdWriteTimestamp || !g->fpGetQueryPoolResults || !g->fpResetQueryPool ||
+        create(d->device, &qi, NULL, &g->pool) != VK_SUCCESS) {
+        g->pool = VK_NULL_HANDLE;
+        fprintf(stderr, "mali-compat: GPU timing unavailable (query pool or hostQueryReset missing)\n");
+        return;
+    }
+    g->fpResetQueryPool(d->device, g->pool, 0, 2 * GT_SLOTS);
+    char comm[32] = "unknown";
+    FILE *f = fopen("/proc/self/comm", "r");
+    if (f) { if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0; fclose(f); }
+    for (char *c = comm; *c; c++) if (*c == '/' || *c == ' ' || *c == '\\') *c = '_';
+    snprintf(g->path, sizeof g->path, "/root/mali-gputime-%s.txt", comm);
+    if ((f = fopen(g->path, "a"))) {
+        fprintf(f, "=== GPU timing on for device %p (%s), timestamp period %.3f ns, %u slots\n", (void *)d->device,
+                props.properties.deviceName, g->period_ns, GT_SLOTS);
+        fclose(f);
+    }
+    if (pthread_create(&g->thread, NULL, gt_thread, g) != 0) {
+        g->fpDestroyQueryPool(d->device, g->pool, NULL);
+        g->pool = VK_NULL_HANDLE;
+        return;
+    }
+    fprintf(stderr, "mali-compat: GPU timing on, report in %s\n", g->path);
+}
+
+static void gt_destroy(struct DeviceData *d) {
+    struct GpuTime *g = d->gt;
+    if (!g) return;
+    if (g->pool) {
+        atomic_store(&g->stop, true);
+        pthread_join(g->thread, NULL);
+        g->fpDestroyQueryPool(d->device, g->pool, NULL);
+    }
+    d->gt = NULL;
+    free(g);
+}
+
+static void gt_render_begin(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t colors, const VkRenderingInfo *ri) {
+    struct CmdBufData *c = cmd_data(cmd);
+    if (!c || !c->dev->gt) return;
+    c->gt_rec = gt_begin(c, cmd, GT_PASS, w, h, colors, VK_NULL_HANDLE);
+    if (c->gt_rec >= 0 && ri) {
+        struct GtRec *r = &c->dev->gt->rec[c->gt_rec];
+        r->rlayers = ri->layerCount;
+        if (ri->colorAttachmentCount && ri->pColorAttachments) r->color0 = ri->pColorAttachments[0].imageView;
+        if (ri->pDepthAttachment) r->depth = ri->pDepthAttachment->imageView;
+    }
+}
+
+static void gt_render_end(VkCommandBuffer cmd) {
+    struct CmdBufData *c = cmd_data(cmd);
+    if (c && c->dev->gt && c->gt_rec >= 0) { gt_end(c, cmd, c->gt_rec); c->gt_rec = -1; }
+}
+
+static void gt_draw(struct CmdBufData *c, uint32_t vcount, uint32_t icount) {
+    if (!c || c->gt_rec < 0 || !c->dev->gt) return;
+    struct GtRec *r = &c->dev->gt->rec[c->gt_rec];
+    if (!r->draws++) { r->pipeline = c->gfx_pipeline; r->vcount = vcount; r->icount = icount; r->src = c->gt_src; }
+}
+
+// The image a meta pass reads: vkd3d binds its copy source with a push descriptor.
+static VKAPI_ATTR void VKAPI_CALL compat_CmdPushDescriptorSetKHR(VkCommandBuffer cmd, VkPipelineBindPoint bp, VkPipelineLayout layout,
+                                                                 uint32_t set, uint32_t count, const VkWriteDescriptorSet *w) {
+    struct CmdBufData *c = cmd_data(cmd);
+    for (uint32_t i = 0; c && i < count; i++)
+        if ((w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+             w[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || w[i].descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) &&
+            w[i].pImageInfo && w[i].descriptorCount) {
+            c->gt_src = w[i].pImageInfo[0].imageView;
+            break;
+        }
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdPushDescriptorSetKHR(cmd, bp, layout, set, count, w);
+}
+
+static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRendering(VkCommandBuffer cmd, const VkRenderingInfo *ri) {
+    GTC(GTC_RENDERING);
+    gt_render_begin(cmd, ri->renderArea.extent.width, ri->renderArea.extent.height, ri->colorAttachmentCount, ri);
+    get_device_data_by_cmd(cmd)->gt->fpCmdBeginRendering(cmd, ri);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdEndRendering(VkCommandBuffer cmd) {
+    get_device_data_by_cmd(cmd)->gt->fpCmdEndRendering(cmd);
+    gt_render_end(cmd);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRenderPass(VkCommandBuffer cmd, const VkRenderPassBeginInfo *bi,
+                                                            VkSubpassContents contents) {
+    GTC(GTC_RENDERPASS);
+    gt_render_begin(cmd, bi->renderArea.extent.width, bi->renderArea.extent.height, 0, NULL);
+    get_device_data_by_cmd(cmd)->gt->fpCmdBeginRenderPass(cmd, bi, contents);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdEndRenderPass(VkCommandBuffer cmd) {
+    get_device_data_by_cmd(cmd)->gt->fpCmdEndRenderPass(cmd);
+    gt_render_end(cmd);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRenderPass2(VkCommandBuffer cmd, const VkRenderPassBeginInfo *bi,
+                                                             const VkSubpassBeginInfo *si) {
+    gt_render_begin(cmd, bi->renderArea.extent.width, bi->renderArea.extent.height, 0, NULL);
+    get_device_data_by_cmd(cmd)->gt->fpCmdBeginRenderPass2(cmd, bi, si);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdEndRenderPass2(VkCommandBuffer cmd, const VkSubpassEndInfo *ei) {
+    get_device_data_by_cmd(cmd)->gt->fpCmdEndRenderPass2(cmd, ei);
+    gt_render_end(cmd);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatch(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z) {
+    GTC(GTC_DISPATCH);
+    struct CmdBufData *c = cmd_data(cmd);
+    if (!c) { get_device_data_by_cmd(cmd)->fpCmdDispatch(cmd, x, y, z); return; }
+    int32_t i = gt_begin(c, cmd, GT_DISPATCH, x, y, z, c->compute_pipeline); // "WxH cZ" = the group counts
+    c->dev->fpCmdDispatch(cmd, x, y, z);
+    gt_end(c, cmd, i);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatchIndirect(VkCommandBuffer cmd, VkBuffer buf, VkDeviceSize off) {
+    GTC(GTC_DISPATCH_INDIRECT);
+    struct CmdBufData *c = cmd_data(cmd);
+    if (!c) { get_device_data_by_cmd(cmd)->gt->fpCmdDispatchIndirect(cmd, buf, off); return; }
+    int32_t i = gt_begin(c, cmd, GT_DISPATCH, 0, 0, 0, c->compute_pipeline); // indirect: group counts unknown (0x0)
+    c->dev->gt->fpCmdDispatchIndirect(cmd, buf, off);
+    gt_end(c, cmd, i);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDraw(VkCommandBuffer cmd, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
+    GTC(GTC_DRAW);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, vc, ic);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDraw(cmd, vc, ic, fv, fi);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexed(VkCommandBuffer cmd, uint32_t xc, uint32_t ic, uint32_t fx, int32_t vo,
+                                                        uint32_t fi) {
+    GTC(GTC_DRAW_INDEXED);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, xc, ic);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndexed(cmd, xc, ic, fx, vo, fi);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndirect(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s) {
+    GTC(GTC_DRAW_INDIRECT);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, 0, 0);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndirect(cmd, b, o, n, s);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, uint32_t n,
+                                                                uint32_t s) {
+    GTC(GTC_DRAW_INDEXED_INDIRECT);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, 0, 0);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndexedIndirect(cmd, b, o, n, s);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndirectCount(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, VkBuffer cb,
+                                                              VkDeviceSize co, uint32_t n, uint32_t s) {
+    GTC(GTC_DRAW_INDIRECT_COUNT);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, 0, 0);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndirectCount(cmd, b, o, cb, co, n, s);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexedIndirectCount(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, VkBuffer cb,
+                                                                     VkDeviceSize co, uint32_t n, uint32_t s) {
+    GTC(GTC_DRAW_INDEXED_INDIRECT_COUNT);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, 0, 0);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndexedIndirectCount(cmd, b, o, cb, co, n, s);
+}
+
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMultiEXT(VkCommandBuffer cmd, uint32_t n, const VkMultiDrawInfoEXT *info,
+                                                         uint32_t ic, uint32_t fi, uint32_t stride) {
+    GTC(GTC_DRAW_MULTI);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, n && info ? info->vertexCount : 0, ic);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMultiEXT(cmd, n, info, ic, fi, stride);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMultiIndexedEXT(VkCommandBuffer cmd, uint32_t n, const VkMultiDrawIndexedInfoEXT *info,
+                                                                uint32_t ic, uint32_t fi, uint32_t stride, const int32_t *vo) {
+    GTC(GTC_DRAW_MULTI_INDEXED);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, n && info ? info->indexCount : 0, ic);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMultiIndexedEXT(cmd, n, info, ic, fi, stride, vo);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMeshTasksEXT(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z) {
+    GTC(GTC_MESH);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, x, y);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMeshTasksEXT(cmd, x, y, z);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s) {
+    GTC(GTC_MESH_INDIRECT);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, 0, 0);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMeshTasksIndirectEXT(cmd, b, o, n, s);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, VkBuffer cb,
+                                                                          VkDeviceSize co, uint32_t n, uint32_t s) {
+    GTC(GTC_MESH_INDIRECT_COUNT);
+    struct CmdBufData *c = cmd_data(cmd);
+    gt_draw(c, 0, 0);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMeshTasksIndirectCountEXT(cmd, b, o, cb, co, n, s);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatchBase(VkCommandBuffer cmd, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x,
+                                                         uint32_t y, uint32_t z) {
+    GTC(GTC_DISPATCH_BASE);
+    struct CmdBufData *c = cmd_data(cmd);
+    int32_t i = gt_begin(c, cmd, GT_DISPATCH, x, y, z, c ? c->compute_pipeline : VK_NULL_HANDLE);
+    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDispatchBase(cmd, bx, by, bz, x, y, z);
+    if (c) gt_end(c, cmd, i);
+}
+
+// -----------------------------------------------------------------------------
 // Layer Core: CreateInstance & CreateDevice
 // -----------------------------------------------------------------------------
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
@@ -2210,6 +3225,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_log_pipelines = access("/root/mali-pipelines.txt", W_OK) == 0;
     g_log_images = access("/root/mali-images.txt", W_OK) == 0;
     g_bc_afrc = !getenv("MALI_COMPAT_BC_AFRC") || strcmp(getenv("MALI_COMPAT_BC_AFRC"), "0") != 0;
+    bool rt = getenv("MALI_COMPAT_RT_COMPRESS") && strcmp(getenv("MALI_COMPAT_RT_COMPRESS"), "0") != 0;
+    if (rt && !g_rt_compress) rt_keep_load(); // once per process: DXVK creates several instances
+    g_rt_compress = rt;
+    g_gpu_time = getenv("MALI_COMPAT_GPU_TIME") && strcmp(getenv("MALI_COMPAT_GPU_TIME"), "0") != 0;
+    g_depth_nocomp = getenv("MALI_COMPAT_DEPTH_NOCOMP") && strcmp(getenv("MALI_COMPAT_DEPTH_NOCOMP"), "0") != 0;
+    // on by default: the write it removes is discarded by the spec anyway (MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off)
+    g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
+    g_gt_trace = getenv("MALI_COMPAT_GT_TRACE") ? (uint32_t)strtoul(getenv("MALI_COMPAT_GT_TRACE"), NULL, 16) : 0;
+    g_dump_hash_count = 0;
+    for (const char *h = getenv("MALI_COMPAT_DUMP_HASH"); h && *h && g_dump_hash_count < 16;) {
+        char *end;
+        unsigned long v = strtoul(h, &end, 16);
+        if (end == h) break;
+        g_dump_hashes[g_dump_hash_count++] = (uint32_t)v;
+        h = *end == ',' ? end + 1 : end;
+    }
 
     VkLayerInstanceCreateInfo *chain_info = (VkLayerInstanceCreateInfo *)pCreateInfo->pNext;
     while (chain_info &&
@@ -2411,6 +3442,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         mod_ci.pNext = &bda_feat;
     }
 
+    // GPU timing resets its timestamp queries from the collector thread: hostQueryReset (Vulkan 1.2 core).
+    VkPhysicalDeviceHostQueryResetFeatures hqr_feat = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, NULL, VK_TRUE};
+    VkPhysicalDeviceHostQueryResetFeatures *app_hqr = (VkPhysicalDeviceHostQueryResetFeatures *)find_struct(pCreateInfo->pNext,
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES);
+    VkBool32 saved_v12_hqr = v12_feat ? v12_feat->hostQueryReset : VK_FALSE;
+    VkBool32 saved_app_hqr = app_hqr ? app_hqr->hostQueryReset : VK_FALSE;
+    if (g_gpu_time) {
+        if (v12_feat) v12_feat->hostQueryReset = VK_TRUE;
+        else if (app_hqr) app_hqr->hostQueryReset = VK_TRUE;
+        else { hqr_feat.pNext = (void *)mod_ci.pNext; mod_ci.pNext = &hqr_feat; }
+    }
+
     VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR *app_div =
         (VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR *)find_struct(pCreateInfo->pNext,
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR);
@@ -2440,6 +3483,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     }
     if (v12_feat) v12_feat->bufferDeviceAddress = saved_v12_bda;
     if (existing_bda) existing_bda->bufferDeviceAddress = saved_existing_bda;
+    if (v12_feat) v12_feat->hostQueryReset = saved_v12_hqr;
+    if (app_hqr) app_hqr->hostQueryReset = saved_app_hqr;
 
     if (res != VK_SUCCESS) {
         LOG("fpCreateDevice failed: %d", res);
@@ -2517,7 +3562,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             if (!d->fpGetImageSubresourceLayout2KHR)
                 d->fpGetImageSubresourceLayout2KHR = (PFN_vkGetImageSubresourceLayout2KHR)fpGetDeviceProcAddr(*pDevice, "vkGetImageSubresourceLayout2EXT");
         }
+        d->fpCreateComputePipelinesReal = (PFN_vkCreateComputePipelines)fpGetDeviceProcAddr(*pDevice, "vkCreateComputePipelines");
         #undef LOAD_DEV
+        if (g_gpu_time) gt_init(d, fpGetDeviceProcAddr);
         if (inst && inst->fpGetPhysicalDeviceMemoryProperties) {
             VkPhysicalDeviceMemoryProperties mp;
             inst->fpGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
@@ -2536,6 +3583,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
     VkDevice device, const VkAllocationCallbacks *pAllocator) {
     struct DeviceData *d = get_device_data(device);
     if (d) {
+        gt_destroy(d);
         if (d->bc_init_done) {
             for (int i = 0; i < 4; i++) {
                 if (d->bc_pipelines[i]) d->fpDestroyPipeline(device, d->bc_pipelines[i], NULL);
@@ -2572,6 +3620,21 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     // "vkGetDeviceProcAddr" it gets here. Forwarding the name handed it the driver's, so vkCreateShaderModule and
     // vkCreateGraphicsPipelines skipped this layer (no SPIR-V patching, vendor compiler crash). [Claude Opus 5.5]
     if (!strcmp(pName, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+    // GPU timing: which vkCmdDraw*/Dispatch* entry points the app asks for (once each), to see what the hooks miss.
+    if (g_gpu_time && (!strncmp(pName, "vkCmdDraw", 9) || !strncmp(pName, "vkCmdDispatch", 13) ||
+                       !strncmp(pName, "vkCmdExecute", 12) || !strncmp(pName, "vkCmdBeginRender", 16))) {
+        static char seen[64][48];
+        static int nseen;
+        static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&m);
+        int k = 0;
+        while (k < nseen && strcmp(seen[k], pName)) k++;
+        if (k == nseen && nseen < 64) {
+            snprintf(seen[nseen++], sizeof seen[0], "%s", pName);
+            fprintf(stderr, "mali-compat: GPU timing: app asked for %s\n", pName);
+        }
+        pthread_mutex_unlock(&m);
+    }
     // Only expose the map2 entry points when they exist below: 64-bit Wine does not enable VK_KHR_map_memory2, and
     // handing it our function then made it call through a NULL driver pointer (The Witcher 3: crash in vkMapMemory).
     // [Claude Opus 5.5]
@@ -2601,6 +3664,42 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         if (!dd || !dd->fpMapMemory2KHR) return dd ? dd->get_device_proc_addr(device, pName) : NULL;
     }
     #define MATCH_DEV(fn) if (!strcmp(pName, "vk" #fn)) return (PFN_vkVoidFunction)compat_##fn
+    // GPU timing hooks: only while the switch is on, so the normal path calls the driver directly.
+    #define MATCH_DEV_KHR(fn) if (!strcmp(pName, "vk" #fn) || !strcmp(pName, "vk" #fn "KHR")) return (PFN_vkVoidFunction)compat_##fn
+    if (g_gpu_time) {
+        MATCH_DEV_KHR(CmdBeginRendering);
+        MATCH_DEV_KHR(CmdEndRendering);
+        MATCH_DEV(CmdBeginRenderPass);
+        MATCH_DEV(CmdEndRenderPass);
+        MATCH_DEV_KHR(CmdBeginRenderPass2);
+        MATCH_DEV_KHR(CmdEndRenderPass2);
+        MATCH_DEV(CmdDispatch);
+        MATCH_DEV(CmdDispatchIndirect);
+        MATCH_DEV(CmdDraw);
+        MATCH_DEV(CmdDrawIndexed);
+        MATCH_DEV(CmdDrawIndirect);
+        MATCH_DEV(CmdDrawIndexedIndirect);
+        MATCH_DEV_KHR(CmdDrawIndirectCount);
+        MATCH_DEV_KHR(CmdDrawIndexedIndirectCount);
+        struct DeviceData *gd = get_device_data(device);
+        if (gd && gd->gt) {
+            #define MATCH_GT_OPT(fn) if (!strcmp(pName, "vk" #fn) && gd->gt->fp##fn) return (PFN_vkVoidFunction)compat_##fn
+            MATCH_GT_OPT(CmdDrawMultiEXT);
+            MATCH_GT_OPT(CmdDrawMultiIndexedEXT);
+            MATCH_GT_OPT(CmdDrawMeshTasksEXT);
+            MATCH_GT_OPT(CmdDrawMeshTasksIndirectEXT);
+            MATCH_GT_OPT(CmdDrawMeshTasksIndirectCountEXT);
+            if ((!strcmp(pName, "vkCmdDispatchBase") || !strcmp(pName, "vkCmdDispatchBaseKHR")) && gd->gt->fpCmdDispatchBase)
+                return (PFN_vkVoidFunction)compat_CmdDispatchBase;
+            #undef MATCH_GT_OPT
+        }
+        if (!strcmp(pName, "vkCmdPushDescriptorSetKHR") || !strcmp(pName, "vkCmdPushDescriptorSet")) {
+            struct DeviceData *dd = get_device_data(device);
+            if (dd && dd->gt && dd->gt->fpCmdPushDescriptorSetKHR) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
+        }
+    }
+    if (g_gpu_time || g_dump_hash_count) MATCH_DEV(CreateComputePipelines);
+    #undef MATCH_DEV_KHR
     MATCH_DEV(DestroyDevice);
     MATCH_DEV(CreateShaderModule);
     MATCH_DEV(CreateGraphicsPipelines);
