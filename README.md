@@ -71,7 +71,8 @@ git submodule update --init
 ./build-bridge.sh zip   # build/mali_bridge/Mali_Bridge.zip for DroidDeck's driver import page
 ```
 
-`build-bridge.sh install-driver` and `deploy` push the results to a connected phone with adb.
+`build-bridge.sh install-driver` and `deploy` push the results to a connected phone with adb. `./package.sh` packs
+the built files into `build/dist/blobferry-<commit>.zip` with an adb install script (`install-adb.sh`) and the licenses.
 
 ## Debug switches
 
