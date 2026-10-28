@@ -2591,7 +2591,9 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
         const struct PushRec *pr = &cstate->push[i];
         d->fpCmdPushConstants(commandBuffer, pr->layout, pr->stages, pr->offset, pr->size, pr->data);
     }
-    if (cstate->cpd.layout && !cstate->cpd.bad && cstate->cpd.count && d->fpCmdPushDescriptorSetKHR)
+    // Only with MALI_COMPAT_VENDOR_ID: the recorded writes can name image/buffer views the app has destroyed since,
+    // and pushing them again crashed Horizon Zero Dawn's benchmark load (C0000005, 2026-10-28 22:49).
+    if (g_vendor_id && cstate->cpd.layout && !cstate->cpd.bad && cstate->cpd.count && d->fpCmdPushDescriptorSetKHR)
         d->fpCmdPushDescriptorSetKHR(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cstate->cpd.layout, cstate->cpd.set,
                                      cstate->cpd.count, cstate->cpd.w);
     if (dec != stack_regs) free(dec);
@@ -3158,7 +3160,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushDescriptorSetKHR(VkCommandBuffer
         }
     struct PushDescRec *r = !c ? NULL : bp == VK_PIPELINE_BIND_POINT_COMPUTE ? &c->cpd
                           : bp == VK_PIPELINE_BIND_POINT_GRAPHICS ? &c->gpd : NULL;
-    if (r) pushdesc_record(r, layout, set, count, w);
+    if (r && g_vendor_id) pushdesc_record(r, layout, set, count, w);
     // With MALI_COMPAT_VENDOR_ID, vkd3d pushes only the root descriptors that changed and expects the others to stay.
     // Test (2026-10-28): forward the whole merged set every time, in case this driver drops bindings a push leaves out.
     if (g_vendor_id && r && !r->bad && r->count) { count = r->count; w = r->w; }
@@ -3782,7 +3784,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     }
     if (!strcmp(pName, "vkCmdPushDescriptorSetKHR") || !strcmp(pName, "vkCmdPushDescriptorSet")) {
         struct DeviceData *dd = get_device_data(device);
-        if (dd && dd->fpCmdPushDescriptorSetKHR) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
+        if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
     }
     if (g_gpu_time || g_dump_hash_count) MATCH_DEV(CreateComputePipelines);
     #undef MATCH_DEV_KHR
