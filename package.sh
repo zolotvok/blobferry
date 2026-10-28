@@ -61,6 +61,9 @@ Needs
   does not have it). Steam and the desktop keep running on PanVK; only the games use the vendor driver.
 - adb, and a debuggable DroidDeck build for install-adb.sh (it uses run-as).
 
+DroidDeck 0.4.0-mali.1 and newer from the fork bundle Blobferry and install it by themselves; this package is for
+other builds and for testing a Blobferry build.
+
 Install
 1. Stop the DroidDeck session.
 2. ./install-adb.sh  (copies rootfs/ into DroidDeck's Linux rootfs and installs the driver).

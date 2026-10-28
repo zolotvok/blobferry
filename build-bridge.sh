@@ -27,6 +27,7 @@ case ${1:-build} in
     clang $T -O2 -Wall "$B/test/img-probe.c" -o "$STAGE/img-probe" -lvulkan   # which dma-buf image create infos the HAL takes
     clang $T -O2 -Wall -I"$B/../panvk-kbase-android/work/mesa/include" "$B/test/map-probe.c" -o "$STAGE/map-probe" -lvulkan   # can the vendor mappings be moved (placed maps)
     clang $T -O2 -Wall "$B/test/bc-probe.c" -o "$STAGE/bc-probe" -lvulkan   # does the compat layer decode BC uploads
+    clang $T -O2 -Wall -I"$B/test" "$B/test/pushdesc-probe.c" -o "$STAGE/pushdesc-probe" -lvulkan   # push-descriptor UBO in vkd3d's root-CBV layout
     clang $T -O2 -Wall -I"$B/../panvk-kbase-android/work/mesa/include" "$B/test/afrc-probe.c" -o "$STAGE/afrc-probe" -lvulkan   # AFRC rates for the BC shadow formats
     # vkprobe.exe: an x86-64 Windows program for Proton (llvm-mingw in tools-llvm-mingw; Vulkan headers from the sysroot)
     MINGW=$(ls "$B"/../tools-llvm-mingw/llvm-mingw-*/bin/x86_64-w64-mingw32-clang 2>/dev/null | head -1)
@@ -84,7 +85,7 @@ EOF2
     # Same result as importing Mali_Bridge.zip on the Runtime driver page (LinuxVulkanDriverManager.adopt), without the file picker.
     D=files/linux_vulkan_drivers/Mali_Bridge
     adb push -q "$STAGE/libvulkan_mali_bridge.so" /data/local/tmp/libvulkan_mali_bridge.so
-    adb shell "run-as com.droiddeck.launcher sh -c 'mkdir -p $D && cp /data/local/tmp/libvulkan_mali_bridge.so $D/ && chmod 755 $D/libvulkan_mali_bridge.so'; rm /data/local/tmp/libvulkan_mali_bridge.so"
+    adb shell "run-as com.droiddeck.launcher sh -c 'mkdir -p $D && cp /data/local/tmp/libvulkan_mali_bridge.so $D/ && chmod 755 $D/libvulkan_mali_bridge.so && touch $D/.dev'; rm /data/local/tmp/libvulkan_mali_bridge.so"
     adb shell "run-as com.droiddeck.launcher sh -c 'cat > $D/icd.json'" <<EOF3
 {
   "file_format_version": "1.0.0",
@@ -102,7 +103,8 @@ EOF3
   deploy)
     tar -C "$OUT/stage" -cf "$OUT/mali_bridge.tar" usr
     adb push -q "$OUT/mali_bridge.tar" /data/local/tmp/mali_bridge.tar
-    adb shell "run-as com.droiddeck.launcher sh -c 'tar -C files/linuxfs -xf /data/local/tmp/mali_bridge.tar'; rm /data/local/tmp/mali_bridge.tar"
-    echo "$(date +%H:%M) bridge: deploy usr/lib/mali_bridge (ICD shim + JSON) into rootfs files/linuxfs; no session restart" >> "$B/../adb-device-changes.txt"
+    # .dev: DroidDeck builds that bundle Blobferry restage it at every session start; this marker keeps the deployed build
+    adb shell "run-as com.droiddeck.launcher sh -c 'tar -C files/linuxfs -xf /data/local/tmp/mali_bridge.tar && touch files/linuxfs/usr/lib/mali_bridge/.dev'; rm /data/local/tmp/mali_bridge.tar"
+    echo "$(date +%H:%M) bridge: deploy usr/lib/mali_bridge (ICD shim + JSON) into rootfs files/linuxfs, .dev marker (app keeps it); no session restart; back to the bundled build: rm files/linuxfs/usr/lib/mali_bridge/.dev" >> "$B/../adb-device-changes.txt"
     adb shell "run-as com.droiddeck.launcher ls -l files/linuxfs/usr/lib/mali_bridge" ;;
 esac

@@ -11,6 +11,10 @@ built for [DroidDeck](https://github.com/Droid-Deck/DroidDeck), a SteamOS-like a
 the [zolotvok/DroidDeck](https://github.com/zolotvok/DroidDeck) fork (branch `mali-panvk`): there Steam and gamescope
 stay on PanVK and only the games run on the vendor driver.
 
+**Using it:** DroidDeck from the fork, version 0.4.0-mali.1 or newer, bundles Blobferry. On a Mali phone it installs
+the files into its Linux runtime at every session start, and "Mali system driver (bridge)" appears on its Runtime
+driver page. No adb or zip import is needed. The steps below are for building and testing Blobferry itself.
+
 ## How it works
 
 ```
@@ -71,8 +75,12 @@ git submodule update --init
 ./build-bridge.sh zip   # build/mali_bridge/Mali_Bridge.zip for DroidDeck's driver import page
 ```
 
-`build-bridge.sh install-driver` and `deploy` push the results to a connected phone with adb. `./package.sh` packs
-the built files into `build/dist/blobferry-<commit>.zip` with an adb install script (`install-adb.sh`) and the licenses.
+`build-bridge.sh install-driver` and `deploy` push the results to a connected phone with adb. They leave a `.dev`
+marker so that a DroidDeck build that bundles Blobferry keeps the deployed files; delete
+`usr/lib/mali_bridge/.dev` (runtime) and `linux_vulkan_drivers/Mali_Bridge/.dev` (app files) to go back to the bundled
+build. `./package.sh` packs the built files into `build/dist/blobferry-<commit>.zip` with an adb install script
+(`install-adb.sh`) and the licenses. DroidDeck's `tools/build_local.sh` bundles that package
+(`DROIDDECK_BLOBFERRY=<zip or folder>`).
 
 ## Debug switches
 

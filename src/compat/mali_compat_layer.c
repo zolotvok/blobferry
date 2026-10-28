@@ -543,6 +543,20 @@ struct PushRec {
     uint8_t data[256];
 };
 
+// The app's compute push descriptors (vkd3d-proton pushes its root CBVs this way with MALI_COMPAT_VENDOR_ID=5143),
+// merged per binding since the last layout change, so they can be pushed again after a BC decode like the push
+// constants. Only single-descriptor writes are kept; anything else marks the record unusable. [Claude Opus 5.5] 2026-10-28
+#define PUSHDESC_MAX 16
+struct PushDescRec {
+    VkPipelineLayout layout;
+    uint32_t set, count;
+    bool bad;
+    VkWriteDescriptorSet w[PUSHDESC_MAX];
+    VkDescriptorBufferInfo buf[PUSHDESC_MAX];
+    VkDescriptorImageInfo img[PUSHDESC_MAX];
+    VkBufferView view[PUSHDESC_MAX];
+};
+
 // Per command buffer: decode staging buffers (back to the pool when it is begun, reset or freed again) and the
 // tracked state above. Hash table (the first version kept 128 command buffers and leaked everything recorded in any
 // other). [Claude Opus 5.5]
@@ -558,6 +572,8 @@ struct CmdBufData {
     bool descriptor_buffers;        // vkCmdBindDescriptorBuffersEXT was recorded since begin
     uint32_t push_count;            // records in push[], oldest first
     struct PushRec push[PUSH_RECS];
+    struct PushDescRec cpd;         // compute push descriptors, layout VK_NULL_HANDLE if none since begin
+    struct PushDescRec gpd;         // graphics push descriptors (full pushes, see compat_CmdPushDescriptorSetKHR)
     VkPipeline gfx_pipeline;        // last app graphics pipeline (GPU timing)
     int32_t gt_rec;                 // GPU timing record of the open render pass, -1 if none
     VkImageView gt_src;             // first image view of the last push-descriptor write (GPU timing details)
@@ -629,6 +645,7 @@ struct DeviceData {
     VkPipeline bc_pipelines_db[4]; // with DESCRIPTOR_BUFFER_BIT, for command buffers that bound descriptor buffers
     bool descriptor_buffer;        // the app enabled VkPhysicalDeviceDescriptorBufferFeaturesEXT::descriptorBuffer
     PFN_vkCmdBindDescriptorBuffersEXT fpCmdBindDescriptorBuffersEXT;
+    PFN_vkCmdPushDescriptorSetKHR fpCmdPushDescriptorSetKHR;
     uint32_t device_local_memory_index;
     bool bc_init_done;
     struct StagingPoolNode *staging_pool; // free decode staging buffers (g_staging_pool_mutex)
@@ -859,6 +876,8 @@ static void reset_cmd_data(struct DeviceData *dev_data, VkCommandBuffer cmd, boo
     e->compute_pipeline = VK_NULL_HANDLE;
     e->descriptor_buffers = false;
     e->push_count = 0;
+    e->cpd.layout = VK_NULL_HANDLE;
+    e->gpd.layout = VK_NULL_HANDLE;
     e->gfx_pipeline = VK_NULL_HANDLE;
     e->gt_rec = -1;
     e->gt_src = VK_NULL_HANDLE;
@@ -1010,6 +1029,13 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
     }
 }
 
+// MALI_COMPAT_VENDOR_ID=<hex>: report this PCI vendor ID instead of Arm's 0x13b5 (driverID stays ARM_PROPRIETARY).
+// vkd3d-proton reads root CBVs through buffer device addresses on every vendor except NVIDIA and Qualcomm, which
+// get push descriptors ("~15%" there; Mali can only preload UBOs into uniform registers). 5143 flips only that
+// choice: vkd3d's other Qualcomm check also needs driverID TURNIP. The game sees the vendor through DXGI too
+// (dxgi.customVendorId keeps it Arm). [Claude Opus 5.5] 2026-10-28
+static uint32_t g_vendor_id;
+
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
@@ -1023,6 +1049,14 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
     // GPU and its buffer descriptors work there, so report what PanVK does. Misaligned storage views are logged in
     // compat_CreateBufferView to see whether they occur at all. [Claude Opus 5.5]
     pProperties->properties.limits.minTexelBufferOffsetAlignment = 16;
+    // With the push path vkd3d sizes a root CBV as min(rest of the buffer, maxUniformBufferRange), and this driver
+    // reports 2 GiB, so root CBVs can span whole heap buffers. D3D12 CBVs address at most 64 KiB (NVIDIA/Qualcomm
+    // report that limit): report it too, so vkd3d clamps the range itself. [Claude Opus 5.5] 2026-10-28
+    if (g_vendor_id) {
+        pProperties->properties.vendorID = g_vendor_id;
+        if (pProperties->properties.limits.maxUniformBufferRange > 65536)
+            pProperties->properties.limits.maxUniformBufferRange = 65536;
+    }
     for (VkBaseOutStructure *h = (VkBaseOutStructure *)pProperties->pNext; h; h = h->pNext) {
         if (h->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES) {
             VkPhysicalDeviceTexelBufferAlignmentProperties *t = (VkPhysicalDeviceTexelBufferAlignmentProperties *)h;
@@ -2557,6 +2591,9 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
         const struct PushRec *pr = &cstate->push[i];
         d->fpCmdPushConstants(commandBuffer, pr->layout, pr->stages, pr->offset, pr->size, pr->data);
     }
+    if (cstate->cpd.layout && !cstate->cpd.bad && cstate->cpd.count && d->fpCmdPushDescriptorSetKHR)
+        d->fpCmdPushDescriptorSetKHR(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cstate->cpd.layout, cstate->cpd.set,
+                                     cstate->cpd.count, cstate->cpd.w);
     if (dec != stack_regs) free(dec);
     free(dst_off);
     if (g_stats) {
@@ -2669,6 +2706,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_ResetCommandPool(
                     e->compute_pipeline = VK_NULL_HANDLE;
                     e->descriptor_buffers = false;
                     e->push_count = 0;
+                    e->cpd.layout = VK_NULL_HANDLE;
+                    e->gpd.layout = VK_NULL_HANDLE;
                     e->gfx_pipeline = VK_NULL_HANDLE;
                     e->gt_rec = -1;
                     e->gt_src = VK_NULL_HANDLE;
@@ -3088,7 +3127,25 @@ static void gt_draw(struct CmdBufData *c, uint32_t vcount, uint32_t icount) {
     if (!r->draws++) { r->pipeline = c->gfx_pipeline; r->vcount = vcount; r->icount = icount; r->src = c->gt_src; }
 }
 
-// The image a meta pass reads: vkd3d binds its copy source with a push descriptor.
+static void pushdesc_record(struct PushDescRec *r, VkPipelineLayout layout, uint32_t set, uint32_t count,
+                            const VkWriteDescriptorSet *w) {
+    if (r->layout != layout || r->set != set) { r->layout = layout; r->set = set; r->count = 0; r->bad = false; }
+    for (uint32_t i = 0; i < count && !r->bad; i++) {
+        if (w[i].descriptorCount != 1 || w[i].pNext) { r->bad = true; break; }
+        uint32_t k = 0;
+        while (k < r->count && !(r->w[k].dstBinding == w[i].dstBinding && r->w[k].dstArrayElement == w[i].dstArrayElement)) k++;
+        if (k == PUSHDESC_MAX) { r->bad = true; break; }
+        if (k == r->count) r->count++;
+        r->w[k] = w[i];
+        r->w[k].pBufferInfo = NULL; r->w[k].pImageInfo = NULL; r->w[k].pTexelBufferView = NULL;
+        if (w[i].pBufferInfo) { r->buf[k] = w[i].pBufferInfo[0]; r->w[k].pBufferInfo = &r->buf[k]; }
+        if (w[i].pImageInfo) { r->img[k] = w[i].pImageInfo[0]; r->w[k].pImageInfo = &r->img[k]; }
+        if (w[i].pTexelBufferView) { r->view[k] = w[i].pTexelBufferView[0]; r->w[k].pTexelBufferView = &r->view[k]; }
+    }
+}
+
+// The image a meta pass reads: vkd3d binds its copy source with a push descriptor (GPU timing details). Compute
+// pushes are also recorded for the restore after a BC decode (struct PushDescRec).
 static VKAPI_ATTR void VKAPI_CALL compat_CmdPushDescriptorSetKHR(VkCommandBuffer cmd, VkPipelineBindPoint bp, VkPipelineLayout layout,
                                                                  uint32_t set, uint32_t count, const VkWriteDescriptorSet *w) {
     struct CmdBufData *c = cmd_data(cmd);
@@ -3099,7 +3156,13 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushDescriptorSetKHR(VkCommandBuffer
             c->gt_src = w[i].pImageInfo[0].imageView;
             break;
         }
-    (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdPushDescriptorSetKHR(cmd, bp, layout, set, count, w);
+    struct PushDescRec *r = !c ? NULL : bp == VK_PIPELINE_BIND_POINT_COMPUTE ? &c->cpd
+                          : bp == VK_PIPELINE_BIND_POINT_GRAPHICS ? &c->gpd : NULL;
+    if (r) pushdesc_record(r, layout, set, count, w);
+    // With MALI_COMPAT_VENDOR_ID, vkd3d pushes only the root descriptors that changed and expects the others to stay.
+    // Test (2026-10-28): forward the whole merged set every time, in case this driver drops bindings a push leaves out.
+    if (g_vendor_id && r && !r->bad && r->count) { count = r->count; w = r->w; }
+    (c ? c->dev : get_device_data_by_cmd(cmd))->fpCmdPushDescriptorSetKHR(cmd, bp, layout, set, count, w);
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRendering(VkCommandBuffer cmd, const VkRenderingInfo *ri) {
@@ -3249,6 +3312,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_gpu_time = getenv("MALI_COMPAT_GPU_TIME") && strcmp(getenv("MALI_COMPAT_GPU_TIME"), "0") != 0;
     g_depth_nocomp = getenv("MALI_COMPAT_DEPTH_NOCOMP") && strcmp(getenv("MALI_COMPAT_DEPTH_NOCOMP"), "0") != 0;
     g_force_comp = getenv("MALI_COMPAT_FORCE_COMP") && strcmp(getenv("MALI_COMPAT_FORCE_COMP"), "0") != 0;
+    g_vendor_id = getenv("MALI_COMPAT_VENDOR_ID") ? (uint32_t)strtoul(getenv("MALI_COMPAT_VENDOR_ID"), NULL, 16) : 0;
     // on by default: the write it removes is discarded by the spec anyway (MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off)
     g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
     g_gt_trace = getenv("MALI_COMPAT_GT_TRACE") ? (uint32_t)strtoul(getenv("MALI_COMPAT_GT_TRACE"), NULL, 16) : 0;
@@ -3575,6 +3639,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT);
         d->descriptor_buffer = dbf && dbf->descriptorBuffer;
         d->fpCmdBindDescriptorBuffersEXT = (PFN_vkCmdBindDescriptorBuffersEXT)fpGetDeviceProcAddr(*pDevice, "vkCmdBindDescriptorBuffersEXT");
+        d->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdPushDescriptorSetKHR");
+        if (!d->fpCmdPushDescriptorSetKHR)
+            d->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdPushDescriptorSet");
         d->fpCmdSetVertexInputEXT = (PFN_vkCmdSetVertexInputEXT)fpGetDeviceProcAddr(*pDevice, "vkCmdSetVertexInputEXT");
         if (g_log_images && want_icc) {
             d->fpGetImageSubresourceLayout2KHR = (PFN_vkGetImageSubresourceLayout2KHR)fpGetDeviceProcAddr(*pDevice, "vkGetImageSubresourceLayout2KHR");
@@ -3712,10 +3779,10 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
                 return (PFN_vkVoidFunction)compat_CmdDispatchBase;
             #undef MATCH_GT_OPT
         }
-        if (!strcmp(pName, "vkCmdPushDescriptorSetKHR") || !strcmp(pName, "vkCmdPushDescriptorSet")) {
-            struct DeviceData *dd = get_device_data(device);
-            if (dd && dd->gt && dd->gt->fpCmdPushDescriptorSetKHR) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
-        }
+    }
+    if (!strcmp(pName, "vkCmdPushDescriptorSetKHR") || !strcmp(pName, "vkCmdPushDescriptorSet")) {
+        struct DeviceData *dd = get_device_data(device);
+        if (dd && dd->fpCmdPushDescriptorSetKHR) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
     }
     if (g_gpu_time || g_dump_hash_count) MATCH_DEV(CreateComputePipelines);
     #undef MATCH_DEV_KHR
