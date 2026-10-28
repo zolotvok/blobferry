@@ -1721,10 +1721,11 @@ static void log_image(struct DeviceData *d, VkDevice device, const VkImageCreate
     pthread_mutex_lock(&m);
     FILE *f = fopen("/root/mali-images.txt", "a");
     if (f) {
-        fprintf(f, "fmt %d %ux%ux%u mips %u layers %u samples %d tiling %d usage 0x%x flags 0x%x%s comp 0x%x rate 0x%x\n",
+        const VkImageCompressionControlEXT *acc = find_struct(ci->pNext, VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT);
+        fprintf(f, "fmt %d %ux%ux%u mips %u layers %u samples %d tiling %d usage 0x%x flags 0x%x%s comp 0x%x rate 0x%x appcc %s\n",
                 ci->format, ci->extent.width, ci->extent.height, ci->extent.depth, ci->mipLevels, ci->arrayLayers,
                 ci->samples, ci->tiling, ci->usage, ci->flags, bc ? " bc-shadow" : "", cp.imageCompressionFlags,
-                cp.imageCompressionFixedRateFlags);
+                cp.imageCompressionFixedRateFlags, acc ? (acc->flags == VK_IMAGE_COMPRESSION_DISABLED_EXT ? "disabled" : "other") : "-");
         fclose(f);
     }
     pthread_mutex_unlock(&m);
@@ -1745,6 +1746,11 @@ static bool g_rt_compress;
 // Witcher 3 (DX12) hangs the GPU in vkd3d's depth->colour copy pass, which texelFetches the depth aspect of its
 // D32_SFLOAT_S8_UINT depth buffer (GPU timing STUCK lines, 2026-10-28); test whether compression is the trigger.
 static bool g_depth_nocomp;
+// MALI_COMPAT_FORCE_COMP=1: vkd3d-proton chains VkImageCompressionControlEXT DISABLED into placed (aliasable)
+// resources, so DX12 games run all their render targets and shadow maps uncompressed on this driver. For colour and
+// depth/stencil attachments without STORAGE the layer turns that request back into DEFAULT (AFBC). Experiment: an
+// aliased target then shares memory with compression metadata, which vkd3d does not expect. [Claude Opus 5.5] 2026-10-28
+static bool g_force_comp;
 struct RTSig { VkFormat format; uint32_t width, height, mips, layers; };
 #define RT_KEEP_MAX 256
 static struct RTSig g_rt_keep[RT_KEEP_MAX];
@@ -1948,6 +1954,18 @@ static void fixup_begin(struct DeviceData *d, const VkImageCreateInfo *ci, struc
             fx->use = &fx->mod;
             fx->mod.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
             fx->rt_stripped = true;
+        }
+    }
+    if (g_force_comp && !fx->is_bc && !g_depth_nocomp &&
+        (fx->mod.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
+        !(fx->mod.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+        VkImageCompressionControlEXT *app_cc = (VkImageCompressionControlEXT *)find_struct(fx->mod.pNext,
+            VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT);
+        if (app_cc && app_cc->flags == VK_IMAGE_COMPRESSION_DISABLED_EXT) {
+            fx->use = &fx->mod;
+            fx->app_cc = app_cc;
+            fx->app_cc_saved = *app_cc;
+            app_cc->flags = VK_IMAGE_COMPRESSION_DEFAULT_EXT;
         }
     }
     if (g_depth_nocomp && d->afrc && !fx->is_bc && (ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
@@ -3230,6 +3248,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_rt_compress = rt;
     g_gpu_time = getenv("MALI_COMPAT_GPU_TIME") && strcmp(getenv("MALI_COMPAT_GPU_TIME"), "0") != 0;
     g_depth_nocomp = getenv("MALI_COMPAT_DEPTH_NOCOMP") && strcmp(getenv("MALI_COMPAT_DEPTH_NOCOMP"), "0") != 0;
+    g_force_comp = getenv("MALI_COMPAT_FORCE_COMP") && strcmp(getenv("MALI_COMPAT_FORCE_COMP"), "0") != 0;
     // on by default: the write it removes is discarded by the spec anyway (MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off)
     g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
     g_gt_trace = getenv("MALI_COMPAT_GT_TRACE") ? (uint32_t)strtoul(getenv("MALI_COMPAT_GT_TRACE"), NULL, 16) : 0;

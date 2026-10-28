@@ -12,6 +12,7 @@ third_party/vulkan-wsi-layer submodule. build-wsi.sh applies this patch when it 
   GPU work takes over 2 s is logged (after 2, 10, 60 s, then every 5 min) instead of hanging silently.
 - MALI_WSI_NO_10BIT=1 hides the 10-bit surface formats.
 - MALI_WSI_PROBE_PIXELS=1 (debug) logs pixel samples of the first presented images.
+- MALI_WSI_FPS=1 appends the present rate every 5 s to /root/mali-wsi-fps.txt (frame rate without a HUD, for scripts).
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index b43b1ad..8f7c824 100644
@@ -46,10 +47,18 @@ index 5339166..cfa86ff 100644
  
     if (dma_buf_heaps->memory_fd < 0)
 diff --git a/wsi/swapchain_base.cpp b/wsi/swapchain_base.cpp
-index 32440ea..ca177c9 100644
+index 32440ea..44ce4f9 100644
 --- a/wsi/swapchain_base.cpp
 +++ b/wsi/swapchain_base.cpp
-@@ -37,6 +37,8 @@
+@@ -32,11 +32,16 @@
+  */
+ 
+ #include <array>
++#include <atomic>
++#include <mutex>
++#include <ctime>
+ #include <cassert>
+ #include <cerrno>
  #include <cstdio>
  #include <cstdlib>
  #include <system_error>
@@ -58,7 +67,7 @@ index 32440ea..ca177c9 100644
  
  #include <unistd.h>
  #include <vulkan/vulkan.h>
-@@ -63,7 +65,6 @@ void swapchain_base::page_flip_thread()
+@@ -63,7 +68,6 @@ void swapchain_base::page_flip_thread()
  {
     auto &sc_images = m_swapchain_images;
     VkResult vk_res = VK_SUCCESS;
@@ -66,7 +75,7 @@ index 32440ea..ca177c9 100644
     constexpr uint64_t SEMAPHORE_TIMEOUT = 250000000; /* 250 ms. */
  
     /* No mutex is needed for the accesses to m_page_flip_thread_run variable as after the variable is
-@@ -100,13 +101,29 @@ void swapchain_base::page_flip_thread()
+@@ -100,13 +104,29 @@ void swapchain_base::page_flip_thread()
           submit_info = *pending_submission;
        }
  
@@ -99,7 +108,7 @@ index 32440ea..ca177c9 100644
           set_error_state(vk_res);
           m_free_image_semaphore.post();
        }
-@@ -203,11 +220,11 @@ void swapchain_base::unpresent_image(uint32_t presented_index, bool release_imag
+@@ -203,11 +223,11 @@ void swapchain_base::unpresent_image(uint32_t presented_index, bool release_imag
     m_swapchain_images[presented_index].set_status(should_keep_acquired ? swapchain_image::ACQUIRED :
                                                                           swapchain_image::FREE);
  
@@ -112,7 +121,7 @@ index 32440ea..ca177c9 100644
  }
  
  swapchain_base::swapchain_base(layer::device_private_data &dev_data, const VkAllocationCallbacks *callbacks)
-@@ -418,10 +435,34 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
+@@ -418,10 +438,34 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
        return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
  
@@ -149,7 +158,60 @@ index 32440ea..ca177c9 100644
     }
  
     util::unique_lock<util::recursive_mutex> image_status_lock(m_image_status_mutex);
-@@ -810,11 +851,16 @@ VkResult swapchain_base::wait_and_get_free_buffer(uint64_t timeout)
+@@ -592,9 +636,52 @@ VkResult swapchain_base::notify_presentation_engine(const pending_present_reques
+    return VK_SUCCESS;
+ }
+ 
++/* DroidDeck/Mali bridge [Claude Opus 5.5] 2026-10-28: MALI_WSI_FPS=1 counts presents (all swapchains of the process)
++ * and every 5 s appends "HH:MM:SS fps N.N" to /root/mali-wsi-fps.txt: a frame rate for games without a HUD (vkd3d)
++ * that scripts can read instead of OCR-ing the compositor counter. */
++static void count_present_for_fps()
++{
++   static const bool on = [] {
++      const char *e = getenv("MALI_WSI_FPS");
++      return e && e[0] && e[0] != '0';
++   }();
++   if (!on)
++      return;
++   static std::atomic<uint64_t> frames{ 0 };
++   static std::atomic<int64_t> window_start{ 0 };
++   static std::mutex m;
++   frames.fetch_add(1, std::memory_order_relaxed);
++   int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
++                    std::chrono::steady_clock::now().time_since_epoch()).count();
++   int64_t start = window_start.load(std::memory_order_relaxed);
++   if (start == 0)
++   {
++      window_start.compare_exchange_strong(start, now);
++      return;
++   }
++   if (now - start < 5000)
++      return;
++   std::lock_guard<std::mutex> lock(m);
++   start = window_start.load();
++   if (now - start < 5000)
++      return;
++   uint64_t n = frames.exchange(0);
++   window_start.store(now);
++   time_t t = time(nullptr);
++   struct tm tm;
++   localtime_r(&t, &tm);
++   FILE *f = fopen("/root/mali-wsi-fps.txt", "a");
++   if (f)
++   {
++      fprintf(f, "%02d:%02d:%02d fps %.1f\n", tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<double>(n) * 1000.0 / static_cast<double>(now - start));
++      fclose(f);
++   }
++}
++
+ VkResult swapchain_base::queue_present(VkQueue queue, const VkPresentInfoKHR *present_info,
+                                        const swapchain_presentation_parameters &submit_info)
+ {
++   count_present_for_fps();
+    if (!is_valid_image_index(submit_info.pending_present.image_index))
+    {
+       WSI_LOG_ERROR("Swapchain image index %u is out of bounds.", submit_info.pending_present.image_index);
+@@ -810,11 +897,16 @@ VkResult swapchain_base::wait_and_get_free_buffer(uint64_t timeout)
         * the swapchain implementation may be able to get a buffer without
         * waiting */
  
