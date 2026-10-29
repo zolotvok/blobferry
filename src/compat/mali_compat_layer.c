@@ -609,6 +609,11 @@ struct DeviceData {
     PFN_vkCreateImageView fpCreateImageView;
     PFN_vkDestroyImageView fpDestroyImageView;
     PFN_vkCreateBufferView fpCreateBufferView;
+    PFN_vkCreateQueryPool fpCreateQueryPool;
+    PFN_vkDestroyQueryPool fpDestroyQueryPool;
+    PFN_vkGetQueryPoolResults fpGetQueryPoolResults;
+    PFN_vkCmdCopyQueryPoolResults fpCmdCopyQueryPoolResults;
+    PFN_vkCmdFillBuffer fpCmdFillBuffer;
     PFN_vkGetDeviceImageMemoryRequirements fpGetDeviceImageMemoryRequirements;
     PFN_vkGetDeviceImageSparseMemoryRequirements fpGetDeviceImageSparseMemoryRequirements;
     PFN_vkCreateBuffer fpCreateBuffer;
@@ -2207,6 +2212,68 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBufferView(
     return d->fpCreateBufferView(device, pCreateInfo, pAllocator, pView);
 }
 
+// MALI_COMPAT_FAKE_OCCLUSION=1: every occlusion query result reads as "visible" (0x10000 samples, available), for the
+// GPU copy (vkCmdFillBuffer instead of vkCmdCopyQueryPoolResults) and the CPU read. A test for occlusion results the
+// driver gets wrong (HZD statics missing): if the statics come back, the game culls them on query results.
+// [Claude Opus 5.5] 2026-10-29
+static bool g_fake_occlusion;
+static _Atomic uint64_t g_occl_copies, g_occl_reads;
+#define OCCL_BUCKETS 64
+static VkQueryPool g_occl_pools[OCCL_BUCKETS][16];
+static pthread_mutex_t g_occl_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool occl_pool(VkQueryPool pool, bool add, bool remove) {
+    uint32_t b = handle_bucket((uint64_t)pool, OCCL_BUCKETS);
+    bool found = false;
+    pthread_mutex_lock(&g_occl_mutex);
+    for (int i = 0; i < 16; i++) {
+        if (g_occl_pools[b][i] == pool) { found = true; if (remove) g_occl_pools[b][i] = VK_NULL_HANDLE; break; }
+        if (add && !g_occl_pools[b][i]) { g_occl_pools[b][i] = pool; add = false; }
+    }
+    pthread_mutex_unlock(&g_occl_mutex);
+    if (add) fprintf(stderr, "mali-compat: fake occlusion: pool table full\n");
+    return found;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
+                                                            const VkAllocationCallbacks *pAllocator, VkQueryPool *pPool) {
+    struct DeviceData *d = get_device_data(device);
+    VkResult r = d->fpCreateQueryPool(device, pCreateInfo, pAllocator, pPool);
+    if (r == VK_SUCCESS && pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION) occl_pool(*pPool, true, false);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL compat_DestroyQueryPool(VkDevice device, VkQueryPool pool, const VkAllocationCallbacks *pAllocator) {
+    struct DeviceData *d = get_device_data(device);
+    if (pool) occl_pool(pool, false, true);
+    d->fpDestroyQueryPool(device, pool, pAllocator);
+}
+
+static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyQueryPoolResults(VkCommandBuffer cmd, VkQueryPool pool, uint32_t first,
+    uint32_t count, VkBuffer dst, VkDeviceSize offset, VkDeviceSize stride, VkQueryResultFlags flags) {
+    struct DeviceData *d = get_device_data_by_cmd(cmd);
+    if (!occl_pool(pool, false, false) || !count) {
+        d->fpCmdCopyQueryPoolResults(cmd, pool, first, count, dst, offset, stride, flags);
+        return;
+    }
+    atomic_fetch_add(&g_occl_copies, 1);
+    VkDeviceSize elem = (flags & VK_QUERY_RESULT_64_BIT ? 8 : 4) * (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT ? 2 : 1);
+    if (stride == elem) d->fpCmdFillBuffer(cmd, dst, offset, elem * count, 0x10000);
+    else
+        for (uint32_t i = 0; i < count; i++) d->fpCmdFillBuffer(cmd, dst, offset + i * stride, elem, 0x10000);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL compat_GetQueryPoolResults(VkDevice device, VkQueryPool pool, uint32_t first,
+    uint32_t count, size_t size, void *data, VkDeviceSize stride, VkQueryResultFlags flags) {
+    struct DeviceData *d = get_device_data(device);
+    if (!occl_pool(pool, false, false)) return d->fpGetQueryPoolResults(device, pool, first, count, size, data, stride, flags);
+    atomic_fetch_add(&g_occl_reads, 1);
+    uint32_t words = (flags & VK_QUERY_RESULT_64_BIT ? 2 : 1) * (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT ? 2 : 1);
+    for (uint32_t i = 0; i < count; i++)
+        for (uint32_t w = 0; w < words; w++) ((uint32_t *)((char *)data + i * stride))[w] = 0x10000;
+    return VK_SUCCESS;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
     VkDevice device, const VkBufferCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer) {
@@ -2965,6 +3032,9 @@ static void gt_report(struct GpuTime *g, double interval_s) {
         fprintf(f, " | firstInstance!=0 draws %llu, divisor!=1 pipelines %llu, vertex inputs %llu",
                 (unsigned long long)atomic_load(&g_div_draws), (unsigned long long)atomic_load(&g_div_pipes),
                 (unsigned long long)atomic_load(&g_div_vi));
+        if (g_fake_occlusion)
+            fprintf(f, " | faked occlusion copies %llu, reads %llu", (unsigned long long)atomic_load(&g_occl_copies),
+                    (unsigned long long)atomic_load(&g_occl_reads));
         fprintf(f, "\n");
         for (uint32_t i = 0; i < n && i < 25; i++) {
             char desc[160];
@@ -3200,11 +3270,23 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushDescriptorSetKHR(VkCommandBuffer
     (c ? c->dev : get_device_data_by_cmd(cmd))->fpCmdPushDescriptorSetKHR(cmd, bp, layout, set, count, w);
 }
 
-static void susres_attachment(VkRenderingAttachmentInfo *a, bool resume, bool suspend) {
+// aspect: 0 color, 1 depth, 2 stencil. A read-only layout gets STORE_OP_NONE: STORE there is invalid (no write access),
+// and read-only depth is what soft particles (HZD fires) bind while sampling it.
+static bool layout_read_only(VkImageLayout l, int aspect) {
+    switch (l) {
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: case VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return true;
+    case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL: case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL: return aspect == 1;
+    case VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL: case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL: return aspect == 2;
+    default: return false;
+    }
+}
+
+static void susres_attachment(VkRenderingAttachmentInfo *a, bool resume, bool suspend, int aspect) {
     if (a->imageView == VK_NULL_HANDLE) return;
     if (resume) a->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     if (suspend) {
-        a->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        a->storeOp = layout_read_only(a->imageLayout, aspect) ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
         a->resolveMode = VK_RESOLVE_MODE_NONE;
         a->resolveImageView = VK_NULL_HANDLE;
     }
@@ -3220,10 +3302,10 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRendering(VkCommandBuffer cmd, 
         bool resume = ri->flags & VK_RENDERING_RESUMING_BIT, suspend = ri->flags & VK_RENDERING_SUSPENDING_BIT;
         plain = *ri;
         plain.flags &= ~(VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT);
-        for (uint32_t i = 0; i < ri->colorAttachmentCount; i++) { col[i] = ri->pColorAttachments[i]; susres_attachment(&col[i], resume, suspend); }
+        for (uint32_t i = 0; i < ri->colorAttachmentCount; i++) { col[i] = ri->pColorAttachments[i]; susres_attachment(&col[i], resume, suspend, 0); }
         plain.pColorAttachments = col;
-        if (ri->pDepthAttachment) { dep = *ri->pDepthAttachment; susres_attachment(&dep, resume, suspend); plain.pDepthAttachment = &dep; }
-        if (ri->pStencilAttachment) { ste = *ri->pStencilAttachment; susres_attachment(&ste, resume, suspend); plain.pStencilAttachment = &ste; }
+        if (ri->pDepthAttachment) { dep = *ri->pDepthAttachment; susres_attachment(&dep, resume, suspend, 1); plain.pDepthAttachment = &dep; }
+        if (ri->pStencilAttachment) { ste = *ri->pStencilAttachment; susres_attachment(&ste, resume, suspend, 2); plain.pStencilAttachment = &ste; }
         ri = &plain;
     }
     gt_render_begin(cmd, ri->renderArea.extent.width, ri->renderArea.extent.height, ri->colorAttachmentCount, ri);
@@ -3374,6 +3456,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_depth_nocomp = getenv("MALI_COMPAT_DEPTH_NOCOMP") && strcmp(getenv("MALI_COMPAT_DEPTH_NOCOMP"), "0") != 0;
     g_force_comp = getenv("MALI_COMPAT_FORCE_COMP") && strcmp(getenv("MALI_COMPAT_FORCE_COMP"), "0") != 0;
     g_no_susres = getenv("MALI_COMPAT_NO_SUSPEND_RESUME") && strcmp(getenv("MALI_COMPAT_NO_SUSPEND_RESUME"), "0") != 0;
+    g_fake_occlusion = getenv("MALI_COMPAT_FAKE_OCCLUSION") && strcmp(getenv("MALI_COMPAT_FAKE_OCCLUSION"), "0") != 0;
     g_vendor_id = getenv("MALI_COMPAT_VENDOR_ID") ? (uint32_t)strtoul(getenv("MALI_COMPAT_VENDOR_ID"), NULL, 16) : 0;
     // on by default: the write it removes is discarded by the spec anyway (MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off)
     g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
@@ -3660,6 +3743,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         LOAD_DEV(CreateImageView);
         LOAD_DEV(DestroyImageView);
         LOAD_DEV(CreateBufferView);
+        LOAD_DEV(CreateQueryPool);
+        LOAD_DEV(DestroyQueryPool);
+        LOAD_DEV(GetQueryPoolResults);
+        LOAD_DEV(CmdCopyQueryPoolResults);
+        LOAD_DEV(CmdFillBuffer);
         LOAD_DEV(GetDeviceImageMemoryRequirements);
         if (!d->fpGetDeviceImageMemoryRequirements)
             d->fpGetDeviceImageMemoryRequirements = (PFN_vkGetDeviceImageMemoryRequirements)fpGetDeviceProcAddr(*pDevice, "vkGetDeviceImageMemoryRequirementsKHR");
@@ -3847,6 +3935,12 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
     }
     if (g_gpu_time || g_dump_hash_count) MATCH_DEV(CreateComputePipelines);
+    if (g_fake_occlusion) {
+        MATCH_DEV(CreateQueryPool);
+        MATCH_DEV(DestroyQueryPool);
+        MATCH_DEV(CmdCopyQueryPoolResults);
+        MATCH_DEV(GetQueryPoolResults);
+    }
     #undef MATCH_DEV_KHR
     MATCH_DEV(DestroyDevice);
     MATCH_DEV(CreateShaderModule);
