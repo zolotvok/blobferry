@@ -1589,16 +1589,26 @@ static void log_pipeline(const VkGraphicsPipelineCreateInfo *ci, VkResult res) {
 // vkd3d's own cache was already complete. The layer loads /root/.cache/mali-compat/<comm>.pcache into one cache per
 // process, passes it for every pipeline it creates (the app's cache is in-memory only), and writes it back once
 // pipeline creation has been idle for 20 s, every minute during long compiles, and at device destroy.
+// Caution (HZD, 2026-10-29): entries loaded from disk gave wrong pipelines (black menu, no loading bar) and the file
+// grew every launch (145 -> 345 MB), so the vendor's cache keys are not stable across runs. =2 keeps only the
+// in-process sharing.
 // [Claude Opus 5.5] 2026-10-29
 static bool g_pcache_on;
+static bool g_pcache_mem_only; // MALI_COMPAT_PIPELINE_CACHE=2: one cache per compile thread, never loaded or saved
 static pthread_mutex_t g_pc_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct DeviceData *g_pc_dev;
 static VkPipelineCache g_pc;
 static char g_pc_path[160];
 static _Atomic uint64_t g_pc_new, g_pc_last_ns;
+// =2: one cache per thread instead of one per process (see pc_for)
+#define PC_THREAD_MAX 64
+static VkPipelineCache g_pc_thread[PC_THREAD_MAX];
+static _Atomic uint32_t g_pc_thread_n;
+static __thread VkPipelineCache tl_pc;
+static __thread struct DeviceData *tl_pc_dev;
 
 static void pc_save_locked(void) {
-    if (!g_pc_dev || !g_pc || !atomic_load(&g_pc_new)) return;
+    if (g_pcache_mem_only || !g_pc_dev || !g_pc || !atomic_load(&g_pc_new)) return;
     size_t size = 0;
     if (g_pc_dev->fpGetPipelineCacheData(g_pc_dev->device, g_pc, &size, NULL) != VK_SUCCESS || !size) return;
     void *data = malloc(size);
@@ -1652,7 +1662,7 @@ static void pc_init(struct DeviceData *d) {
     snprintf(g_pc_path, sizeof g_pc_path, "/root/.cache/mali-compat/%s.pcache", comm);
     void *data = NULL;
     size_t size = 0;
-    if ((f = fopen(g_pc_path, "rb"))) {
+    if (!g_pcache_mem_only && (f = fopen(g_pc_path, "rb"))) {
         if (fseek(f, 0, SEEK_END) == 0 && (long)(size = (size_t)ftell(f)) > 0 && (data = malloc(size))) {
             rewind(f);
             if (fread(data, 1, size, f) != size) { free(data); data = NULL; size = 0; }
@@ -1671,7 +1681,7 @@ static void pc_init(struct DeviceData *d) {
         fprintf(stderr, "mali-compat: pipeline cache %s: loaded %zu bytes\n", g_pc_path, size);
         static bool started;
         pthread_t t;
-        if (!started && pthread_create(&t, NULL, pc_saver, NULL) == 0) { pthread_detach(t); started = true; }
+        if (!started && !g_pcache_mem_only && pthread_create(&t, NULL, pc_saver, NULL) == 0) { pthread_detach(t); started = true; }
     } else g_pc = VK_NULL_HANDLE;
     pthread_mutex_unlock(&g_pc_mutex);
 }
@@ -1680,6 +1690,9 @@ static void pc_destroy(struct DeviceData *d) {
     pthread_mutex_lock(&g_pc_mutex);
     if (g_pc_dev == d) {
         pc_save_locked();
+        for (uint32_t i = 0; i < atomic_load(&g_pc_thread_n) && i < PC_THREAD_MAX; i++)
+            if (g_pc_thread[i]) { d->fpDestroyPipelineCache(d->device, g_pc_thread[i], NULL); g_pc_thread[i] = VK_NULL_HANDLE; }
+        atomic_store(&g_pc_thread_n, 0);
         d->fpDestroyPipelineCache(d->device, g_pc, NULL);
         g_pc = VK_NULL_HANDLE;
         g_pc_dev = NULL;
@@ -1687,9 +1700,41 @@ static void pc_destroy(struct DeviceData *d) {
     pthread_mutex_unlock(&g_pc_mutex);
 }
 
-// the cache to create pipelines with: the layer's own when it is on for this device
+// Only the game's background compile threads use the shared cache: with one cache the driver serialises compiles on
+// it, and a pipeline the render thread needs then waited behind thousands of background compiles (HZD's menu froze
+// at 0 fps, 2026-10-29 test 6). MALI_COMPAT_PIPELINE_CACHE_THREADS=<comm prefix> limits it to some threads (default "*",
+// every thread: with one cache per thread (=2) nothing is shared, so the filter is no longer needed).
+static const char *g_pc_threads = "*";
+static __thread int tl_pc_use; // 0 unknown, 1 shared cache, 2 the app's
+static bool pc_thread_ok(void) {
+    if (!tl_pc_use) {
+        char comm[32] = "";
+        FILE *f = fopen("/proc/thread-self/comm", "r");
+        if (f) {
+            if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0;
+            fclose(f);
+        }
+        tl_pc_use = (!strcmp(g_pc_threads, "*") || !strncmp(comm, g_pc_threads, strlen(g_pc_threads))) ? 1 : 2;
+    }
+    return tl_pc_use == 1;
+}
+
+// =2: one cache per thread instead of one per process. Six compile threads inserting into one shared cache spun at
+// full CPU without progress (HZD stuck in the menu or intro whenever a pipeline was missing, tests 3/6/7).
+
+// the cache to create pipelines with: the layer's own when it is on for this device and thread
 static VkPipelineCache pc_for(struct DeviceData *d, VkPipelineCache app, uint32_t count) {
-    if (g_pc_dev != d || !g_pc) return app;
+    if (g_pc_dev != d || !g_pc || !pc_thread_ok()) return app;
+    if (g_pcache_mem_only) {
+        if (tl_pc_dev != d || !tl_pc) {
+            uint32_t i = atomic_fetch_add(&g_pc_thread_n, 1);
+            VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            if (i >= PC_THREAD_MAX || d->fpCreatePipelineCache(d->device, &ci, NULL, &tl_pc) != VK_SUCCESS) return app;
+            g_pc_thread[i] = tl_pc;
+            tl_pc_dev = d;
+        }
+        return tl_pc;
+    }
     atomic_fetch_add(&g_pc_new, count);
     atomic_store(&g_pc_last_ns, now_ns());
     return g_pc;
@@ -3586,6 +3631,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_force_comp = getenv("MALI_COMPAT_FORCE_COMP") && strcmp(getenv("MALI_COMPAT_FORCE_COMP"), "0") != 0;
     g_no_susres = getenv("MALI_COMPAT_NO_SUSPEND_RESUME") && strcmp(getenv("MALI_COMPAT_NO_SUSPEND_RESUME"), "0") != 0;
     g_pcache_on = getenv("MALI_COMPAT_PIPELINE_CACHE") && strcmp(getenv("MALI_COMPAT_PIPELINE_CACHE"), "0") != 0;
+    g_pcache_mem_only = g_pcache_on && !strcmp(getenv("MALI_COMPAT_PIPELINE_CACHE"), "2");
+    if (getenv("MALI_COMPAT_PIPELINE_CACHE_THREADS")) g_pc_threads = getenv("MALI_COMPAT_PIPELINE_CACHE_THREADS");
     g_force_coherent = getenv("MALI_COMPAT_FORCE_COHERENT") && strcmp(getenv("MALI_COMPAT_FORCE_COHERENT"), "0") != 0;
     g_fake_occlusion = getenv("MALI_COMPAT_FAKE_OCCLUSION") && strcmp(getenv("MALI_COMPAT_FAKE_OCCLUSION"), "0") != 0;
     g_vendor_id = getenv("MALI_COMPAT_VENDOR_ID") ? (uint32_t)strtoul(getenv("MALI_COMPAT_VENDOR_ID"), NULL, 16) : 0;
