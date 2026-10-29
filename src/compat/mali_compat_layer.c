@@ -11,6 +11,7 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
@@ -609,6 +610,9 @@ struct DeviceData {
     PFN_vkCreateImageView fpCreateImageView;
     PFN_vkDestroyImageView fpDestroyImageView;
     PFN_vkCreateBufferView fpCreateBufferView;
+    PFN_vkCreatePipelineCache fpCreatePipelineCache;
+    PFN_vkGetPipelineCacheData fpGetPipelineCacheData;
+    PFN_vkDestroyPipelineCache fpDestroyPipelineCache;
     PFN_vkCreateQueryPool fpCreateQueryPool;
     PFN_vkDestroyQueryPool fpDestroyQueryPool;
     PFN_vkGetQueryPoolResults fpGetQueryPoolResults;
@@ -642,6 +646,7 @@ struct DeviceData {
     PFN_vkFlushMappedMemoryRanges fpFlushMappedMemoryRanges;
     PFN_vkInvalidateMappedMemoryRanges fpInvalidateMappedMemoryRanges;
     uint32_t coherent_types; // memory types with HOST_COHERENT
+    uint8_t coherent_remap[VK_MAX_MEMORY_TYPES]; // MALI_COMPAT_FORCE_COHERENT: non-coherent host type -> coherent type + 1 (0 = none)
     PFN_vkGetImageSubresourceLayout2KHR fpGetImageSubresourceLayout2KHR; // only with g_log_images
 
     // BC compute decoder resources
@@ -1579,6 +1584,117 @@ static void log_pipeline(const VkGraphicsPipelineCreateInfo *ci, VkResult res) {
     pthread_mutex_unlock(&m);
 }
 
+// MALI_COMPAT_PIPELINE_CACHE=1: a persistent VkPipelineCache for the driver's compiled pipelines. Under libhybris the
+// vendor driver keeps no disk cache, so every launch recompiled all of HZD's ~30k pipelines (~10 min of loading) while
+// vkd3d's own cache was already complete. The layer loads /root/.cache/mali-compat/<comm>.pcache into one cache per
+// process, passes it for every pipeline it creates (the app's cache is in-memory only), and writes it back once
+// pipeline creation has been idle for 20 s, every minute during long compiles, and at device destroy.
+// [Claude Opus 5.5] 2026-10-29
+static bool g_pcache_on;
+static pthread_mutex_t g_pc_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct DeviceData *g_pc_dev;
+static VkPipelineCache g_pc;
+static char g_pc_path[160];
+static _Atomic uint64_t g_pc_new, g_pc_last_ns;
+
+static void pc_save_locked(void) {
+    if (!g_pc_dev || !g_pc || !atomic_load(&g_pc_new)) return;
+    size_t size = 0;
+    if (g_pc_dev->fpGetPipelineCacheData(g_pc_dev->device, g_pc, &size, NULL) != VK_SUCCESS || !size) return;
+    void *data = malloc(size);
+    if (!data) return;
+    uint64_t n = atomic_exchange(&g_pc_new, 0);
+    if (g_pc_dev->fpGetPipelineCacheData(g_pc_dev->device, g_pc, &size, data) == VK_SUCCESS) {
+        char tmp[176];
+        snprintf(tmp, sizeof tmp, "%s.tmp", g_pc_path);
+        FILE *f = fopen(tmp, "wb");
+        if (f && fwrite(data, 1, size, f) == size && fclose(f) == 0 && rename(tmp, g_pc_path) == 0)
+            fprintf(stderr, "mali-compat: pipeline cache saved: %zu bytes (+%llu pipelines)\n", size, (unsigned long long)n);
+        else {
+            if (f) fclose(f);
+            fprintf(stderr, "mali-compat: pipeline cache save to %s failed: %s\n", g_pc_path, strerror(errno));
+        }
+    }
+    free(data);
+}
+
+static void *pc_saver(void *arg) {
+    (void)arg;
+    for (;;) {
+        sleep(5);
+        // after 20 s without new pipelines, or every minute during a long compile (games get killed, not closed)
+        static uint64_t last_save;
+        uint64_t now = now_ns(), n = atomic_load(&g_pc_new);
+        if (n && (now - atomic_load(&g_pc_last_ns) > 20000000000ull || (n >= 500 && now - last_save > 60000000000ull))) {
+            last_save = now;
+            pthread_mutex_lock(&g_pc_mutex);
+            pc_save_locked();
+            pthread_mutex_unlock(&g_pc_mutex);
+        }
+    }
+    return NULL;
+}
+
+static void pc_init(struct DeviceData *d) {
+    if (!g_pcache_on || !d->fpCreatePipelineCache || !d->fpGetPipelineCacheData) return;
+    pthread_mutex_lock(&g_pc_mutex);
+    if (g_pc_dev) { pthread_mutex_unlock(&g_pc_mutex); return; } // one cache per process (the first live device)
+    char comm[32] = "unknown";
+    FILE *f = fopen("/proc/self/comm", "r");
+    if (f) {
+        if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0;
+        fclose(f);
+    }
+    for (char *c = comm; *c; c++)
+        if (*c == '/' || *c == ' ' || *c == '\\') *c = '_';
+    mkdir("/root/.cache", 0755);
+    mkdir("/root/.cache/mali-compat", 0755);
+    snprintf(g_pc_path, sizeof g_pc_path, "/root/.cache/mali-compat/%s.pcache", comm);
+    void *data = NULL;
+    size_t size = 0;
+    if ((f = fopen(g_pc_path, "rb"))) {
+        if (fseek(f, 0, SEEK_END) == 0 && (long)(size = (size_t)ftell(f)) > 0 && (data = malloc(size))) {
+            rewind(f);
+            if (fread(data, 1, size, f) != size) { free(data); data = NULL; size = 0; }
+        }
+        fclose(f);
+    }
+    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, data ? size : 0, data};
+    VkResult r = d->fpCreatePipelineCache(d->device, &ci, NULL, &g_pc);
+    if (r != VK_SUCCESS && data) { // a cache from another driver build: start empty
+        ci.initialDataSize = 0, ci.pInitialData = NULL;
+        r = d->fpCreatePipelineCache(d->device, &ci, NULL, &g_pc);
+    }
+    free(data);
+    if (r == VK_SUCCESS) {
+        g_pc_dev = d;
+        fprintf(stderr, "mali-compat: pipeline cache %s: loaded %zu bytes\n", g_pc_path, size);
+        static bool started;
+        pthread_t t;
+        if (!started && pthread_create(&t, NULL, pc_saver, NULL) == 0) { pthread_detach(t); started = true; }
+    } else g_pc = VK_NULL_HANDLE;
+    pthread_mutex_unlock(&g_pc_mutex);
+}
+
+static void pc_destroy(struct DeviceData *d) {
+    pthread_mutex_lock(&g_pc_mutex);
+    if (g_pc_dev == d) {
+        pc_save_locked();
+        d->fpDestroyPipelineCache(d->device, g_pc, NULL);
+        g_pc = VK_NULL_HANDLE;
+        g_pc_dev = NULL;
+    }
+    pthread_mutex_unlock(&g_pc_mutex);
+}
+
+// the cache to create pipelines with: the layer's own when it is on for this device
+static VkPipelineCache pc_for(struct DeviceData *d, VkPipelineCache app, uint32_t count) {
+    if (g_pc_dev != d || !g_pc) return app;
+    atomic_fetch_add(&g_pc_new, count);
+    atomic_store(&g_pc_last_ns, now_ns());
+    return g_pc;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
     VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
     const VkGraphicsPipelineCreateInfo *pCreateInfos, const VkAllocationCallbacks *pAllocator,
@@ -1705,7 +1821,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
             if (div) atomic_fetch_add(&g_div_pipes, 1);
         }
     dump_inflight_pipeline(createInfoCount, modified);
-    VkResult res = d->fpCreateGraphicsPipelines(device, pipelineCache, createInfoCount, modified, pAllocator, pPipelines);
+    VkResult res = d->fpCreateGraphicsPipelines(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount, modified, pAllocator, pPipelines);
     for (uint32_t k = 0; k < zero_div_count; k++) zero_div[k]->divisor = 0;
     if (res != VK_SUCCESS) {
         fprintf(stderr, "mali-compat: vkCreateGraphicsPipelines FAILED: %d\n", res);
@@ -1730,7 +1846,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
     VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
     const VkComputePipelineCreateInfo *pCreateInfos, const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines) {
     struct DeviceData *d = get_device_data(device);
-    VkResult res = d->fpCreateComputePipelinesReal(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+    VkResult res = d->fpCreateComputePipelinesReal(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount, pCreateInfos, pAllocator, pPipelines);
     for (uint32_t i = 0; i < createInfoCount; i++) {
         uint32_t hash[1], stage[1];
         uint32_t n = stage_hashes(&pCreateInfos[i].stage, 1, hash, stage);
@@ -2217,6 +2333,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBufferView(
 // driver gets wrong (HZD statics missing): if the statics come back, the game culls them on query results.
 // [Claude Opus 5.5] 2026-10-29
 static bool g_fake_occlusion;
+static bool g_force_coherent; // MALI_COMPAT_FORCE_COHERENT, see compat_AllocateMemory
 static _Atomic uint64_t g_occl_copies, g_occl_reads;
 #define OCCL_BUCKETS 64
 static VkQueryPool g_occl_pools[OCCL_BUCKETS][16];
@@ -2512,11 +2629,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
         .pNext = mod.pNext,
     };
     mod.pNext = &flags_info;
+    // MALI_COMPAT_FORCE_COHERENT=1: allocations of the vendor's non-coherent HOST_CACHED type go to the coherent host
+    // type of the same heap instead (the app still sees the type it asked for). vkd3d puts READBACK heaps there and
+    // invalidates only in Map(); a D3D12 game that maps once and reads the pointer every frame (fine on Windows, where
+    // readback memory is coherent) reads stale CPU cache lines on ARM. Reporting the type as device-local instead
+    // crashed HZD at start (DXGI adapter memory). Gemini 4 Argon's lead for the missing statics. [Claude Opus 5.5]
+    if (g_force_coherent && mod.memoryTypeIndex < VK_MAX_MEMORY_TYPES && d->coherent_remap[mod.memoryTypeIndex]) {
+        static _Atomic uint32_t remapped;
+        if (atomic_fetch_add(&remapped, 1) == 0)
+            fprintf(stderr, "mali-compat: force coherent: memory type %u -> %u\n", mod.memoryTypeIndex,
+                    d->coherent_remap[mod.memoryTypeIndex] - 1u);
+        mod.memoryTypeIndex = d->coherent_remap[mod.memoryTypeIndex] - 1u;
+    }
 
     VkResult res = d->fpAllocateMemory(device, &mod, pAllocator, pMemory);
     if (res == VK_SUCCESS) {
         atomic_fetch_add(&g_allocated_bytes, pAllocateInfo->allocationSize);
-        mem_add(*pMemory, pAllocateInfo->allocationSize, pAllocateInfo->memoryTypeIndex);
+        mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex);
     }
     return res;
 }
@@ -3456,6 +3585,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_depth_nocomp = getenv("MALI_COMPAT_DEPTH_NOCOMP") && strcmp(getenv("MALI_COMPAT_DEPTH_NOCOMP"), "0") != 0;
     g_force_comp = getenv("MALI_COMPAT_FORCE_COMP") && strcmp(getenv("MALI_COMPAT_FORCE_COMP"), "0") != 0;
     g_no_susres = getenv("MALI_COMPAT_NO_SUSPEND_RESUME") && strcmp(getenv("MALI_COMPAT_NO_SUSPEND_RESUME"), "0") != 0;
+    g_pcache_on = getenv("MALI_COMPAT_PIPELINE_CACHE") && strcmp(getenv("MALI_COMPAT_PIPELINE_CACHE"), "0") != 0;
+    g_force_coherent = getenv("MALI_COMPAT_FORCE_COHERENT") && strcmp(getenv("MALI_COMPAT_FORCE_COHERENT"), "0") != 0;
     g_fake_occlusion = getenv("MALI_COMPAT_FAKE_OCCLUSION") && strcmp(getenv("MALI_COMPAT_FAKE_OCCLUSION"), "0") != 0;
     g_vendor_id = getenv("MALI_COMPAT_VENDOR_ID") ? (uint32_t)strtoul(getenv("MALI_COMPAT_VENDOR_ID"), NULL, 16) : 0;
     // on by default: the write it removes is discarded by the spec anyway (MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off)
@@ -3743,6 +3874,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         LOAD_DEV(CreateImageView);
         LOAD_DEV(DestroyImageView);
         LOAD_DEV(CreateBufferView);
+        LOAD_DEV(CreatePipelineCache);
+        LOAD_DEV(GetPipelineCacheData);
+        LOAD_DEV(DestroyPipelineCache);
         LOAD_DEV(CreateQueryPool);
         LOAD_DEV(DestroyQueryPool);
         LOAD_DEV(GetQueryPoolResults);
@@ -3801,11 +3935,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         d->fpCreateComputePipelinesReal = (PFN_vkCreateComputePipelines)fpGetDeviceProcAddr(*pDevice, "vkCreateComputePipelines");
         #undef LOAD_DEV
         if (g_gpu_time) gt_init(d, fpGetDeviceProcAddr);
+        pc_init(d);
         if (inst && inst->fpGetPhysicalDeviceMemoryProperties) {
             VkPhysicalDeviceMemoryProperties mp;
             inst->fpGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
             for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
                 if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) d->coherent_types |= 1u << i;
+            const VkMemoryPropertyFlags hc = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+                if ((mp.memoryTypes[i].propertyFlags & hc) == VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+                    for (uint32_t j = 0; j < mp.memoryTypeCount; j++)
+                        if ((mp.memoryTypes[j].propertyFlags & hc) == hc && mp.memoryTypes[j].heapIndex == mp.memoryTypes[i].heapIndex) {
+                            d->coherent_remap[i] = (uint8_t)(j + 1);
+                            break;
+                        }
         }
         d->bc_init_done = false;
     }
@@ -3820,6 +3963,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
     struct DeviceData *d = get_device_data(device);
     if (d) {
         gt_destroy(d);
+        pc_destroy(d);
         if (d->bc_init_done) {
             for (int i = 0; i < 4; i++) {
                 if (d->bc_pipelines[i]) d->fpDestroyPipeline(device, d->bc_pipelines[i], NULL);
@@ -3934,7 +4078,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         struct DeviceData *dd = get_device_data(device);
         if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
     }
-    if (g_gpu_time || g_dump_hash_count) MATCH_DEV(CreateComputePipelines);
+    if (g_gpu_time || g_dump_hash_count || g_pcache_on) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
         MATCH_DEV(CreateQueryPool);
         MATCH_DEV(DestroyQueryPool);
