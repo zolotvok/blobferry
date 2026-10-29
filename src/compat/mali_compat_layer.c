@@ -1035,6 +1035,18 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
 // choice: vkd3d's other Qualcomm check also needs driverID TURNIP. The game sees the vendor through DXGI too
 // (dxgi.customVendorId keeps it Arm). [Claude Opus 5.5] 2026-10-28
 static uint32_t g_vendor_id;
+// GPU timing diagnostics for instanced vertex input (HZD's missing static meshes, 2026-10-29): this driver has
+// supportsNonZeroFirstInstance = false, so a draw with firstInstance != 0 on a binding whose divisor is not 1 (the
+// emulated zero divisor included) reads undefined instance data. Pipelines and dynamic vertex inputs with such
+// bindings, and draws with firstInstance != 0.
+static _Atomic uint64_t g_div_pipes, g_div_vi, g_div_draws;
+// MALI_COMPAT_NO_SUSPEND_RESUME=1 (experiment, needs GPU timing for the hook): vkd3d-proton splits render passes on
+// tilers with VK_RENDERING_SUSPENDING/RESUMING_BIT. Turn each part into a plain pass: a suspending part stores its
+// attachments, a resuming part loads them, and only the last part resolves. Same result, more bandwidth; tests whether
+// this driver loses draws in resumed passes (HZD's missing static meshes, 2026-10-29). Counters of such passes.
+static bool g_no_susres;
+static _Atomic uint64_t g_susp_passes, g_resu_passes;
+static __thread bool tl_div_bound; // the last vertex input this thread set or bound has a divisor != 1 (approximate)
 
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties) {
@@ -1679,6 +1691,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
                 }
         }
     }
+    if (g_gpu_time)
+        for (uint32_t i = 0; i < createInfoCount; i++) {
+            const VkPipelineVertexInputDivisorStateCreateInfo *dv = modified[i].pVertexInputState ? find_struct(
+                modified[i].pVertexInputState->pNext, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO) : NULL;
+            bool div = false;
+            for (uint32_t k = 0; dv && k < dv->vertexBindingDivisorCount; k++) div |= dv->pVertexBindingDivisors[k].divisor != 1;
+            if (div) atomic_fetch_add(&g_div_pipes, 1);
+        }
     dump_inflight_pipeline(createInfoCount, modified);
     VkResult res = d->fpCreateGraphicsPipelines(device, pipelineCache, createInfoCount, modified, pAllocator, pPipelines);
     for (uint32_t k = 0; k < zero_div_count; k++) zero_div[k]->divisor = 0;
@@ -1715,12 +1735,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
     return res;
 }
 
+
 static VKAPI_ATTR void VKAPI_CALL compat_CmdSetVertexInputEXT(
     VkCommandBuffer commandBuffer, uint32_t bindingCount, const VkVertexInputBindingDescription2EXT *pBindings,
     uint32_t attributeCount, const VkVertexInputAttributeDescription2EXT *pAttributes) {
     struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
     VkVertexInputBindingDescription2EXT stack[32];
     const VkVertexInputBindingDescription2EXT *b = pBindings;
+    if (g_gpu_time) {
+        bool div = false;
+        for (uint32_t i = 0; i < bindingCount; i++)
+            div |= pBindings[i].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE && pBindings[i].divisor != 1;
+        if (div) atomic_fetch_add(&g_div_vi, 1);
+        tl_div_bound = div;
+    }
     if (d->zero_divisor_emulated && bindingCount <= 32) {
         for (uint32_t i = 0; i < bindingCount; i++) {
             stack[i] = pBindings[i];
@@ -2932,6 +2960,11 @@ static void gt_report(struct GpuTime *g, double interval_s) {
             uint64_t c = atomic_load(&g_gtc[k]);
             if (c) fprintf(f, " %s %llu", g_gtc_name[k], (unsigned long long)c);
         }
+        fprintf(f, " | suspending passes %llu, resuming %llu", (unsigned long long)atomic_load(&g_susp_passes),
+                (unsigned long long)atomic_load(&g_resu_passes));
+        fprintf(f, " | firstInstance!=0 draws %llu, divisor!=1 pipelines %llu, vertex inputs %llu",
+                (unsigned long long)atomic_load(&g_div_draws), (unsigned long long)atomic_load(&g_div_pipes),
+                (unsigned long long)atomic_load(&g_div_vi));
         fprintf(f, "\n");
         for (uint32_t i = 0; i < n && i < 25; i++) {
             char desc[160];
@@ -3167,8 +3200,32 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushDescriptorSetKHR(VkCommandBuffer
     (c ? c->dev : get_device_data_by_cmd(cmd))->fpCmdPushDescriptorSetKHR(cmd, bp, layout, set, count, w);
 }
 
+static void susres_attachment(VkRenderingAttachmentInfo *a, bool resume, bool suspend) {
+    if (a->imageView == VK_NULL_HANDLE) return;
+    if (resume) a->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    if (suspend) {
+        a->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        a->resolveMode = VK_RESOLVE_MODE_NONE;
+        a->resolveImageView = VK_NULL_HANDLE;
+    }
+}
+
 static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRendering(VkCommandBuffer cmd, const VkRenderingInfo *ri) {
     GTC(GTC_RENDERING);
+    if (ri->flags & VK_RENDERING_SUSPENDING_BIT) atomic_fetch_add(&g_susp_passes, 1);
+    if (ri->flags & VK_RENDERING_RESUMING_BIT) atomic_fetch_add(&g_resu_passes, 1);
+    VkRenderingInfo plain;
+    VkRenderingAttachmentInfo col[8], dep, ste;
+    if (g_no_susres && (ri->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)) && ri->colorAttachmentCount <= 8) {
+        bool resume = ri->flags & VK_RENDERING_RESUMING_BIT, suspend = ri->flags & VK_RENDERING_SUSPENDING_BIT;
+        plain = *ri;
+        plain.flags &= ~(VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT);
+        for (uint32_t i = 0; i < ri->colorAttachmentCount; i++) { col[i] = ri->pColorAttachments[i]; susres_attachment(&col[i], resume, suspend); }
+        plain.pColorAttachments = col;
+        if (ri->pDepthAttachment) { dep = *ri->pDepthAttachment; susres_attachment(&dep, resume, suspend); plain.pDepthAttachment = &dep; }
+        if (ri->pStencilAttachment) { ste = *ri->pStencilAttachment; susres_attachment(&ste, resume, suspend); plain.pStencilAttachment = &ste; }
+        ri = &plain;
+    }
     gt_render_begin(cmd, ri->renderArea.extent.width, ri->renderArea.extent.height, ri->colorAttachmentCount, ri);
     get_device_data_by_cmd(cmd)->gt->fpCmdBeginRendering(cmd, ri);
 }
@@ -3213,6 +3270,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatchIndirect(VkCommandBuffer cmd
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDraw(VkCommandBuffer cmd, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
     GTC(GTC_DRAW);
+    if (fi && ic) atomic_fetch_add(&g_div_draws, 1);
     struct CmdBufData *c = cmd_data(cmd);
     gt_draw(c, vc, ic);
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDraw(cmd, vc, ic, fv, fi);
@@ -3220,6 +3278,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDraw(VkCommandBuffer cmd, uint32_t v
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexed(VkCommandBuffer cmd, uint32_t xc, uint32_t ic, uint32_t fx, int32_t vo,
                                                         uint32_t fi) {
     GTC(GTC_DRAW_INDEXED);
+    if (fi && ic) atomic_fetch_add(&g_div_draws, 1);
     struct CmdBufData *c = cmd_data(cmd);
     gt_draw(c, xc, ic);
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndexed(cmd, xc, ic, fx, vo, fi);
@@ -3314,6 +3373,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_gpu_time = getenv("MALI_COMPAT_GPU_TIME") && strcmp(getenv("MALI_COMPAT_GPU_TIME"), "0") != 0;
     g_depth_nocomp = getenv("MALI_COMPAT_DEPTH_NOCOMP") && strcmp(getenv("MALI_COMPAT_DEPTH_NOCOMP"), "0") != 0;
     g_force_comp = getenv("MALI_COMPAT_FORCE_COMP") && strcmp(getenv("MALI_COMPAT_FORCE_COMP"), "0") != 0;
+    g_no_susres = getenv("MALI_COMPAT_NO_SUSPEND_RESUME") && strcmp(getenv("MALI_COMPAT_NO_SUSPEND_RESUME"), "0") != 0;
     g_vendor_id = getenv("MALI_COMPAT_VENDOR_ID") ? (uint32_t)strtoul(getenv("MALI_COMPAT_VENDOR_ID"), NULL, 16) : 0;
     // on by default: the write it removes is discarded by the spec anyway (MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off)
     g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
