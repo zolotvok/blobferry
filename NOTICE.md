@@ -35,3 +35,9 @@ phone at run time and never ships, copies or redistributes it.
 Running the phone's vendor Vulkan driver from a glibc Linux guest through libhybris is what tawc and
 [ARLinux](https://github.com/taowen/arlinux-rootfs) do. Blobferry builds on that idea with its own ICD shim and a
 compatibility layer for DXVK and vkd3d-proton on Mali.
+
+[MaliBridge](https://github.com/ASEbrahim/MaliBridge) (GPL-3) runs the vendor driver for Linux programs too, through
+a socket to an Android-side server. `MALI_COMPAT_GS_HIDE_PROCS` takes the idea of its "gs_hide": Mesa Zink turns
+Xwayland's GL_QUADS into geometry shaders, which crash some Mali drivers, so geometry shaders are hidden from the
+listed processes. Only the idea was taken; Blobferry's implementation (a feature mask in the compat layer,
+`src/compat/mali_compat_layer.c`) is its own, and no MaliBridge code is included.
