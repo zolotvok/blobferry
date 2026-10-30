@@ -1468,6 +1468,9 @@ static bool g_gpu_time;
 static uint32_t g_dump_hashes[16];
 static uint32_t g_dump_hash_count;
 static uint32_t g_gt_trace; // MALI_COMPAT_GT_TRACE=<hex>: write every pass whose fragment/compute shader has this hash
+                            // (=all: every pass and dispatch, in GPU order with its start time)
+static uint32_t g_skip_hash; // MALI_COMPAT_SKIP_HASH, see gt_skip
+static _Atomic uint64_t g_skipped_draws;
 
 static uint32_t spv_hash(const uint32_t *code, size_t bytes) {
     uint32_t h = 2166136261u;
@@ -1682,6 +1685,262 @@ static const struct CodeNode *fragdepth_module_get(VkShaderModule m) {
         if (e->module == (uint64_t)m) { found = e; break; }
     pthread_mutex_unlock(&g_hash_mutex);
     return found;
+}
+
+// -----------------------------------------------------------------------------
+// Stream output without the geometry shader (MALI_COMPAT_XFB_VS=1). [Claude Opus 5.5] 2026-10-30
+// DXVK turns D3D11 stream output into a passthrough geometry shader with transform feedback. On the vendor driver a
+// geometry shader with transform feedback costs ~4 ms per draw, capture in the vertex shader 0.1-0.2 ms and a geometry
+// shader without capture 0.04 ms (test/xfb-probe.c). Unity's DX11 GPU skinning (stream output, one draw per skinned
+// mesh) took 35-41 ms of a ~50 ms frame in Yooka-Laylee IL. For a geometry shader that only copies input components
+// to captured outputs (points in, one point out), the pipeline is built without it: the vertex shader gets one new
+// captured output per geometry shader output (same XfbBuffer/XfbStride/Offset, location moved past the vertex
+// shader's own outputs), filled from the vertex shader's outputs right before it returns.
+// -----------------------------------------------------------------------------
+static bool g_xfb_vs;
+static _Atomic uint64_t g_xfb_vs_pipes;
+
+enum { SD_LOC = 1, SD_COMP = 2, SD_XBUF = 4, SD_XSTRIDE = 8, SD_OFF = 16, SD_BUILTIN = 32, SD_STREAM = 64 };
+struct SpvMod {
+    const uint32_t *w;
+    size_t n;
+    uint32_t bound, model, entry_fn, entry_at, last_entry_end, caps_end, types_at, funcs_at;
+    uint32_t *flags, *loc, *comp, *xbuf, *xstride, *off;
+    uint32_t *op, *a, *b, *c; // defining opcode per result id and its operands (see spv_mod_parse)
+    bool xfb, in_points, out_points, one_vertex, other_mode, has_xfb_cap;
+};
+
+static void spv_mod_free(struct SpvMod *m) { free(m->flags); }
+
+// Indexes a module: decorations, types, pointers, variables and constants by result id, and where the sections start.
+// a/b/c: TypeInt width/signed, TypeFloat width, TypeVector comp/count, TypeArray elem/length id, TypePointer
+// storage/pointee, Variable pointer type/storage, Constant type/value.
+static bool spv_mod_parse(const uint32_t *w, size_t bytes, struct SpvMod *m) {
+    memset(m, 0, sizeof *m);
+    m->w = w;
+    m->n = bytes / 4;
+    if (m->n < 5 || w[0] != 0x07230203 || w[3] > (1u << 20)) return false;
+    m->bound = w[3];
+    m->flags = calloc((size_t)m->bound * 10, sizeof(uint32_t));
+    if (!m->flags) return false;
+    m->loc = m->flags + m->bound; m->comp = m->loc + m->bound; m->xbuf = m->comp + m->bound;
+    m->xstride = m->xbuf + m->bound; m->off = m->xstride + m->bound; m->op = m->off + m->bound;
+    m->a = m->op + m->bound; m->b = m->a + m->bound; m->c = m->b + m->bound;
+    int entries = 0;
+    for (size_t i = 5; i < m->n;) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (!wc || i + wc > m->n) { spv_mod_free(m); return false; }
+        const uint32_t *x = w + i;
+        if (op == 17) { m->caps_end = i + wc; if (wc >= 2 && x[1] == 53) m->has_xfb_cap = true; }
+        else if (op == 15 && wc >= 3) { if (!entries++) { m->model = x[1]; m->entry_fn = x[2]; m->entry_at = i; } m->last_entry_end = i + wc; }
+        else if (op == 16 && wc >= 3 && x[1] == m->entry_fn) {
+            uint32_t mode = x[2];
+            if (mode == 11) m->xfb = true;
+            else if (mode == 19) m->in_points = true;
+            else if (mode == 27) m->out_points = true;
+            else if (mode == 26) m->one_vertex = wc >= 4 && x[3] == 1;
+            else if (mode == 0) m->other_mode |= !(wc >= 4 && x[3] == 1); // Invocations other than 1
+            else if (mode >= 20 && mode <= 29) m->other_mode = true; // other primitive types
+        } else if (op == 71 && wc >= 3 && x[1] < m->bound) {
+            uint32_t id = x[1], dec = x[2], v = wc >= 4 ? x[3] : 0;
+            if (dec == 30) { m->flags[id] |= SD_LOC; m->loc[id] = v; }
+            else if (dec == 31) { m->flags[id] |= SD_COMP; m->comp[id] = v; }
+            else if (dec == 36) { m->flags[id] |= SD_XBUF; m->xbuf[id] = v; }
+            else if (dec == 37) { m->flags[id] |= SD_XSTRIDE; m->xstride[id] = v; }
+            else if (dec == 35) { m->flags[id] |= SD_OFF; m->off[id] = v; }
+            else if (dec == 11) m->flags[id] |= SD_BUILTIN;
+            else if (dec == 29 && v) m->flags[id] |= SD_STREAM;
+        } else if (op >= 19 && op <= 39 && wc >= 2 && x[1] < m->bound) {
+            if (!m->types_at) m->types_at = i;
+            m->op[x[1]] = op;
+            m->a[x[1]] = wc >= 3 ? x[2] : 0;
+            m->b[x[1]] = wc >= 4 ? x[3] : 0;
+        } else if ((op == 43 || op == 59) && wc >= 4 && x[2] < m->bound) {
+            if (!m->types_at) m->types_at = i;
+            m->op[x[2]] = op;
+            m->a[x[2]] = x[1];
+            m->b[x[2]] = x[3];
+        } else if (op == 54 && !m->funcs_at) {
+            m->funcs_at = i;
+        }
+        i += wc;
+    }
+    return entries == 1 && m->types_at && m->funcs_at;
+}
+
+// Scalar type of a 32-bit int/float type id as (op << 16 | signed << 8 | width), 0 for anything else.
+static uint32_t spv_scalar_key(const struct SpvMod *m, uint32_t t) {
+    if (t >= m->bound || (m->op[t] != 21 && m->op[t] != 22) || m->a[t] != 32) return 0;
+    return m->op[t] << 16 | (m->op[t] == 21 ? m->b[t] : 0) << 8 | 32;
+}
+
+// The pointee of a variable, split into scalar type id and component count (1 for scalars); false for other types.
+static bool spv_var_shape(const struct SpvMod *m, uint32_t var, uint32_t *scalar, uint32_t *count) {
+    if (var >= m->bound || m->op[var] != 59) return false;
+    uint32_t pt = m->a[var];
+    if (pt >= m->bound || m->op[pt] != 32) return false;
+    uint32_t t = m->b[pt];
+    if (t < m->bound && m->op[t] == 23) { *scalar = m->a[t]; *count = m->b[t]; }
+    else { *scalar = t; *count = 1; }
+    return spv_scalar_key(m, *scalar) != 0;
+}
+
+struct XfbMap { uint32_t in_loc, in_comp, count, key, loc, comp, buf, stride, off; bool has_stride;
+                uint32_t vs_var, vs_idx, vs_scalar, vs_count; };
+
+// New vertex shader that also captures what the passthrough geometry shader `gs` captured, or NULL.
+static uint32_t *xfb_vs_from_gs(const uint32_t *vs, size_t vs_bytes, const uint32_t *gs, size_t gs_bytes, size_t *out_bytes) {
+    struct SpvMod g, v;
+    if (!spv_mod_parse(gs, gs_bytes, &g)) return NULL;
+    if (!spv_mod_parse(vs, vs_bytes, &v)) { spv_mod_free(&g); return NULL; }
+    uint32_t *out = NULL;
+    struct XfbMap map[64];
+    uint32_t nmap = 0, chain_var[64], chain_k[64], chain_id[64], nchain = 0, load_id[64], load_chain[64], nload = 0;
+    uint32_t labels = 0, emits = 0, fns = 0;
+    if (g.model != 3 || !g.xfb || !g.in_points || !g.out_points || !g.one_vertex || g.other_mode || v.model != 0 || v.xfb) goto done;
+    // the geometry shader body: one block of input element loads stored to captured outputs, then EmitVertex
+    for (size_t i = g.funcs_at; i < g.n;) {
+        uint32_t wc = gs[i] >> 16, op = gs[i] & 0xffff;
+        const uint32_t *x = gs + i;
+        i += wc;
+        if (op == 54) { if (++fns > 1) goto done; }
+        else if (op == 248) { if (++labels > 1) goto done; }
+        else if (op == 218) emits++;
+        else if (op == 253 || op == 56 || op == 8 || op == 317 || op == 0) continue;
+        else if (op == 65 && (wc == 5 || wc == 6) && nchain < 64) {
+            // OpAccessChain %ptr %id %input_var %c0 [%ck]: element 0 of the input array, optionally component k
+            uint32_t base = x[3], i0 = x[4], k = wc == 6 ? x[5] : UINT32_MAX;
+            if (base >= g.bound || g.op[base] != 59 || g.b[base] != 1 || (g.flags[base] & SD_BUILTIN)) goto done;
+            if (i0 >= g.bound || g.op[i0] != 43 || g.b[i0] != 0) goto done;
+            if (k != UINT32_MAX) { if (k >= g.bound || g.op[k] != 43) goto done; k = g.b[k]; }
+            chain_id[nchain] = x[2]; chain_var[nchain] = base; chain_k[nchain++] = k;
+        } else if (op == 61 && wc >= 4 && nload < 64) {
+            uint32_t c = 0;
+            while (c < nchain && chain_id[c] != x[3]) c++;
+            if (c == nchain) goto done;
+            load_id[nload] = x[2]; load_chain[nload++] = c;
+        } else if (op == 62 && wc >= 3 && nmap < 64) {
+            uint32_t dst = x[1], l = 0;
+            while (l < nload && load_id[l] != x[2]) l++;
+            if (l == nload || dst >= g.bound || g.op[dst] != 59 || g.b[dst] != 3) goto done;
+            if ((g.flags[dst] & (SD_LOC | SD_XBUF | SD_OFF)) != (SD_LOC | SD_XBUF | SD_OFF) || (g.flags[dst] & (SD_BUILTIN | SD_STREAM))) goto done;
+            uint32_t c = load_chain[l], in = chain_var[c], k = chain_k[c];
+            // the input: an array of one scalar or vector at a location
+            uint32_t ipt = g.a[in], iarr = ipt < g.bound ? g.b[ipt] : 0;
+            if (iarr >= g.bound || g.op[iarr] != 28 || !(g.flags[in] & SD_LOC)) goto done;
+            uint32_t ielem = g.a[iarr], iscalar = ielem, icount = 1;
+            if (ielem < g.bound && g.op[ielem] == 23) { iscalar = g.a[ielem]; icount = g.b[ielem]; }
+            uint32_t oscalar, ocount;
+            if (!spv_var_shape(&g, dst, &oscalar, &ocount) || spv_scalar_key(&g, oscalar) != spv_scalar_key(&g, iscalar)) goto done;
+            struct XfbMap *mp = &map[nmap++];
+            memset(mp, 0, sizeof *mp);
+            mp->in_loc = g.loc[in];
+            mp->in_comp = g.comp[in] + (k == UINT32_MAX ? 0 : k);
+            mp->count = ocount;
+            if (k == UINT32_MAX ? ocount != icount : (ocount != 1 || k >= icount)) goto done;
+            mp->key = spv_scalar_key(&g, oscalar);
+            mp->loc = g.loc[dst]; mp->comp = g.comp[dst]; mp->buf = g.xbuf[dst]; mp->off = g.off[dst];
+            mp->has_stride = g.flags[dst] & SD_XSTRIDE; mp->stride = g.xstride[dst];
+        } else goto done;
+    }
+    if (emits != 1 || !nmap) goto done;
+    // the vertex shader outputs that feed them; new locations go past the highest one
+    uint32_t base = 0;
+    for (uint32_t id = 1; id < v.bound; id++)
+        if (v.op[id] == 59 && v.b[id] == 3 && (v.flags[id] & SD_LOC) && !(v.flags[id] & SD_BUILTIN)) {
+            uint32_t s, c;
+            if (!spv_var_shape(&v, id, &s, &c)) goto done; // arrays or structs: leave the pipeline alone
+            if (v.loc[id] + 1 > base) base = v.loc[id] + 1;
+        }
+    for (uint32_t k = 0; k < nmap; k++) {
+        struct XfbMap *mp = &map[k];
+        for (uint32_t id = 1; id < v.bound && !mp->vs_var; id++) {
+            uint32_t s, c;
+            if (v.op[id] != 59 || v.b[id] != 3 || !(v.flags[id] & SD_LOC) || (v.flags[id] & SD_BUILTIN) || v.loc[id] != mp->in_loc) continue;
+            if (!spv_var_shape(&v, id, &s, &c) || mp->in_comp < v.comp[id] || mp->in_comp + mp->count > v.comp[id] + c) continue;
+            if (spv_scalar_key(&v, s) != mp->key || (mp->count > 1 && mp->count != c)) goto done;
+            mp->vs_var = id; mp->vs_idx = mp->in_comp - v.comp[id]; mp->vs_scalar = s; mp->vs_count = c;
+        }
+        if (!mp->vs_var || base + mp->loc >= 32) goto done;
+    }
+
+    // write the new module
+    size_t cap = v.n + 64 + nmap * 40;
+    out = malloc(cap * sizeof *out);
+    if (!out) goto done;
+    size_t o = 0;
+    uint32_t next = v.bound;
+    uint32_t uint_t = 0;
+    for (uint32_t id = 1; id < v.bound && !uint_t; id++) if (v.op[id] == 21 && v.a[id] == 32 && v.b[id] == 0) uint_t = id;
+    bool new_uint = !uint_t;
+    if (new_uint) uint_t = next++;
+    uint32_t var_id[64], ptr_id[64], idx_id[64];
+    for (uint32_t k = 0; k < nmap; k++) {
+        var_id[k] = next++;
+        ptr_id[k] = next++; // Output pointer to the captured type (scalar, or the VS variable's vector type)
+        idx_id[k] = map[k].vs_count > 1 && map[k].count == 1 ? next++ : 0;
+    }
+    memcpy(out, vs, 5 * sizeof *out);
+    o = 5;
+    for (size_t i = 5; i < v.n;) {
+        uint32_t wc = vs[i] >> 16, op = vs[i] & 0xffff;
+        if (i == v.types_at) {
+            // decorations of the new outputs, at the end of the annotation section
+            for (uint32_t k = 0; k < nmap; k++) {
+                out[o++] = 4u << 16 | 71; out[o++] = var_id[k]; out[o++] = 30; out[o++] = base + map[k].loc;
+                if (map[k].comp) { out[o++] = 4u << 16 | 71; out[o++] = var_id[k]; out[o++] = 31; out[o++] = map[k].comp; }
+                out[o++] = 4u << 16 | 71; out[o++] = var_id[k]; out[o++] = 36; out[o++] = map[k].buf;
+                if (map[k].has_stride) { out[o++] = 4u << 16 | 71; out[o++] = var_id[k]; out[o++] = 37; out[o++] = map[k].stride; }
+                out[o++] = 4u << 16 | 71; out[o++] = var_id[k]; out[o++] = 35; out[o++] = map[k].off;
+            }
+        }
+        if (i == v.funcs_at) {
+            // types, constants and variables, at the end of the global section
+            if (new_uint) { out[o++] = 4u << 16 | 21; out[o++] = uint_t; out[o++] = 32; out[o++] = 0; }
+            for (uint32_t k = 0; k < nmap; k++) {
+                uint32_t vec_t = v.b[v.a[map[k].vs_var]]; // the VS variable's pointee
+                out[o++] = 4u << 16 | 32; out[o++] = ptr_id[k]; out[o++] = 3; out[o++] = map[k].count > 1 ? vec_t : map[k].vs_scalar;
+                if (idx_id[k]) { out[o++] = 4u << 16 | 43; out[o++] = uint_t; out[o++] = idx_id[k]; out[o++] = map[k].vs_idx; }
+                out[o++] = 4u << 16 | 59; out[o++] = ptr_id[k]; out[o++] = var_id[k]; out[o++] = 3;
+            }
+        }
+        if (op == 15 && i == v.entry_at) {
+            out[o++] = (wc + nmap) << 16 | 15;
+            memcpy(out + o, vs + i + 1, (wc - 1) * sizeof *out);
+            o += wc - 1;
+            for (uint32_t k = 0; k < nmap; k++) out[o++] = var_id[k];
+            i += wc;
+            if (i == v.last_entry_end) { out[o++] = 3u << 16 | 16; out[o++] = v.entry_fn; out[o++] = 11; }
+            continue;
+        }
+        if (op == 253) {
+            // before every return (only the entry function returns void here; DXVK inlines everything into main)
+            uint32_t tmp = next;
+            for (uint32_t k = 0; k < nmap; k++) {
+                uint32_t src = map[k].vs_var;
+                uint32_t vt = map[k].count > 1 ? v.b[v.a[map[k].vs_var]] : map[k].vs_scalar;
+                if (idx_id[k]) {
+                    out[o++] = 5u << 16 | 65; out[o++] = ptr_id[k]; out[o++] = tmp; out[o++] = map[k].vs_var; out[o++] = idx_id[k];
+                    src = tmp++;
+                }
+                out[o++] = 4u << 16 | 61; out[o++] = vt; out[o++] = tmp; out[o++] = src;
+                out[o++] = 3u << 16 | 62; out[o++] = var_id[k]; out[o++] = tmp++;
+                if (o + 64 + nmap * 12 > cap) { cap *= 2; uint32_t *nw = realloc(out, cap * sizeof *out); if (!nw) { free(out); out = NULL; goto done; } out = nw; }
+            }
+            next = tmp;
+        }
+        if (o + wc + 64 + nmap * 40 > cap) { cap = cap * 2 + wc; uint32_t *nw = realloc(out, cap * sizeof *out); if (!nw) { free(out); out = NULL; goto done; } out = nw; }
+        memcpy(out + o, vs + i, wc * sizeof *out);
+        o += wc;
+        i += wc;
+        if (op == 17 && i == v.caps_end && !v.has_xfb_cap) { out[o++] = 2u << 16 | 17; out[o++] = 53; }
+    }
+    out[3] = next;
+    *out_bytes = o * sizeof *out;
+done:
+    spv_mod_free(&g);
+    spv_mod_free(&v);
+    return out;
 }
 
 // -----------------------------------------------------------------------------
@@ -2069,6 +2328,69 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
     }
 
     // Also check for inline VkShaderModuleCreateInfo in stage pNext (VK_KHR_maintenance5)
+    // Stream output (MALI_COMPAT_XFB_VS): pipelines with DXVK's passthrough capture GS and no fragment shader are built
+    // from a vertex shader that captures by itself. Inline SPIR-V only (DXVK passes it that way with maintenance5).
+    VkPipelineShaderStageCreateInfo *xv_stages = NULL;
+    VkShaderModuleCreateInfo *xv_inline = NULL;
+    uint32_t **xv_codes = NULL;
+    if (g_xfb_vs) {
+        xv_stages = calloc((size_t)createInfoCount * 8, sizeof *xv_stages);
+        xv_inline = calloc(createInfoCount, sizeof *xv_inline);
+        xv_codes = calloc(createInfoCount, sizeof *xv_codes);
+        for (uint32_t i = 0; xv_stages && xv_inline && xv_codes && i < createInfoCount; i++) {
+            const VkGraphicsPipelineCreateInfo *ci = &modified[i];
+            if (ci->stageCount > 8 || (ci->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) ||
+                find_struct(ci->pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)) continue;
+            int vsi = -1, gsi = -1;
+            bool other = false;
+            for (uint32_t st = 0; st < ci->stageCount; st++) {
+                VkShaderStageFlagBits sb = ci->pStages[st].stage;
+                if (sb == VK_SHADER_STAGE_VERTEX_BIT) vsi = st;
+                else if (sb == VK_SHADER_STAGE_GEOMETRY_BIT) gsi = st;
+                else other = true; // fragment or tessellation: keep the pipeline as it is
+            }
+            if (gsi < 0) continue;
+            const VkShaderModuleCreateInfo *vsm = vsi < 0 ? NULL : find_struct(ci->pStages[vsi].pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+            const VkShaderModuleCreateInfo *gsm = find_struct(ci->pStages[gsi].pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+            const char *why = vsi < 0 ? "no VS" : other ? "fragment/tessellation stage" : !vsm || !gsm ? "shader module, not inline"
+                            : ci->pStages[vsi].pNext != (const void *)vsm ? "VS pNext chain" : NULL;
+            size_t bytes = 0;
+            uint32_t *code = why ? NULL : xfb_vs_from_gs(vsm->pCode, vsm->codeSize, gsm->pCode, gsm->codeSize, &bytes);
+            if (!code) {
+                // log the capture GS pipelines left alone (once per GS hash), so missed shapes can be found
+                struct SpvMod gm;
+                bool xfb = gsm && spv_mod_parse(gsm->pCode, gsm->codeSize, &gm) && (spv_mod_free(&gm), gm.xfb);
+                static uint32_t seen[64];
+                static _Atomic uint32_t nseen;
+                uint32_t h = gsm ? spv_hash(gsm->pCode, gsm->codeSize) : 0, k = 0, ns = atomic_load(&nseen);
+                while (k < ns && k < 64 && seen[k] != h) k++;
+                if ((xfb || !gsm) && k == ns && ns < 64) {
+                    seen[atomic_fetch_add(&nseen, 1) % 64] = h;
+                    fprintf(stderr, "mali-compat: stream output: GS %08x kept (%s), stages %u, in points %d, out points %d, one vertex %d\n", h,
+                            why ? why : "shape not handled", ci->stageCount, gsm ? gm.in_points : -1, gsm ? gm.out_points : -1,
+                            gsm ? gm.one_vertex : -1);
+                }
+                continue;
+            }
+            xv_codes[i] = code;
+            xv_inline[i] = *vsm;
+            xv_inline[i].pCode = code;
+            xv_inline[i].codeSize = bytes;
+            VkPipelineShaderStageCreateInfo *ns = xv_stages + (size_t)i * 8;
+            uint32_t k = 0;
+            for (uint32_t st = 0; st < ci->stageCount; st++) {
+                if ((int)st == gsi) continue;
+                ns[k] = ci->pStages[st];
+                if ((int)st == vsi) ns[k].pNext = &xv_inline[i];
+                k++;
+            }
+            modified[i].pStages = ns;
+            modified[i].stageCount = k;
+            if (atomic_fetch_add(&g_xfb_vs_pipes, 1) == 0)
+                fprintf(stderr, "mali-compat: stream output: pipeline built without the passthrough geometry shader\n");
+        }
+    }
+
     for (uint32_t i = 0; i < createInfoCount; i++) {
         if (modified[i].pRasterizationState) {
             rast_copies[i] = *modified[i].pRasterizationState;
@@ -2138,6 +2460,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
     for (uint32_t k = 0; k < fd_module_count; k++) d->fpDestroyShaderModule(device, fd_modules[k], NULL);
     for (uint32_t k = 0; k < fd_code_count; k++) free(fd_codes[k]);
     free(fd_stages);
+    for (uint32_t k = 0; xv_codes && k < createInfoCount; k++) free(xv_codes[k]);
+    free(xv_codes);
+    free(xv_inline);
+    free(xv_stages);
     free(rast_copies);
     free(modified);
     return res;
@@ -3392,7 +3718,9 @@ static void gt_pipe_desc(VkPipeline p, char *out, size_t len) {
     if (p && hash_get(g_pipeline_hash, (uint64_t)p, &h))
         for (int s = 0; s < 3 && h.stages[s]; s++) {
             const char *nm = h.stages[s] == VK_SHADER_STAGE_VERTEX_BIT ? "vs" : h.stages[s] == VK_SHADER_STAGE_FRAGMENT_BIT ? "fs"
-                           : h.stages[s] == VK_SHADER_STAGE_COMPUTE_BIT ? "cs" : "st";
+                           : h.stages[s] == VK_SHADER_STAGE_COMPUTE_BIT ? "cs" : h.stages[s] == VK_SHADER_STAGE_GEOMETRY_BIT ? "gs"
+                           : h.stages[s] == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ? "tc"
+                           : h.stages[s] == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT ? "te" : "st";
             n += snprintf(out + n, len - n, " %s:%08x", nm, h.hash[s]);
         }
 }
@@ -3426,6 +3754,7 @@ static void gt_line_rec(FILE *f, const char *tag, const struct GtRec *r, double 
 // MALI_COMPAT_GT_TRACE: does this record's pipeline have the traced fragment/compute shader?
 static bool gt_traced(const struct GtRec *r) {
     struct HashNode h;
+    if (g_gt_trace == UINT32_MAX) return true;
     if (!g_gt_trace || !r->pipeline || !hash_get(g_pipeline_hash, (uint64_t)r->pipeline, &h)) return false;
     for (int i = 0; i < 3; i++) if (h.hash[i] == g_gt_trace) return true;
     return false;
@@ -3465,6 +3794,8 @@ static void gt_report(struct GpuTime *g, double interval_s) {
         fprintf(f, " | firstInstance!=0 draws %llu, divisor!=1 pipelines %llu, vertex inputs %llu",
                 (unsigned long long)atomic_load(&g_div_draws), (unsigned long long)atomic_load(&g_div_pipes),
                 (unsigned long long)atomic_load(&g_div_vi));
+        if (g_xfb_vs) fprintf(f, " | stream-output pipelines without GS %llu", (unsigned long long)atomic_load(&g_xfb_vs_pipes));
+        if (g_skip_hash) fprintf(f, " | skipped draws (%08x) %llu", g_skip_hash, (unsigned long long)atomic_load(&g_skipped_draws));
         if (g_fake_occlusion)
             fprintf(f, " | faked occlusion copies %llu, reads %llu", (unsigned long long)atomic_load(&g_occl_copies),
                     (unsigned long long)atomic_load(&g_occl_reads));
@@ -3539,7 +3870,12 @@ static void *gt_thread(void *arg) {
                 uint64_t ns = v[2] >= v[0] ? (uint64_t)((double)(v[2] - v[0]) * g->period_ns) : 0;
                 if (gt_traced(r)) {
                     FILE *f = fopen(g->path, "a");
-                    if (f) { gt_line_rec(f, "TRACE", r, age, ns / 1e6); fclose(f); }
+                    if (f) {
+                        // GPU start and end time in ms, so the lines can be put in GPU order and gaps seen
+                        fprintf(f, "T %.3f %.3f ", v[0] * g->period_ns / 1e6, v[2] * g->period_ns / 1e6);
+                        gt_line_rec(f, "TRACE", r, age, ns / 1e6);
+                        fclose(f);
+                    }
                 }
                 gt_add(g, r, ns);
                 gt_free_slot(g, i);
@@ -3659,10 +3995,23 @@ static void gt_render_end(VkCommandBuffer cmd) {
     if (c && c->dev->gt && c->gt_rec >= 0) { gt_end(c, cmd, c->gt_rec); c->gt_rec = -1; }
 }
 
-static void gt_draw(struct CmdBufData *c, uint32_t vcount, uint32_t icount) {
-    if (!c || c->gt_rec < 0 || !c->dev->gt) return;
+// MALI_COMPAT_SKIP_HASH=<hex>: draws whose bound graphics pipeline has a shader with this hash are dropped (finds the
+// draw that makes a pass slow; the picture is wrong while it is set). [Claude Opus 5.5] 2026-10-30
+static bool gt_skip(struct CmdBufData *c) {
+    struct HashNode h;
+    if (!g_skip_hash || !c || !c->gfx_pipeline || !hash_get(g_pipeline_hash, (uint64_t)c->gfx_pipeline, &h)) return false;
+    for (int i = 0; i < 3; i++)
+        if (h.hash[i] == g_skip_hash) { atomic_fetch_add(&g_skipped_draws, 1); return true; }
+    return false;
+}
+
+// Returns true when the draw is to be skipped (gt_skip).
+static bool gt_draw(struct CmdBufData *c, uint32_t vcount, uint32_t icount) {
+    if (gt_skip(c)) return true;
+    if (!c || c->gt_rec < 0 || !c->dev->gt) return false;
     struct GtRec *r = &c->dev->gt->rec[c->gt_rec];
     if (!r->draws++) { r->pipeline = c->gfx_pipeline; r->vcount = vcount; r->icount = icount; r->src = c->gt_src; }
+    return false;
 }
 
 static void pushdesc_record(struct PushDescRec *r, VkPipelineLayout layout, uint32_t set, uint32_t count,
@@ -3787,7 +4136,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDraw(VkCommandBuffer cmd, uint32_t v
     GTC(GTC_DRAW);
     if (fi && ic) atomic_fetch_add(&g_div_draws, 1);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, vc, ic);
+    if (gt_draw(c, vc, ic)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDraw(cmd, vc, ic, fv, fi);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexed(VkCommandBuffer cmd, uint32_t xc, uint32_t ic, uint32_t fx, int32_t vo,
@@ -3795,34 +4144,34 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexed(VkCommandBuffer cmd, uin
     GTC(GTC_DRAW_INDEXED);
     if (fi && ic) atomic_fetch_add(&g_div_draws, 1);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, xc, ic);
+    if (gt_draw(c, xc, ic)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndexed(cmd, xc, ic, fx, vo, fi);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndirect(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s) {
     GTC(GTC_DRAW_INDIRECT);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, 0, 0);
+    if (gt_draw(c, 0, 0)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndirect(cmd, b, o, n, s);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, uint32_t n,
                                                                 uint32_t s) {
     GTC(GTC_DRAW_INDEXED_INDIRECT);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, 0, 0);
+    if (gt_draw(c, 0, 0)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndexedIndirect(cmd, b, o, n, s);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndirectCount(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, VkBuffer cb,
                                                               VkDeviceSize co, uint32_t n, uint32_t s) {
     GTC(GTC_DRAW_INDIRECT_COUNT);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, 0, 0);
+    if (gt_draw(c, 0, 0)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndirectCount(cmd, b, o, cb, co, n, s);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexedIndirectCount(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, VkBuffer cb,
                                                                      VkDeviceSize co, uint32_t n, uint32_t s) {
     GTC(GTC_DRAW_INDEXED_INDIRECT_COUNT);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, 0, 0);
+    if (gt_draw(c, 0, 0)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndexedIndirectCount(cmd, b, o, cb, co, n, s);
 }
 
@@ -3830,33 +4179,33 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMultiEXT(VkCommandBuffer cmd, ui
                                                          uint32_t ic, uint32_t fi, uint32_t stride) {
     GTC(GTC_DRAW_MULTI);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, n && info ? info->vertexCount : 0, ic);
+    if (gt_draw(c, n && info ? info->vertexCount : 0, ic)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMultiEXT(cmd, n, info, ic, fi, stride);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMultiIndexedEXT(VkCommandBuffer cmd, uint32_t n, const VkMultiDrawIndexedInfoEXT *info,
                                                                 uint32_t ic, uint32_t fi, uint32_t stride, const int32_t *vo) {
     GTC(GTC_DRAW_MULTI_INDEXED);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, n && info ? info->indexCount : 0, ic);
+    if (gt_draw(c, n && info ? info->indexCount : 0, ic)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMultiIndexedEXT(cmd, n, info, ic, fi, stride, vo);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMeshTasksEXT(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z) {
     GTC(GTC_MESH);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, x, y);
+    if (gt_draw(c, x, y)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMeshTasksEXT(cmd, x, y, z);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s) {
     GTC(GTC_MESH_INDIRECT);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, 0, 0);
+    if (gt_draw(c, 0, 0)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMeshTasksIndirectEXT(cmd, b, o, n, s);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, VkBuffer cb,
                                                                           VkDeviceSize co, uint32_t n, uint32_t s) {
     GTC(GTC_MESH_INDIRECT_COUNT);
     struct CmdBufData *c = cmd_data(cmd);
-    gt_draw(c, 0, 0);
+    if (gt_draw(c, 0, 0)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawMeshTasksIndirectCountEXT(cmd, b, o, cb, co, n, s);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatchBase(VkCommandBuffer cmd, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x,
@@ -3899,6 +4248,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     // on by default: the write it removes is discarded by the spec anyway (MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off)
     g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
     g_gt_trace = getenv("MALI_COMPAT_GT_TRACE") ? (uint32_t)strtoul(getenv("MALI_COMPAT_GT_TRACE"), NULL, 16) : 0;
+    if (getenv("MALI_COMPAT_GT_TRACE") && !strcmp(getenv("MALI_COMPAT_GT_TRACE"), "all")) g_gt_trace = UINT32_MAX;
+    g_xfb_vs = getenv("MALI_COMPAT_XFB_VS") && strcmp(getenv("MALI_COMPAT_XFB_VS"), "0") != 0;
+    g_skip_hash = getenv("MALI_COMPAT_SKIP_HASH") ? (uint32_t)strtoul(getenv("MALI_COMPAT_SKIP_HASH"), NULL, 16) : 0;
     g_dump_hash_count = 0;
     for (const char *h = getenv("MALI_COMPAT_DUMP_HASH"); h && *h && g_dump_hash_count < 16;) {
         char *end;
