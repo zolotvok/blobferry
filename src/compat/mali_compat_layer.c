@@ -1949,7 +1949,7 @@ static void pc_destroy(struct DeviceData *d) {
 
 // Only the game's background compile threads use the shared cache: with one cache the driver serialises compiles on
 // it, and a pipeline the render thread needs then waited behind thousands of background compiles (HZD's menu froze
-// at 0 fps, 2026-10-29 test 6). MALI_COMPAT_PIPELINE_CACHE_THREADS=<comm prefix> (default "AsyncPso", HZD's compile
+// at 0 fps, 2026-10-29 test 6). MALI_COMPAT_PIPELINE_CACHE_THREADS=<comm prefixes, comma-separated> (default "AsyncPso", HZD's compile
 // queue; "*" = every thread). "*" broke HZD's start (2026-10-30): with a cache on the main thread vkd3d's first compute
 // pipelines crashed (C0000005 in vkCreateComputePipelines, or FEX "Unhandled non-JIT atomic" after a 2 min hang).
 static const char *g_pc_threads = "AsyncPso";
@@ -1962,7 +1962,15 @@ static bool pc_thread_ok(void) {
             if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0;
             fclose(f);
         }
-        tl_pc_use = (!strcmp(g_pc_threads, "*") || !strncmp(comm, g_pc_threads, strlen(g_pc_threads))) ? 1 : 2;
+        // a comma-separated list of prefixes (the Witcher compiles on several named threads)
+        tl_pc_use = 2;
+        for (const char *p = g_pc_threads; *p; ) {
+            size_t n = strcspn(p, ",");
+            if ((n == 1 && *p == '*') || (n && !strncmp(comm, p, n))) { tl_pc_use = 1; break; }
+            p += n + (p[n] == ',');
+        }
+        // once per thread: which threads create pipelines, to pick the prefixes for a new game
+        fprintf(stderr, "mali-compat: pipeline cache: thread '%s' %s\n", comm, tl_pc_use == 1 ? "uses it" : "skipped");
     }
     return tl_pc_use == 1;
 }
