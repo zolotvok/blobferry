@@ -800,6 +800,7 @@ struct CmdBufData {
     VkPipeline gfx_pipeline;        // last app graphics pipeline (GPU timing)
     int32_t gt_rec;                 // GPU timing record of the open render pass, -1 if none
     VkImageView gt_src;             // first image view of the last push-descriptor write (GPU timing details)
+    bool async_skip;                // the bound graphics pipeline is still compiling (MALI_COMPAT_ASYNC_PSO)
     struct CmdBufData *next;
 };
 
@@ -1113,6 +1114,7 @@ static void reset_cmd_data(struct DeviceData *dev_data, VkCommandBuffer cmd, boo
     e->gfx_pipeline = VK_NULL_HANDLE;
     e->gt_rec = -1;
     e->gt_src = VK_NULL_HANDLE;
+    e->async_skip = false;
     if (remove) {
         free(e->staging_resources);
         free(e);
@@ -2311,6 +2313,363 @@ static VkPipelineCache pc_for(struct DeviceData *d, VkPipelineCache app, uint32_
     return g_pc;
 }
 
+// -----------------------------------------------------------------------------
+// Asynchronous graphics pipeline compiles (MALI_COMPAT_ASYNC_PSO=<ms>). [Claude Opus 5.5] 2026-10-30
+// The vendor compiler takes 4-9 s on some pipelines (The Witcher 3 DX11), and DXVK creates them on its CS thread when
+// a draw first needs them, so the game stops for that long. With the switch, every graphics pipeline is deep-copied
+// and compiled on worker threads; the caller waits up to <ms> milliseconds. A compile that finishes in time returns
+// the real pipeline as before. A slower one returns a stand-in handle: binding it binds the real pipeline once it is
+// done, and until then the draws recorded with it are dropped (the object appears a moment later). Pipelines that
+// capture with transform feedback, pipeline libraries, derivatives, shader modules (not inline SPIR-V) and create
+// infos with structures the copy does not know are compiled the normal way. MALI_COMPAT_ASYNC_THREADS sets the worker
+// count (default 2).
+// -----------------------------------------------------------------------------
+static uint32_t g_async_ms;      // 0 = off
+static uint32_t g_async_threads = 2;
+static _Atomic uint64_t g_async_jobs, g_async_pending, g_async_skipped, g_async_failed;
+
+struct ArBlk { struct ArBlk *next; size_t used, cap; unsigned char data[]; };
+struct Arena { struct ArBlk *head; bool fail; };
+static void *ar_alloc(struct Arena *a, size_t n) {
+    n = (n + 15) & ~(size_t)15;
+    struct ArBlk *b = a->head;
+    if (!b || b->used + n > b->cap) {
+        size_t cap = n > 65536 ? n : 65536;
+        if (!(b = malloc(sizeof *b + cap))) { a->fail = true; return NULL; }
+        b->next = a->head; b->used = 0; b->cap = cap; a->head = b;
+    }
+    void *p = b->data + b->used;
+    b->used += n;
+    return p;
+}
+static const void *ar_dup(struct Arena *a, const void *src, size_t n) {
+    if (!src || !n) return NULL;
+    void *p = ar_alloc(a, n);
+    if (p) memcpy(p, src, n);
+    return p;
+}
+static void ar_free(struct Arena *a) {
+    for (struct ArBlk *b = a->head, *n; b; b = n) { n = b->next; free(b); }
+    a->head = NULL;
+}
+
+// One pNext chain. Unknown structures fail the copy (the pipeline is then compiled synchronously); creation feedback
+// (written by the driver, the app's memory may be gone by then) and object names are left out.
+static const void *async_copy_chain(struct Arena *a, const void *chain) {
+    const void *head = NULL;
+    VkBaseOutStructure *tail = NULL;
+    for (const VkBaseInStructure *s = chain; s; s = s->pNext) {
+        size_t size = 0;
+        switch (s->sType) {
+        case VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO:
+        case VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT: continue;
+        case VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO: size = sizeof(VkPipelineRenderingCreateInfo); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO: size = sizeof(VkPipelineCreateFlags2CreateInfoKHR); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO: size = sizeof(VkPipelineRobustnessCreateInfoEXT); break;
+        case VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: size = sizeof(VkShaderModuleCreateInfo); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO:
+            size = sizeof(VkPipelineShaderStageRequiredSubgroupSizeCreateInfo); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO:
+            size = sizeof(VkPipelineVertexInputDivisorStateCreateInfoEXT); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO:
+            size = sizeof(VkPipelineTessellationDomainOriginStateCreateInfo); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT:
+            size = sizeof(VkPipelineViewportDepthClipControlCreateInfoEXT); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT:
+            size = sizeof(VkPipelineRasterizationDepthClipStateCreateInfoEXT); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT:
+            size = sizeof(VkPipelineRasterizationStateStreamCreateInfoEXT); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO:
+            size = sizeof(VkPipelineRasterizationLineStateCreateInfoEXT); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT:
+            size = sizeof(VkPipelineRasterizationProvokingVertexStateCreateInfoEXT); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT:
+            size = sizeof(VkPipelineRasterizationConservativeStateCreateInfoEXT); break;
+        case VK_STRUCTURE_TYPE_PIPELINE_COLOR_WRITE_CREATE_INFO_EXT: size = sizeof(VkPipelineColorWriteCreateInfoEXT); break;
+        default: a->fail = true; return NULL;
+        }
+        VkBaseOutStructure *c = (VkBaseOutStructure *)ar_dup(a, s, size);
+        if (!c) { a->fail = true; return NULL; }
+        c->pNext = NULL;
+        switch (s->sType) {
+        case VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO: {
+            VkPipelineRenderingCreateInfo *r = (VkPipelineRenderingCreateInfo *)c;
+            r->pColorAttachmentFormats = ar_dup(a, r->pColorAttachmentFormats, r->colorAttachmentCount * sizeof(VkFormat));
+            break;
+        }
+        case VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: {
+            VkShaderModuleCreateInfo *m = (VkShaderModuleCreateInfo *)c;
+            m->pCode = ar_dup(a, m->pCode, m->codeSize);
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO: {
+            VkPipelineVertexInputDivisorStateCreateInfoEXT *d = (VkPipelineVertexInputDivisorStateCreateInfoEXT *)c;
+            d->pVertexBindingDivisors = ar_dup(a, d->pVertexBindingDivisors,
+                                               d->vertexBindingDivisorCount * sizeof(VkVertexInputBindingDivisorDescriptionEXT));
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PIPELINE_COLOR_WRITE_CREATE_INFO_EXT: {
+            VkPipelineColorWriteCreateInfoEXT *w = (VkPipelineColorWriteCreateInfoEXT *)c;
+            w->pColorWriteEnables = ar_dup(a, w->pColorWriteEnables, w->attachmentCount * sizeof(VkBool32));
+            break;
+        }
+        default: break;
+        }
+        if (tail) tail->pNext = c; else head = c;
+        tail = c;
+    }
+    return head;
+}
+
+#define AR_STATE(field, type)                                                         \
+    if (s->field) {                                                                   \
+        type *x = (type *)ar_dup(a, s->field, sizeof(type));                          \
+        if (!x) return false;                                                         \
+        x->pNext = async_copy_chain(a, s->field->pNext);                              \
+        d->field = x;                                                                 \
+    }
+
+// Deep copy of a graphics pipeline create info into the arena; false if it cannot be copied.
+static bool async_copy_ci(struct Arena *a, const VkGraphicsPipelineCreateInfo *s, VkGraphicsPipelineCreateInfo *d) {
+    *d = *s;
+    d->pNext = async_copy_chain(a, s->pNext);
+    bool tess = false;
+    VkPipelineShaderStageCreateInfo *st = s->stageCount ? ar_alloc(a, s->stageCount * sizeof *st) : NULL;
+    for (uint32_t i = 0; st && i < s->stageCount; i++) {
+        st[i] = s->pStages[i];
+        st[i].pNext = async_copy_chain(a, s->pStages[i].pNext);
+        if (s->pStages[i].pName) st[i].pName = ar_dup(a, s->pStages[i].pName, strlen(s->pStages[i].pName) + 1);
+        if (s->pStages[i].pSpecializationInfo) {
+            const VkSpecializationInfo *si = s->pStages[i].pSpecializationInfo;
+            VkSpecializationInfo *ci = (VkSpecializationInfo *)ar_dup(a, si, sizeof *si);
+            if (ci) {
+                ci->pMapEntries = ar_dup(a, si->pMapEntries, si->mapEntryCount * sizeof(VkSpecializationMapEntry));
+                ci->pData = ar_dup(a, si->pData, si->dataSize);
+            }
+            st[i].pSpecializationInfo = ci;
+        }
+        if (s->pStages[i].stage & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) tess = true;
+    }
+    d->pStages = st;
+    AR_STATE(pVertexInputState, VkPipelineVertexInputStateCreateInfo)
+    if (s->pVertexInputState) {
+        VkPipelineVertexInputStateCreateInfo *v = (VkPipelineVertexInputStateCreateInfo *)d->pVertexInputState;
+        v->pVertexBindingDescriptions = ar_dup(a, v->pVertexBindingDescriptions,
+                                               v->vertexBindingDescriptionCount * sizeof(VkVertexInputBindingDescription));
+        v->pVertexAttributeDescriptions = ar_dup(a, v->pVertexAttributeDescriptions,
+                                                 v->vertexAttributeDescriptionCount * sizeof(VkVertexInputAttributeDescription));
+    }
+    AR_STATE(pInputAssemblyState, VkPipelineInputAssemblyStateCreateInfo)
+    if (tess) { AR_STATE(pTessellationState, VkPipelineTessellationStateCreateInfo) } else d->pTessellationState = NULL;
+    AR_STATE(pViewportState, VkPipelineViewportStateCreateInfo)
+    if (s->pViewportState) {
+        VkPipelineViewportStateCreateInfo *v = (VkPipelineViewportStateCreateInfo *)d->pViewportState;
+        v->pViewports = ar_dup(a, v->pViewports, v->viewportCount * sizeof(VkViewport));
+        v->pScissors = ar_dup(a, v->pScissors, v->scissorCount * sizeof(VkRect2D));
+    }
+    AR_STATE(pRasterizationState, VkPipelineRasterizationStateCreateInfo)
+    AR_STATE(pMultisampleState, VkPipelineMultisampleStateCreateInfo)
+    if (s->pMultisampleState && s->pMultisampleState->pSampleMask) {
+        VkPipelineMultisampleStateCreateInfo *m = (VkPipelineMultisampleStateCreateInfo *)d->pMultisampleState;
+        m->pSampleMask = ar_dup(a, m->pSampleMask, ((m->rasterizationSamples + 31) / 32) * sizeof(VkSampleMask));
+    }
+    AR_STATE(pDepthStencilState, VkPipelineDepthStencilStateCreateInfo)
+    AR_STATE(pColorBlendState, VkPipelineColorBlendStateCreateInfo)
+    if (s->pColorBlendState) {
+        VkPipelineColorBlendStateCreateInfo *c = (VkPipelineColorBlendStateCreateInfo *)d->pColorBlendState;
+        c->pAttachments = ar_dup(a, c->pAttachments, c->attachmentCount * sizeof(VkPipelineColorBlendAttachmentState));
+    }
+    AR_STATE(pDynamicState, VkPipelineDynamicStateCreateInfo)
+    if (s->pDynamicState) {
+        VkPipelineDynamicStateCreateInfo *y = (VkPipelineDynamicStateCreateInfo *)d->pDynamicState;
+        y->pDynamicStates = ar_dup(a, y->pDynamicStates, y->dynamicStateCount * sizeof(VkDynamicState));
+    }
+    return !a->fail;
+}
+#undef AR_STATE
+
+// Can this pipeline be compiled in the background? Inline SPIR-V for every stage and no transform feedback (its
+// draws produce data later work reads, so they must not be dropped), no libraries or derivatives.
+static bool async_eligible(const VkGraphicsPipelineCreateInfo *ci) {
+    if (ci->flags & (VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_DERIVATIVE_BIT |
+                     VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)) return false;
+    if (find_struct(ci->pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR) ||
+        find_struct(ci->pNext, VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT)) return false;
+    for (uint32_t i = 0; i < ci->stageCount; i++) {
+        const VkShaderModuleCreateInfo *sm = find_struct(ci->pStages[i].pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+        if (!sm || ci->pStages[i].module) return false;
+        size_t n = sm->codeSize / 4;
+        for (size_t o = 5; o < n;) {
+            uint32_t wc = sm->pCode[o] >> 16, op = sm->pCode[o] & 0xffff;
+            if (!wc || o + wc > n) return false;
+            if (op == 17 && wc >= 2 && sm->pCode[o + 1] == 53) return false; // OpCapability TransformFeedback
+            if (op == 54) break;                                         // first function: past the declarations
+            o += wc;
+        }
+    }
+    return true;
+}
+
+enum { AJ_PENDING, AJ_DONE, AJ_FAILED };
+struct AsyncJob {
+    pthread_mutex_t m;
+    pthread_cond_t cv;
+    int state;
+    VkResult result;
+    bool detached, destroy; // the caller returned the stand-in / the app destroyed it before the compile ended
+    _Atomic(VkPipeline) real;
+    struct DeviceData *d;
+    VkPipelineCache cache;
+    struct Arena arena;
+    VkGraphicsPipelineCreateInfo ci;
+    uint32_t hash[3];
+    struct AsyncJob *next_job;  // work queue
+    struct AsyncJob *next_live; // stand-in table
+};
+
+static pthread_mutex_t g_async_qm = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_async_qcv = PTHREAD_COND_INITIALIZER;
+static struct AsyncJob *g_async_qhead, *g_async_qtail;
+static bool g_async_started;
+
+// stand-in handle -> job; read on every pipeline bind
+#define ASYNC_BUCKETS 4096
+static struct AsyncJob *g_async_live[ASYNC_BUCKETS];
+static pthread_rwlock_t g_async_rw = PTHREAD_RWLOCK_INITIALIZER;
+static _Atomic uint32_t g_async_live_n; // fast path: no stand-ins, no lookup
+
+static struct AsyncJob *async_lookup(VkPipeline p) {
+    if (!atomic_load(&g_async_live_n) || !p) return NULL;
+    pthread_rwlock_rdlock(&g_async_rw);
+    struct AsyncJob *j = g_async_live[handle_bucket((uint64_t)(uintptr_t)p, ASYNC_BUCKETS)];
+    while (j && (VkPipeline)(uintptr_t)j != p) j = j->next_live;
+    pthread_rwlock_unlock(&g_async_rw);
+    return j;
+}
+
+static void async_free_job(struct AsyncJob *j) {
+    ar_free(&j->arena);
+    pthread_mutex_destroy(&j->m);
+    pthread_cond_destroy(&j->cv);
+    free(j);
+}
+
+static void *async_worker(void *arg) {
+    (void)arg;
+    pthread_setname_np(pthread_self(), "mali-async-pso");
+    for (;;) {
+        pthread_mutex_lock(&g_async_qm);
+        while (!g_async_qhead) pthread_cond_wait(&g_async_qcv, &g_async_qm);
+        struct AsyncJob *j = g_async_qhead;
+        g_async_qhead = j->next_job;
+        if (!g_async_qhead) g_async_qtail = NULL;
+        pthread_mutex_unlock(&g_async_qm);
+
+        VkPipeline p = VK_NULL_HANDLE;
+        uint64_t t0 = now_ns();
+        VkResult r = j->d->fpCreateGraphicsPipelines(j->d->device, j->cache, 1, &j->ci, NULL, &p);
+        uint64_t dt = now_ns() - t0;
+        if (g_gpu_time) pcstat_add(1, dt);
+        if (dt > 1000000000ull)
+            fprintf(stderr, "mali-compat: slow pipeline compile %.0f ms (async): %08x %08x %08x\n", dt / 1e6, j->hash[0],
+                    j->hash[1], j->hash[2]);
+        ar_free(&j->arena); // the copy is no longer needed
+        pthread_mutex_lock(&j->m);
+        if (r != VK_SUCCESS) { p = VK_NULL_HANDLE; atomic_fetch_add(&g_async_failed, 1); }
+        atomic_store(&j->real, p);
+        j->result = r;
+        j->state = r == VK_SUCCESS ? AJ_DONE : AJ_FAILED;
+        bool gone = j->detached && j->destroy;
+        pthread_cond_broadcast(&j->cv);
+        pthread_mutex_unlock(&j->m);
+        if (gone) {
+            if (p) j->d->fpDestroyPipeline(j->d->device, p, NULL);
+            async_free_job(j);
+        }
+    }
+    return NULL;
+}
+
+// Compile one pipeline through the workers. Returns true and sets *out (real pipeline or stand-in); false if the
+// create info cannot be copied (the caller compiles it itself).
+static bool async_create(struct DeviceData *d, VkPipelineCache cache, const VkGraphicsPipelineCreateInfo *ci,
+                         const uint32_t *hash, VkPipeline *out, VkResult *res) {
+    struct AsyncJob *j = calloc(1, sizeof *j);
+    if (!j) return false;
+    if (!async_copy_ci(&j->arena, ci, &j->ci)) { ar_free(&j->arena); free(j); return false; }
+    pthread_mutex_init(&j->m, NULL);
+    pthread_cond_init(&j->cv, NULL);
+    j->d = d;
+    j->cache = cache;
+    if (hash) memcpy(j->hash, hash, sizeof j->hash);
+    pthread_mutex_lock(&g_async_qm);
+    if (!g_async_started) {
+        for (uint32_t i = 0; i < g_async_threads; i++) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, async_worker, NULL) == 0) pthread_detach(t);
+        }
+        g_async_started = true;
+    }
+    if (g_async_qtail) g_async_qtail->next_job = j; else g_async_qhead = j;
+    g_async_qtail = j;
+    pthread_cond_signal(&g_async_qcv);
+    pthread_mutex_unlock(&g_async_qm);
+    atomic_fetch_add(&g_async_jobs, 1);
+
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += (long)g_async_ms * 1000000L;
+    until.tv_sec += until.tv_nsec / 1000000000L;
+    until.tv_nsec %= 1000000000L;
+    pthread_mutex_lock(&j->m);
+    while (j->state == AJ_PENDING && pthread_cond_timedwait(&j->cv, &j->m, &until) == 0) {}
+    if (j->state != AJ_PENDING) {
+        // finished in time: the real pipeline, as without the switch
+        VkPipeline p = atomic_load(&j->real);
+        VkResult r = j->result;
+        pthread_mutex_unlock(&j->m);
+        async_free_job(j);
+        *out = p;
+        *res = r;
+        return true;
+    }
+    j->detached = true;
+    pthread_rwlock_wrlock(&g_async_rw);
+    uint32_t b = handle_bucket((uint64_t)(uintptr_t)j, ASYNC_BUCKETS);
+    j->next_live = g_async_live[b];
+    g_async_live[b] = j;
+    atomic_fetch_add(&g_async_live_n, 1);
+    pthread_rwlock_unlock(&g_async_rw);
+    pthread_mutex_unlock(&j->m);
+    atomic_fetch_add(&g_async_pending, 1);
+    *out = (VkPipeline)(uintptr_t)j;
+    *res = VK_SUCCESS;
+    return true;
+}
+
+// vkDestroyPipeline for a stand-in: the real pipeline goes with it, now or when its compile ends.
+static bool async_destroy(VkPipeline p) {
+    struct AsyncJob *j = async_lookup(p);
+    if (!j) return false;
+    pthread_rwlock_wrlock(&g_async_rw);
+    struct AsyncJob **pp = &g_async_live[handle_bucket((uint64_t)(uintptr_t)p, ASYNC_BUCKETS)];
+    while (*pp && *pp != j) pp = &(*pp)->next_live;
+    if (*pp) { *pp = j->next_live; atomic_fetch_sub(&g_async_live_n, 1); }
+    pthread_rwlock_unlock(&g_async_rw);
+    pthread_mutex_lock(&j->m);
+    if (j->state == AJ_PENDING) { j->destroy = true; pthread_mutex_unlock(&j->m); return true; }
+    VkPipeline real = atomic_load(&j->real);
+    pthread_mutex_unlock(&j->m);
+    if (real) j->d->fpDestroyPipeline(j->d->device, real, NULL);
+    async_free_job(j);
+    return true;
+}
+
+static VKAPI_ATTR void VKAPI_CALL compat_DestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks *a) {
+    if (async_destroy(pipeline)) return;
+    get_device_data(device)->fpDestroyPipeline(device, pipeline, a);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
     VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
     const VkGraphicsPipelineCreateInfo *pCreateInfos, const VkAllocationCallbacks *pAllocator,
@@ -2509,8 +2868,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
         }
     dump_inflight_pipeline(createInfoCount, modified);
     uint64_t t0 = g_gpu_time ? now_ns() : 0;
-    VkResult res = d->fpCreateGraphicsPipelines(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount, modified, pAllocator, pPipelines);
-    if (g_gpu_time) {
+    VkResult res = VK_SUCCESS;
+    if (g_async_ms) {
+        // one by one through the workers (MALI_COMPAT_ASYNC_PSO); what cannot go there is compiled here
+        VkPipelineCache pc = pc_for(d, pipelineCache, createInfoCount);
+        for (uint32_t i = 0; i < createInfoCount; i++) {
+            VkResult r1 = VK_SUCCESS;
+            if (!async_eligible(&modified[i]) || !async_create(d, pc, &modified[i], gt_hash ? gt_hash[i] : NULL, &pPipelines[i], &r1))
+                r1 = d->fpCreateGraphicsPipelines(device, pc, 1, &modified[i], pAllocator, &pPipelines[i]);
+            if (r1 != VK_SUCCESS && res == VK_SUCCESS) res = r1;
+        }
+    } else {
+        res = d->fpCreateGraphicsPipelines(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount, modified, pAllocator, pPipelines);
+    }
+    if (g_gpu_time && !g_async_ms) {
         uint64_t dt = now_ns() - t0;
         pcstat_add(createInfoCount, dt);
         // compiles over a second stall the game (DXVK compiles on its CS thread): name their shaders
@@ -3384,10 +3755,17 @@ static VKAPI_ATTR void VKAPI_CALL compat_FreeMemory(
 static VKAPI_ATTR void VKAPI_CALL compat_CmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint bindPoint,
                                                          VkPipeline pipeline) {
     struct CmdBufData *c = cmd_data(commandBuffer);
-    if (!c) { get_device_data_by_cmd(commandBuffer)->fpCmdBindPipeline(commandBuffer, bindPoint, pipeline); return; }
+    VkPipeline drv = pipeline;
+    if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        // a stand-in from MALI_COMPAT_ASYNC_PSO: the real pipeline once compiled, else drop the draws until the next bind
+        struct AsyncJob *j = async_lookup(pipeline);
+        drv = j ? atomic_load(&j->real) : pipeline;
+        if (c) c->async_skip = !drv;
+    }
+    if (!c) { if (drv) get_device_data_by_cmd(commandBuffer)->fpCmdBindPipeline(commandBuffer, bindPoint, drv); return; }
     if (bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) c->compute_pipeline = pipeline;
     else if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) c->gfx_pipeline = pipeline;
-    c->dev->fpCmdBindPipeline(commandBuffer, bindPoint, pipeline);
+    if (drv) c->dev->fpCmdBindPipeline(commandBuffer, bindPoint, drv);
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
@@ -3879,6 +4257,10 @@ static void gt_report(struct GpuTime *g, double interval_s) {
         fprintf(f, " | firstInstance!=0 draws %llu, divisor!=1 pipelines %llu, vertex inputs %llu",
                 (unsigned long long)atomic_load(&g_div_draws), (unsigned long long)atomic_load(&g_div_pipes),
                 (unsigned long long)atomic_load(&g_div_vi));
+        if (g_async_ms)
+            fprintf(f, " | async pipelines %llu, stand-ins %llu, draws dropped %llu, failed %llu",
+                    (unsigned long long)atomic_load(&g_async_jobs), (unsigned long long)atomic_load(&g_async_pending),
+                    (unsigned long long)atomic_load(&g_async_skipped), (unsigned long long)atomic_load(&g_async_failed));
         if (g_noatt_w) fprintf(f, " | attachment-less passes clamped %llu", (unsigned long long)atomic_load(&g_noatt_clamped));
         if (g_xfb_vs) fprintf(f, " | stream-output pipelines without GS %llu", (unsigned long long)atomic_load(&g_xfb_vs_pipes));
         if (g_skip_hash) fprintf(f, " | skipped draws (%08x) %llu", g_skip_hash, (unsigned long long)atomic_load(&g_skipped_draws));
@@ -4037,6 +4419,7 @@ static void gt_init(struct DeviceData *d, PFN_vkGetDeviceProcAddr gdpa) {
     VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * GT_SLOTS};
     // The hooks are already handed out and pass through d->gt's function pointers, so d->gt stays even without a pool.
     d->gt = g;
+    if (!g_gpu_time) return; // only the function pointers (async compiles, pass clamp)
     if (!create || !g->fpCmdWriteTimestamp || !g->fpGetQueryPoolResults || !g->fpResetQueryPool ||
         create(d->device, &qi, NULL, &g->pool) != VK_SUCCESS) {
         g->pool = VK_NULL_HANDLE;
@@ -4103,6 +4486,7 @@ static bool gt_skip(struct CmdBufData *c) {
 
 // Returns true when the draw is to be skipped (gt_skip).
 static bool gt_draw(struct CmdBufData *c, uint32_t vcount, uint32_t icount) {
+    if (c && c->async_skip) { atomic_fetch_add(&g_async_skipped, 1); return true; }
     if (gt_skip(c)) return true;
     if (!c || c->gt_rec < 0 || !c->dev->gt) return false;
     struct GtRec *r = &c->dev->gt->rec[c->gt_rec];
@@ -4359,6 +4743,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
     g_gt_trace = getenv("MALI_COMPAT_GT_TRACE") ? (uint32_t)strtoul(getenv("MALI_COMPAT_GT_TRACE"), NULL, 16) : 0;
     if (getenv("MALI_COMPAT_GT_TRACE") && !strcmp(getenv("MALI_COMPAT_GT_TRACE"), "all")) g_gt_trace = UINT32_MAX;
+    g_async_ms = getenv("MALI_COMPAT_ASYNC_PSO") ? (uint32_t)atoi(getenv("MALI_COMPAT_ASYNC_PSO")) : 0;
+    if (getenv("MALI_COMPAT_ASYNC_THREADS") && atoi(getenv("MALI_COMPAT_ASYNC_THREADS")) > 0)
+        g_async_threads = (uint32_t)atoi(getenv("MALI_COMPAT_ASYNC_THREADS"));
     g_spv_dontunroll = getenv("MALI_COMPAT_SPV_DONTUNROLL") && strcmp(getenv("MALI_COMPAT_SPV_DONTUNROLL"), "0") != 0;
     g_xfb_vs = getenv("MALI_COMPAT_XFB_VS") && strcmp(getenv("MALI_COMPAT_XFB_VS"), "0") != 0;
     g_noatt_w = g_noatt_h = 0;
@@ -4707,7 +5094,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         }
         d->fpCreateComputePipelinesReal = (PFN_vkCreateComputePipelines)fpGetDeviceProcAddr(*pDevice, "vkCreateComputePipelines");
         #undef LOAD_DEV
-        if (g_gpu_time) gt_init(d, fpGetDeviceProcAddr);
+        if (g_gpu_time || g_async_ms || g_noatt_w) gt_init(d, fpGetDeviceProcAddr);
         pc_init(d);
         if (inst && inst->fpGetPhysicalDeviceMemoryProperties) {
             VkPhysicalDeviceMemoryProperties mp;
@@ -4819,7 +5206,8 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     #define MATCH_DEV(fn) if (!strcmp(pName, "vk" #fn)) return (PFN_vkVoidFunction)compat_##fn
     // GPU timing hooks: only while the switch is on, so the normal path calls the driver directly.
     #define MATCH_DEV_KHR(fn) if (!strcmp(pName, "vk" #fn) || !strcmp(pName, "vk" #fn "KHR")) return (PFN_vkVoidFunction)compat_##fn
-    if (g_gpu_time) {
+    if (g_async_ms) MATCH_DEV(DestroyPipeline);
+    if (g_gpu_time || g_async_ms || g_noatt_w) { // GPU timing, async compiles and the pass clamp share these hooks
         MATCH_DEV_KHR(CmdBeginRendering);
         MATCH_DEV_KHR(CmdEndRendering);
         MATCH_DEV(CmdBeginRenderPass);
