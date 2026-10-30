@@ -29,6 +29,7 @@ case ${1:-build} in
     clang $T -O2 -Wall "$B/test/bc-probe.c" -o "$STAGE/bc-probe" -lvulkan   # does the compat layer decode BC uploads
     clang $T -O2 -Wall -I"$B/test" "$B/test/pushdesc-probe.c" -o "$STAGE/pushdesc-probe" -lvulkan   # push-descriptor UBO in vkd3d's root-CBV layout
     clang $T -O2 -Wall -I"$B/test" "$B/test/xfb-probe.c" -o "$STAGE/xfb-probe" -lvulkan   # cost of stream output (GS + transform feedback)
+    clang $T -O2 -Wall "$B/test/session-probe.c" -o "$STAGE/session-probe" -lvulkan   # what gamescope / Steam need from the bridge
     clang $T -O2 -Wall -I"$B/../panvk-kbase-android/work/mesa/include" "$B/test/afrc-probe.c" -o "$STAGE/afrc-probe" -lvulkan   # AFRC rates for the BC shadow formats
     # vkprobe.exe: an x86-64 Windows program for Proton (llvm-mingw in tools-llvm-mingw; Vulkan headers from the sysroot)
     MINGW=$(ls "$B"/../tools-llvm-mingw/llvm-mingw-*/bin/x86_64-w64-mingw32-clang 2>/dev/null | head -1)

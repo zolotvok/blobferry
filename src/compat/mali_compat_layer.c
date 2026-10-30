@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
@@ -1282,13 +1283,38 @@ static bool g_no_susres;
 static _Atomic uint64_t g_susp_passes, g_resu_passes;
 static __thread bool tl_div_bound; // the last vertex input this thread set or bound has a divisor != 1 (approximate)
 
+// VK_EXT_physical_device_drm, emulated (MALI_COMPAT_DRM_NODE=<device node>, e.g. /dev/mali0). gamescope refuses a
+// physical device without a DRM primary and render node and then finds the render node through
+// drmGetDeviceFromDevId(); DroidDeck exposes the GPU node under /dev/dri with a matching /sys/dev/char tree (the
+// stand-in PanVK reported for the session until now). The vendor driver has no such extension, so the layer reports
+// the node's major:minor as both nodes, for the session processes (gamescope, Steam) on the bridge. [Claude Opus 5.5]
+// 2026-10-30
+static bool g_drm_on;
+static unsigned g_drm_major, g_drm_minor;
+static void drm_node_init(void) {
+    const char *path = getenv("MALI_COMPAT_DRM_NODE");
+    struct stat st;
+    g_drm_on = path && *path && stat(path, &st) == 0 && S_ISCHR(st.st_mode);
+    if (g_drm_on) { g_drm_major = major(st.st_rdev); g_drm_minor = minor(st.st_rdev); }
+    else if (path && *path) fprintf(stderr, "mali-compat: MALI_COMPAT_DRM_NODE=%s is not a character device\n", path);
+}
+
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2 *pProperties) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
     struct unlinked u = unlink_struct(pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT);
+    struct unlinked ud = g_drm_on ? unlink_struct(pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT)
+                                  : (struct unlinked){0};
     if (inst && inst->fpGetPhysicalDeviceProperties2)
         inst->fpGetPhysicalDeviceProperties2(physicalDevice, pProperties);
+    relink(ud);
     relink(u);
+    if (ud.node) {
+        VkPhysicalDeviceDrmPropertiesEXT *drm = (VkPhysicalDeviceDrmPropertiesEXT *)ud.node;
+        drm->hasPrimary = drm->hasRender = VK_TRUE;
+        drm->primaryMajor = drm->renderMajor = g_drm_major;
+        drm->primaryMinor = drm->renderMinor = g_drm_minor;
+    }
     if (u.node) ((VkPhysicalDeviceMapMemoryPlacedPropertiesEXT *)u.node)->minPlacedMemoryMapAlignment = page_size();
     // Texel buffer offsets: the vendor reports 64-byte alignment without single-texel alignment, which vkd3d-proton
     // refuses (HZD: "Lacking support for single texel alignment"). PanVK reports single-texel / 16 bytes on the same
@@ -1438,7 +1464,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_EnumerateDeviceExtensionProperties(
     VkResult res = inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, NULL);
     if (res != VK_SUCCESS) return res;
 
-    VkExtensionProperties *all = (VkExtensionProperties *)malloc((count + 3) * sizeof(VkExtensionProperties));
+    VkExtensionProperties *all = (VkExtensionProperties *)malloc((count + 4) * sizeof(VkExtensionProperties));
     if (!all) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
     res = inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, all);
@@ -1470,6 +1496,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_EnumerateDeviceExtensionProperties(
     if (has_div_khr && !has_div_ext) {
         strncpy(all[count].extensionName, "VK_EXT_vertex_attribute_divisor", VK_MAX_EXTENSION_NAME_SIZE);
         all[count].specVersion = 3;
+        count++;
+    }
+    bool has_drm = false;
+    for (uint32_t i = 0; i < count; i++) has_drm |= !strcmp(all[i].extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME);
+    if (g_drm_on && !has_drm) {
+        strncpy(all[count].extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME, VK_MAX_EXTENSION_NAME_SIZE);
+        all[count].specVersion = 1;
         count++;
     }
 
@@ -4743,6 +4776,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
     g_gt_trace = getenv("MALI_COMPAT_GT_TRACE") ? (uint32_t)strtoul(getenv("MALI_COMPAT_GT_TRACE"), NULL, 16) : 0;
     if (getenv("MALI_COMPAT_GT_TRACE") && !strcmp(getenv("MALI_COMPAT_GT_TRACE"), "all")) g_gt_trace = UINT32_MAX;
+    drm_node_init();
     g_async_ms = getenv("MALI_COMPAT_ASYNC_PSO") ? (uint32_t)atoi(getenv("MALI_COMPAT_ASYNC_PSO")) : 0;
     if (getenv("MALI_COMPAT_ASYNC_THREADS") && atoi(getenv("MALI_COMPAT_ASYNC_THREADS")) > 0)
         g_async_threads = (uint32_t)atoi(getenv("MALI_COMPAT_ASYNC_THREADS"));
@@ -4876,6 +4910,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         const char *e = pCreateInfo->ppEnabledExtensionNames[i];
         if (!strcmp(e, "VK_EXT_vertex_attribute_divisor")) { div_ext = true; continue; } // the vendor has only KHR
         div_khr |= !strcmp(e, "VK_KHR_vertex_attribute_divisor");
+        if (g_drm_on && !strcmp(e, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME)) continue; // the layer's (properties only)
         if (strcmp(e, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME)) ext_names[mod_ci.enabledExtensionCount++] = e;
     }
     if (div_ext && !div_khr) ext_names[mod_ci.enabledExtensionCount++] = "VK_KHR_vertex_attribute_divisor";
