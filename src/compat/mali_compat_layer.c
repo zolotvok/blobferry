@@ -1241,6 +1241,26 @@ static bool gs_hidden(void) {
     return hidden;
 }
 
+// MALI_COMPAT_FP16_HIDE_PROCS=<comm prefixes>: shaderFloat16 / shaderInt16 hidden from those processes (gamescope
+// picks its FP16 composite shaders when the device has both). Diagnostic for the session on the bridge, where
+// gamescope's composited output stayed all zero. [Claude Opus 5.5] 2026-10-30
+static bool fp16_hidden(void) {
+    static int hidden = -1;
+    if (hidden >= 0) return hidden;
+    const char *list = getenv("MALI_COMPAT_FP16_HIDE_PROCS");
+    char comm[32] = "";
+    FILE *f = fopen("/proc/self/comm", "r");
+    if (f) { if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0; fclose(f); }
+    hidden = 0;
+    for (const char *p = list ? list : ""; *p; ) {
+        size_t n = strcspn(p, ",");
+        if (n && !strncmp(comm, p, n)) { hidden = 1; break; }
+        p += n + (p[n] == ',');
+    }
+    if (hidden) fprintf(stderr, "mali-compat: FP16 hidden from '%s'\n", comm);
+    return hidden;
+}
+
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures *pFeatures) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
@@ -1252,6 +1272,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures(
     pFeatures->shaderCullDistance = VK_TRUE;
     pFeatures->fillModeNonSolid = VK_TRUE;
     if (gs_hidden()) pFeatures->geometryShader = VK_FALSE;
+    if (fp16_hidden()) pFeatures->shaderInt16 = VK_FALSE;
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
@@ -1267,6 +1288,15 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
     pFeatures->features.shaderCullDistance = VK_TRUE;
     pFeatures->features.fillModeNonSolid = VK_TRUE;
     if (gs_hidden()) pFeatures->features.geometryShader = VK_FALSE;
+    if (fp16_hidden()) {
+        pFeatures->features.shaderInt16 = VK_FALSE;
+        for (VkBaseOutStructure *h = (VkBaseOutStructure *)pFeatures->pNext; h; h = h->pNext) {
+            if (h->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+                ((VkPhysicalDeviceVulkan12Features *)h)->shaderFloat16 = VK_FALSE;
+            else if (h->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES)
+                ((VkPhysicalDeviceShaderFloat16Int8Features *)h)->shaderFloat16 = VK_FALSE;
+        }
+    }
 
     // Scan pNext for VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT
     VkBaseOutStructure *header = (VkBaseOutStructure *)pFeatures->pNext;
@@ -1496,8 +1526,15 @@ static void *dmabuf_peek_thread(void *arg) {
             const uint32_t *w = p;
             uint64_t words = x->size / 4, nz = 0;
             for (uint64_t i = 0; i < words; i += 61) nz += w[i] != 0;
-            fprintf(stderr, "mali-compat: dma-buf peek: %s mem %p %llu KiB, non-zero %llu of %llu samples, px[0] %08x px[mid] %08x px[3/4] %08x\n",
-                    x->imported ? "imported" : "exported", (void *)x->mem, (unsigned long long)(x->size >> 10), (unsigned long long)nz,
+            static char comm[32];
+            if (!comm[0]) {
+                FILE *cf = fopen("/proc/self/comm", "r");
+                if (!cf || !fgets(comm, sizeof comm, cf)) snprintf(comm, sizeof comm, "?");
+                if (cf) fclose(cf);
+                comm[strcspn(comm, "\n")] = 0;
+            }
+            fprintf(stderr, "mali-compat: dma-buf peek [%s %d]: %s mem %p %llu KiB, non-zero %llu of %llu samples, px[0] %08x px[mid] %08x px[3/4] %08x\n",
+                    comm, (int)getpid(), x->imported ? "imported" : "exported", (void *)x->mem, (unsigned long long)(x->size >> 10), (unsigned long long)nz,
                     (unsigned long long)(words / 61 + 1), w[0], w[words / 2], w[words * 3 / 4]);
             sy.flags = 2 /* END */ | 1;
             ioctl(x->fd, DMA_BUF_IOCTL_SYNC_, &sy);
@@ -3473,6 +3510,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImage(
         uint32_t bpp = format_bytes(pCreateInfo->format);
         bool has_linear = false;
         for (uint32_t i = 0; ml && i < ml->drmFormatModifierCount; i++) has_linear |= ml->pDrmFormatModifiers[i] == 0;
+        if (em && getenv("MALI_COMPAT_DMABUF_PEEK")) {
+            // diagnostic: how the external images of this process are made (Xwayland/Zink vs gamescope)
+            static _Atomic int logged;
+            const VkImageDrmFormatModifierExplicitCreateInfoEXT *ex0 =
+                find_struct(pCreateInfo->pNext, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+            if (atomic_fetch_add(&logged, 1) < 24)
+                fprintf(stderr, "mali-compat: external image: handles 0x%x fmt %d %ux%u tiling %d usage 0x%x flags 0x%x, "
+                        "modifier list %u (linear %d), explicit %s %llx pitch %llu\n", em->handleTypes, pCreateInfo->format,
+                        pCreateInfo->extent.width, pCreateInfo->extent.height, pCreateInfo->tiling, pCreateInfo->usage,
+                        pCreateInfo->flags, ml ? ml->drmFormatModifierCount : 0, has_linear, ex0 ? "yes" : "no",
+                        ex0 ? (unsigned long long)ex0->drmFormatModifier : 0ull,
+                        ex0 && ex0->pPlaneLayouts ? (unsigned long long)ex0->pPlaneLayouts[0].rowPitch : 0ull);
+        }
         if (em && (em->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) && ml && has_linear && bpp &&
             pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
             u_list = unlink_struct((void *)pCreateInfo, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
@@ -3895,12 +3945,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
     // dma-buf export (MALI_COMPAT_DMABUF_EXPORT): the memory comes from the dma-heap and is imported into the driver
     struct unlinked u_exp = {0}, u_mwsi = {0};
     VkImportMemoryFdInfoKHR imp;
-    int export_fd = -1;
+    int export_fd = -1, keep_import_fd = -1;
     VkMemoryAllocateInfo emod;
     if (g_dmabuf_export) {
         u_mwsi = unlink_struct((void *)pAllocateInfo, STYPE_WSI_MEMORY_ALLOCATE_INFO_MESA);
         const VkExportMemoryAllocateInfo *ex = find_struct(pAllocateInfo->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
-        if (ex && (ex->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) && d->fpGetMemoryFdKHR &&
+        const VkImportMemoryFdInfoKHR *imp_in = find_struct(pAllocateInfo->pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR);
+        if (ex && (ex->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) && imp_in &&
+            imp_in->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+            // An import that also asks to be exportable (Mesa Zink's allocate_bo puts both structs on a re-imported
+            // GBM buffer): keep the import, drop the export struct the driver refuses, and remember the imported fd
+            // so vkGetMemoryFdKHR hands out that same buffer. Allocating a fresh heap buffer here instead put Zink's
+            // rendering into memory nobody shared: Xwayland drew Steam into it while gamescope composited the
+            // untouched original (black session screen, 2026-10-30; found by a Fable review of Zink's source).
+            u_exp = unlink_struct((void *)pAllocateInfo, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+            keep_import_fd = dup(imp_in->fd);
+        } else if (ex && (ex->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) && d->fpGetMemoryFdKHR &&
             (export_fd = dmaheap_alloc(pAllocateInfo->allocationSize)) >= 0) {
             u_exp = unlink_struct((void *)pAllocateInfo, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
             emod = *pAllocateInfo;
@@ -3916,7 +3976,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
         }
     }
     int peek_import_fd = -1;
-    if (g_dmabuf_export && export_fd < 0 && getenv("MALI_COMPAT_DMABUF_PEEK")) {
+    if (g_dmabuf_export && export_fd < 0 && keep_import_fd < 0 && getenv("MALI_COMPAT_DMABUF_PEEK")) {
         const VkImportMemoryFdInfoKHR *im = find_struct(pAllocateInfo->pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR);
         if (im && im->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) peek_import_fd = dup(im->fd);
     }
@@ -3944,6 +4004,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
     if (res == VK_SUCCESS) {
         atomic_fetch_add(&g_allocated_bytes, pAllocateInfo->allocationSize);
         mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex);
+    }
+    if (keep_import_fd >= 0) {
+        struct ExportMem *e = res == VK_SUCCESS ? malloc(sizeof *e) : NULL;
+        if (e) {
+            *e = (struct ExportMem){*pMemory, keep_import_fd, pAllocateInfo->allocationSize, true, NULL};
+            pthread_mutex_lock(&g_export_mutex);
+            e->next = g_export_mem;
+            g_export_mem = e;
+            pthread_mutex_unlock(&g_export_mutex);
+        } else close(keep_import_fd);
     }
     if (peek_import_fd >= 0) {
         struct ExportMem *e = res == VK_SUCCESS ? malloc(sizeof *e) : NULL;
