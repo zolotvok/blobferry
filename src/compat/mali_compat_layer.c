@@ -13,6 +13,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
@@ -848,6 +850,8 @@ struct DeviceData {
     PFN_vkDestroyBuffer fpDestroyBuffer;
     PFN_vkAllocateMemory fpAllocateMemory;
     PFN_vkFreeMemory fpFreeMemory;
+    PFN_vkGetMemoryFdKHR fpGetMemoryFdKHR;
+    PFN_vkGetMemoryFdPropertiesKHR fpGetMemoryFdPropertiesKHR;
     PFN_vkBindBufferMemory fpBindBufferMemory;
     PFN_vkGetBufferMemoryRequirements fpGetBufferMemoryRequirements;
     PFN_vkGetBufferDeviceAddress fpGetBufferDeviceAddress;
@@ -1403,6 +1407,58 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_GetPhysicalDeviceImageFormatPropert
         physicalDevice, format, type, tiling, usage, flags, pImageFormatProperties);
 }
 
+// -----------------------------------------------------------------------------
+// dma-buf export, emulated (MALI_COMPAT_DMABUF_EXPORT=1). [Claude Opus 5.5] 2026-10-30
+// The vendor driver imports linear dma-bufs (explicit DRM-modifier layout) but exports none: its external memory
+// features for dma-buf are IMPORTABLE only, and AFBC/AFRC modifiers are refused (test/session-probe.c). gamescope's
+// nested Wayland backend allocates its output images as exportable dma-bufs and hands them to the parent compositor,
+// so on the bridge it asserted ("modifiers.size() > 0"). With the switch:
+// - linear dma-buf image formats report EXPORTABLE too;
+// - an exportable dma-buf image created from a modifier list gets an explicit linear layout (pitch aligned to 256);
+// - its memory comes from the system dma-heap and is imported into the driver; vkGetMemoryFdKHR hands out that fd.
+// Mesa's private WSI structures in gamescope's create infos are dropped on the way (the vendor does not know them).
+// -----------------------------------------------------------------------------
+static bool g_dmabuf_export;
+#define STYPE_WSI_IMAGE_CREATE_INFO_MESA ((VkStructureType)1000001002)
+#define STYPE_WSI_MEMORY_ALLOCATE_INFO_MESA ((VkStructureType)1000001003)
+struct ExportMem { VkDeviceMemory mem; int fd; struct ExportMem *next; };
+static struct ExportMem *g_export_mem;
+static pthread_mutex_t g_export_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+struct dma_heap_alloc_data_ { uint64_t len; uint32_t fd; uint32_t fd_flags; uint64_t heap_flags; };
+#define DMA_HEAP_IOCTL_ALLOC_ _IOWR('H', 0x0, struct dma_heap_alloc_data_)
+static int dmaheap_alloc(uint64_t size) {
+    static int heap = -2;
+    if (heap == -2) {
+        const char *path = getenv("MALI_COMPAT_DMABUF_HEAP") ? getenv("MALI_COMPAT_DMABUF_HEAP") : "/dev/dma_heap/system";
+        heap = open(path, O_RDONLY | O_CLOEXEC);
+        if (heap < 0) fprintf(stderr, "mali-compat: dma-buf export: cannot open %s: %s\n", path, strerror(errno));
+    }
+    if (heap < 0) return -1;
+    struct dma_heap_alloc_data_ a = {(size + 4095) & ~4095ull, 0, O_RDWR | O_CLOEXEC, 0};
+    if (ioctl(heap, DMA_HEAP_IOCTL_ALLOC_, &a) < 0) {
+        fprintf(stderr, "mali-compat: dma-buf export: heap allocation of %llu bytes failed: %s\n", (unsigned long long)size, strerror(errno));
+        return -1;
+    }
+    return (int)a.fd;
+}
+
+static uint32_t format_bytes(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: return 1;
+    case VK_FORMAT_R8G8_UNORM: return 2;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return 4;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+    default: return 0;
+    }
+}
+
+static bool dmabuf_handle(const void *chain) {
+    const VkPhysicalDeviceExternalImageFormatInfo *e = find_struct(chain, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+    return e && e->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL compat_GetPhysicalDeviceImageFormatProperties2(
     VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
     VkImageFormatProperties2 *pImageFormatProperties) {
@@ -1414,7 +1470,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_GetPhysicalDeviceImageFormatPropert
         mod.flags &= ~VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
         return inst->fpGetPhysicalDeviceImageFormatProperties2(physicalDevice, &mod, pImageFormatProperties);
     }
-    return inst->fpGetPhysicalDeviceImageFormatProperties2(physicalDevice, pImageFormatInfo, pImageFormatProperties);
+    VkResult r = inst->fpGetPhysicalDeviceImageFormatProperties2(physicalDevice, pImageFormatInfo, pImageFormatProperties);
+    if (r == VK_SUCCESS && g_dmabuf_export && dmabuf_handle(pImageFormatInfo->pNext)) {
+        const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mi =
+            find_struct(pImageFormatInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+        bool linear = pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR ||
+                      (pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && mi && mi->drmFormatModifier == 0);
+        VkExternalImageFormatProperties *ep = (VkExternalImageFormatProperties *)find_struct(
+            pImageFormatProperties->pNext, VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
+        if (linear && ep && format_bytes(pImageFormatInfo->format)) {
+            ep->externalMemoryProperties.externalMemoryFeatures |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                                                                   VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+            ep->externalMemoryProperties.compatibleHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            ep->externalMemoryProperties.exportFromImportedHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        }
+    }
+    return r;
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceMemoryProperties2(
@@ -3335,6 +3406,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImage(
     VkDevice device, const VkImageCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkImage *pImage) {
     struct DeviceData *d = get_device_data(device);
+    // dma-buf export (MALI_COMPAT_DMABUF_EXPORT): a modifier list becomes an explicit linear layout the driver imports
+    VkImageCreateInfo dci;
+    VkImageDrmFormatModifierExplicitCreateInfoEXT expl;
+    VkSubresourceLayout plane0;
+    struct unlinked u_list = {0}, u_wsi = {0};
+    if (g_dmabuf_export) {
+        u_wsi = unlink_struct((void *)pCreateInfo, STYPE_WSI_IMAGE_CREATE_INFO_MESA);
+        const VkExternalMemoryImageCreateInfo *em = find_struct(pCreateInfo->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+        const VkImageDrmFormatModifierListCreateInfoEXT *ml =
+            find_struct(pCreateInfo->pNext, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+        uint32_t bpp = format_bytes(pCreateInfo->format);
+        bool has_linear = false;
+        for (uint32_t i = 0; ml && i < ml->drmFormatModifierCount; i++) has_linear |= ml->pDrmFormatModifiers[i] == 0;
+        if (em && (em->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) && ml && has_linear && bpp &&
+            pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+            u_list = unlink_struct((void *)pCreateInfo, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+            plane0 = (VkSubresourceLayout){0, 0, ((VkDeviceSize)pCreateInfo->extent.width * bpp + 255) & ~255ull, 0, 0};
+            expl = (VkImageDrmFormatModifierExplicitCreateInfoEXT){
+                VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT, pCreateInfo->pNext, 0, 1, &plane0};
+            dci = *pCreateInfo;
+            dci.pNext = &expl;
+            pCreateInfo = &dci;
+        }
+    }
     struct image_fixup fx;
     fixup_begin(d, pCreateInfo, &fx);
     bool is_bc = fx.is_bc;
@@ -3377,6 +3472,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImage(
             (void *)*pImage, pCreateInfo->format, fx.mod.format, pCreateInfo->extent.width, pCreateInfo->extent.height);
     }
     fixup_end(&fx);
+    relink(u_list);
+    relink(u_wsi);
     return res;
 }
 
@@ -3741,6 +3838,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
     const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMemory) {
     struct DeviceData *d = get_device_data(device);
 
+    // dma-buf export (MALI_COMPAT_DMABUF_EXPORT): the memory comes from the dma-heap and is imported into the driver
+    struct unlinked u_exp = {0}, u_mwsi = {0};
+    VkImportMemoryFdInfoKHR imp;
+    int export_fd = -1;
+    VkMemoryAllocateInfo emod;
+    if (g_dmabuf_export) {
+        u_mwsi = unlink_struct((void *)pAllocateInfo, STYPE_WSI_MEMORY_ALLOCATE_INFO_MESA);
+        const VkExportMemoryAllocateInfo *ex = find_struct(pAllocateInfo->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+        if (ex && (ex->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) && d->fpGetMemoryFdKHR &&
+            (export_fd = dmaheap_alloc(pAllocateInfo->allocationSize)) >= 0) {
+            u_exp = unlink_struct((void *)pAllocateInfo, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+            emod = *pAllocateInfo;
+            VkMemoryFdPropertiesKHR fp = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+            if (d->fpGetMemoryFdPropertiesKHR &&
+                d->fpGetMemoryFdPropertiesKHR(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, export_fd, &fp) == VK_SUCCESS &&
+                fp.memoryTypeBits && !(fp.memoryTypeBits & (1u << emod.memoryTypeIndex)))
+                emod.memoryTypeIndex = (uint32_t)__builtin_ctz(fp.memoryTypeBits);
+            imp = (VkImportMemoryFdInfoKHR){VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, emod.pNext,
+                                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dup(export_fd)};
+            emod.pNext = &imp;
+            pAllocateInfo = &emod;
+        }
+    }
     VkMemoryAllocateInfo mod = *pAllocateInfo;
     VkMemoryAllocateFlagsInfo flags_info = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
@@ -3766,12 +3886,49 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
         atomic_fetch_add(&g_allocated_bytes, pAllocateInfo->allocationSize);
         mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex);
     }
+    if (export_fd >= 0) {
+        if (res == VK_SUCCESS) {
+            struct ExportMem *e = malloc(sizeof *e);
+            if (e) {
+                e->mem = *pMemory;
+                e->fd = export_fd;
+                pthread_mutex_lock(&g_export_mutex);
+                e->next = g_export_mem;
+                g_export_mem = e;
+                pthread_mutex_unlock(&g_export_mutex);
+            } else close(export_fd);
+        } else {
+            close(imp.fd); // a failed import leaves the fd to the caller
+            close(export_fd);
+            fprintf(stderr, "mali-compat: dma-buf export: importing the heap buffer failed: %d\n", res);
+        }
+    }
+    relink(u_exp);
+    relink(u_mwsi);
     return res;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL compat_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *info, int *pFd) {
+    if (g_dmabuf_export && info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+        int fd = -1;
+        pthread_mutex_lock(&g_export_mutex);
+        for (struct ExportMem *x = g_export_mem; x; x = x->next) if (x->mem == info->memory) { fd = dup(x->fd); break; }
+        pthread_mutex_unlock(&g_export_mutex);
+        if (fd >= 0) { *pFd = fd; return VK_SUCCESS; }
+    }
+    struct DeviceData *d = get_device_data(device);
+    return d->fpGetMemoryFdKHR ? d->fpGetMemoryFdKHR(device, info, pFd) : VK_ERROR_INVALID_EXTERNAL_HANDLE;
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_FreeMemory(
     VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks *pAllocator) {
     struct DeviceData *d = get_device_data(device);
+    if (g_dmabuf_export && memory) {
+        pthread_mutex_lock(&g_export_mutex);
+        for (struct ExportMem **pp = &g_export_mem; *pp; pp = &(*pp)->next)
+            if ((*pp)->mem == memory) { struct ExportMem *x = *pp; *pp = x->next; close(x->fd); free(x); break; }
+        pthread_mutex_unlock(&g_export_mutex);
+    }
     struct MemInfo *e = memory ? mem_remove(memory) : NULL;
     if (e && e->orig) {
         // Freeing unmaps implicitly; let the driver do it on its own address and keep Wine's range reserved.
@@ -4777,6 +4934,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_gt_trace = getenv("MALI_COMPAT_GT_TRACE") ? (uint32_t)strtoul(getenv("MALI_COMPAT_GT_TRACE"), NULL, 16) : 0;
     if (getenv("MALI_COMPAT_GT_TRACE") && !strcmp(getenv("MALI_COMPAT_GT_TRACE"), "all")) g_gt_trace = UINT32_MAX;
     drm_node_init();
+    g_dmabuf_export = getenv("MALI_COMPAT_DMABUF_EXPORT") && strcmp(getenv("MALI_COMPAT_DMABUF_EXPORT"), "0") != 0;
     g_async_ms = getenv("MALI_COMPAT_ASYNC_PSO") ? (uint32_t)atoi(getenv("MALI_COMPAT_ASYNC_PSO")) : 0;
     if (getenv("MALI_COMPAT_ASYNC_THREADS") && atoi(getenv("MALI_COMPAT_ASYNC_THREADS")) > 0)
         g_async_threads = (uint32_t)atoi(getenv("MALI_COMPAT_ASYNC_THREADS"));
@@ -5087,6 +5245,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         LOAD_DEV(DestroyBuffer);
         LOAD_DEV(AllocateMemory);
         LOAD_DEV(FreeMemory);
+        LOAD_DEV(GetMemoryFdKHR);
+        LOAD_DEV(GetMemoryFdPropertiesKHR);
         LOAD_DEV(BindBufferMemory);
         LOAD_DEV(GetBufferMemoryRequirements);
         LOAD_DEV(GetBufferDeviceAddress);
@@ -5293,6 +5453,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     MATCH_DEV(CreateBufferView);
     MATCH_DEV(AllocateMemory);
     MATCH_DEV(FreeMemory);
+    if (g_dmabuf_export) { MATCH_DEV(GetMemoryFdKHR); }
     MATCH_DEV(UnmapMemory);
     MATCH_DEV(MapMemory2KHR);
     MATCH_DEV(UnmapMemory2KHR);

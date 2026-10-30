@@ -94,6 +94,29 @@ int main(void) {
                    mods[m].drmFormatModifierTilingFeatures);
         printf("\n");
     }
+    // gamescope's flippable images (output and flat textures): exportable as dma-buf with a modifier the parent
+    // compositor takes (getModifierProps in rendervulkan.cpp). Which modifiers does the driver let it export?
+    struct { const char *name; VkImageUsageFlags usage; } uses[] = {
+        {"flat (sampled|dst)", VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT},
+        {"output (storage|src|sampled)", VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT},
+        {"import (sampled)", VK_IMAGE_USAGE_SAMPLED_BIT}};
+    uint64_t try_mods[] = {0, 0x0800000000000041ull, 0x0800000000000061ull, 0x0820000000000001ull};
+    for (unsigned u = 0; u < sizeof uses / sizeof *uses; u++)
+        for (unsigned m = 0; m < sizeof try_mods / sizeof *try_mods; m++) {
+            VkPhysicalDeviceImageDrmFormatModifierInfoEXT mi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+                                                                NULL, try_mods[m], VK_SHARING_MODE_EXCLUSIVE};
+            VkPhysicalDeviceExternalImageFormatInfo ei = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, &mi,
+                                                          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+            VkPhysicalDeviceImageFormatInfo2 fi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &ei,
+                                                   VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_TYPE_2D,
+                                                   VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, uses[u].usage, 0};
+            VkExternalImageFormatProperties ep = {VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+            VkImageFormatProperties2 ip = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &ep};
+            VkResult rr = vkGetPhysicalDeviceImageFormatProperties2(pd, &fi, &ip);
+            printf("B8G8R8A8 %-30s modifier %016llx: %d, external features 0x%x, export-from 0x%x\n", uses[u].name,
+                   (unsigned long long)try_mods[m], rr, ep.externalMemoryProperties.externalMemoryFeatures,
+                   ep.externalMemoryProperties.exportFromImportedHandleTypes);
+        }
     vkDestroyInstance(inst, NULL);
     return 0;
 }
