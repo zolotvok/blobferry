@@ -1220,6 +1220,27 @@ static VkResult init_bc_compute(struct DeviceData *d) {
 // -----------------------------------------------------------------------------
 // Intercepted Vulkan Entry Points
 // -----------------------------------------------------------------------------
+// MALI_COMPAT_GS_HIDE_PROCS=<comm prefixes, comma-separated>: those processes are told the device has no geometry
+// shaders. Xwayland's glamor draws GL_QUADS in a compatibility context and Mesa Zink turns them into geometry shaders;
+// MaliBridge found that pipelines with a geometry stage crash some Mali drivers, so Xwayland segfaults (their
+// "gs_hide"). Without the feature Zink takes its other path. For the session on the bridge. [Claude Opus 5.5] 2026-10-30
+static bool gs_hidden(void) {
+    static int hidden = -1;
+    if (hidden >= 0) return hidden;
+    const char *list = getenv("MALI_COMPAT_GS_HIDE_PROCS");
+    char comm[32] = "";
+    FILE *f = fopen("/proc/self/comm", "r");
+    if (f) { if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0; fclose(f); }
+    hidden = 0;
+    for (const char *p = list ? list : ""; *p; ) {
+        size_t n = strcspn(p, ",");
+        if (n && !strncmp(comm, p, n)) { hidden = 1; break; }
+        p += n + (p[n] == ',');
+    }
+    if (hidden) fprintf(stderr, "mali-compat: geometry shaders hidden from '%s'\n", comm);
+    return hidden;
+}
+
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures *pFeatures) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
@@ -1230,6 +1251,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures(
     pFeatures->shaderClipDistance = VK_TRUE;
     pFeatures->shaderCullDistance = VK_TRUE;
     pFeatures->fillModeNonSolid = VK_TRUE;
+    if (gs_hidden()) pFeatures->geometryShader = VK_FALSE;
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
@@ -1244,6 +1266,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
     pFeatures->features.shaderClipDistance = VK_TRUE;
     pFeatures->features.shaderCullDistance = VK_TRUE;
     pFeatures->features.fillModeNonSolid = VK_TRUE;
+    if (gs_hidden()) pFeatures->features.geometryShader = VK_FALSE;
 
     // Scan pNext for VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT
     VkBaseOutStructure *header = (VkBaseOutStructure *)pFeatures->pNext;
@@ -1421,7 +1444,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_GetPhysicalDeviceImageFormatPropert
 static bool g_dmabuf_export;
 #define STYPE_WSI_IMAGE_CREATE_INFO_MESA ((VkStructureType)1000001002)
 #define STYPE_WSI_MEMORY_ALLOCATE_INFO_MESA ((VkStructureType)1000001003)
-struct ExportMem { VkDeviceMemory mem; int fd; struct ExportMem *next; };
+struct ExportMem { VkDeviceMemory mem; int fd; uint64_t size; bool imported; struct ExportMem *next; };
 static struct ExportMem *g_export_mem;
 static pthread_mutex_t g_export_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1452,6 +1475,37 @@ static uint32_t format_bytes(VkFormat f) {
     case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
     default: return 0;
     }
+}
+
+// MALI_COMPAT_DMABUF_PEEK=1 (diagnostic): every 5 s, one line per exported buffer with how much of it is non-zero
+// and a few pixels, read through a CPU mapping of the dma-buf (with DMA_BUF_IOCTL_SYNC). Tells whether gamescope's
+// output images hold a picture before DroidDeck's compositor gets them.
+struct dma_buf_sync_ { uint64_t flags; };
+#define DMA_BUF_IOCTL_SYNC_ _IOW('b', 0, struct dma_buf_sync_)
+static void *dmabuf_peek_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        sleep(5);
+        pthread_mutex_lock(&g_export_mutex);
+        int n = 0;
+        for (struct ExportMem *x = g_export_mem; x && n < 12; x = x->next, n++) {
+            void *p = mmap(NULL, x->size, PROT_READ, MAP_SHARED, x->fd, 0);
+            if (p == MAP_FAILED) { fprintf(stderr, "mali-compat: dma-buf peek: mmap failed: %s\n", strerror(errno)); continue; }
+            struct dma_buf_sync_ sy = {1 /* START */ | 1u << 0 /* READ */};
+            ioctl(x->fd, DMA_BUF_IOCTL_SYNC_, &sy);
+            const uint32_t *w = p;
+            uint64_t words = x->size / 4, nz = 0;
+            for (uint64_t i = 0; i < words; i += 61) nz += w[i] != 0;
+            fprintf(stderr, "mali-compat: dma-buf peek: %s mem %p %llu KiB, non-zero %llu of %llu samples, px[0] %08x px[mid] %08x px[3/4] %08x\n",
+                    x->imported ? "imported" : "exported", (void *)x->mem, (unsigned long long)(x->size >> 10), (unsigned long long)nz,
+                    (unsigned long long)(words / 61 + 1), w[0], w[words / 2], w[words * 3 / 4]);
+            sy.flags = 2 /* END */ | 1;
+            ioctl(x->fd, DMA_BUF_IOCTL_SYNC_, &sy);
+            munmap(p, x->size);
+        }
+        pthread_mutex_unlock(&g_export_mutex);
+    }
+    return NULL;
 }
 
 static bool dmabuf_handle(const void *chain) {
@@ -3861,6 +3915,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
             pAllocateInfo = &emod;
         }
     }
+    int peek_import_fd = -1;
+    if (g_dmabuf_export && export_fd < 0 && getenv("MALI_COMPAT_DMABUF_PEEK")) {
+        const VkImportMemoryFdInfoKHR *im = find_struct(pAllocateInfo->pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR);
+        if (im && im->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) peek_import_fd = dup(im->fd);
+    }
     VkMemoryAllocateInfo mod = *pAllocateInfo;
     VkMemoryAllocateFlagsInfo flags_info = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
@@ -3886,12 +3945,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
         atomic_fetch_add(&g_allocated_bytes, pAllocateInfo->allocationSize);
         mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex);
     }
+    if (peek_import_fd >= 0) {
+        struct ExportMem *e = res == VK_SUCCESS ? malloc(sizeof *e) : NULL;
+        if (e) {
+            *e = (struct ExportMem){*pMemory, peek_import_fd, pAllocateInfo->allocationSize, true, NULL};
+            pthread_mutex_lock(&g_export_mutex);
+            e->next = g_export_mem;
+            g_export_mem = e;
+            pthread_mutex_unlock(&g_export_mutex);
+        } else close(peek_import_fd);
+    }
     if (export_fd >= 0) {
         if (res == VK_SUCCESS) {
             struct ExportMem *e = malloc(sizeof *e);
             if (e) {
                 e->mem = *pMemory;
                 e->fd = export_fd;
+                e->size = pAllocateInfo->allocationSize;
+                e->imported = false;
+                static bool peek_started;
+                if (!peek_started && getenv("MALI_COMPAT_DMABUF_PEEK") && strcmp(getenv("MALI_COMPAT_DMABUF_PEEK"), "0")) {
+                    pthread_t t;
+                    peek_started = pthread_create(&t, NULL, dmabuf_peek_thread, NULL) == 0;
+                    if (peek_started) pthread_detach(t);
+                }
                 pthread_mutex_lock(&g_export_mutex);
                 e->next = g_export_mem;
                 g_export_mem = e;
