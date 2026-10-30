@@ -97,9 +97,200 @@ static void dump_spirv(const uint32_t *orig, size_t orig_bytes, const uint32_t *
 }
 
 static uint32_t *compat_patch_spirv_impl(const uint32_t *inWords, size_t inBytes, size_t *pOutBytes);
+static uint32_t *spv_fix_u64_to_float(const uint32_t *in, size_t bytes);
+static __thread size_t g_fix_out_bytes; // size of spv_fix_u64_to_float's result
+static uint32_t *spv_fix_broadcast_first(const uint32_t *in, size_t bytes);
+static bool g_spv_fix; // MALI_COMPAT_SPV_FIX=1: the two vendor-compiler workarounds below (Control); off by default
 static uint32_t *compat_patch_spirv(const uint32_t *inWords, size_t inBytes, size_t *pOutBytes) {
     uint32_t *out = compat_patch_spirv_impl(inWords, inBytes, pOutBytes);
+    uint32_t *fixed = g_spv_fix ? spv_fix_u64_to_float(out ? out : inWords, out ? *pOutBytes : inBytes) : NULL;
+    if (fixed) {
+        *pOutBytes = g_fix_out_bytes;
+        free(out);
+        out = fixed;
+    }
+    fixed = g_spv_fix ? spv_fix_broadcast_first(out ? out : inWords, out ? *pOutBytes : inBytes) : NULL;
+    if (fixed) {
+        *pOutBytes = g_fix_out_bytes;
+        free(out);
+        out = fixed;
+    }
     if (out) dump_spirv(inWords, inBytes, out, *pOutBytes);
+    return out;
+}
+
+// dxil-spirv converts a 32-bit unsigned to float through 64 bits (OpUConvert to u64, then OpConvertUToF). The vendor
+// compiler aborts the whole process on that ("LLVM ERROR: Cannot select: i64 = <<Unknown Target Node #405>> ...
+// AssertZext ... i26", Control, 2026-10-30). A zero extension does not change the value, so OpConvertUToF of the
+// narrow operand gives the same float; the OpUConvert, now unused, is dropped (the dead zero extension aborts the
+// compiler too). Returns a patched copy (size in g_fix_out_bytes) or NULL. [Claude Opus 5.5]
+// vkd3d marks descriptor offsets it loads from push constants as uniform with OpGroupNonUniformBroadcastFirst. The
+// vendor compiler aborted on such a compute shader (Control, 2026-10-30, the same "Cannot select ... Constant 32"
+// as above; it lowers the ballot through 64 bits). When the value is provably the same on every lane (built only from
+// push-constant loads, constants and integer arithmetic on them), BroadcastFirst(x) == x, so it becomes OpCopyObject.
+// Game code's own WaveReadLaneFirst on varying values is left alone. Returns a patched copy (size in
+// g_fix_out_bytes) or NULL. [Claude Opus 5.5]
+#define SpvOpBroadcastFirst_ 338
+static uint32_t *spv_fix_broadcast_first(const uint32_t *in, size_t bytes) {
+    if (!in || bytes < 20 || bytes % 4 || in[0] != 0x07230203) return NULL;
+    size_t n = bytes / 4;
+    uint32_t bound = in[3];
+    if (!bound || bound > (1u << 22)) return NULL;
+    uint32_t *def = calloc(bound, 4);      // result id -> word offset of its instruction
+    uint8_t *pc_ptr = calloc(bound, 1);    // pointer ids into PushConstant (variables, access chains)
+    if (!def || !pc_ptr) { free(def); free(pc_ptr); return NULL; }
+    bool any = false;
+    for (size_t o = 5; o < n;) {
+        uint16_t op = in[o] & 0xffff, len = in[o] >> 16;
+        if (!len || o + len > n) break;
+        // result id position: types/constants/variables/most ops have (type, result) at 1, 2; OpType* at 1
+        if (op >= 19 && op <= 39 && len >= 2 && in[o + 1] < bound) def[in[o + 1]] = (uint32_t)o;
+        else if (len >= 3 && in[o + 2] < bound && (op == 43 || op == 44 || op == 59 || op == 61 || op == 65 || op == 66 ||
+                 op == 83 || (op >= 124 && op <= 132) || (op >= 128 && op <= 200) || op == SpvOpBroadcastFirst_))
+            def[in[o + 2]] = (uint32_t)o;
+        if (op == 59 && len >= 4 && in[o + 3] == 9 && in[o + 2] < bound) pc_ptr[in[o + 2]] = 1; // OpVariable PushConstant
+        if ((op == 65 || op == 66) && len >= 4 && in[o + 3] < bound && pc_ptr[in[o + 3]] && in[o + 2] < bound)
+            pc_ptr[in[o + 2]] = 1;
+        if (op == SpvOpBroadcastFirst_) any = true;
+        o += len;
+    }
+    uint32_t *out = NULL, fixes = 0;
+    if (any && (out = malloc(bytes))) {
+        memcpy(out, in, bytes);
+        size_t w = 5;
+        for (size_t o = 5; o < n;) {
+            uint16_t op = in[o] & 0xffff, len = in[o] >> 16;
+            if (!len || o + len > n) { memcpy(out + w, in + o, (n - o) * 4); w += n - o; break; }
+            bool uniform = false;
+            if (op == SpvOpBroadcastFirst_ && len == 5) {
+                // walk the operand: a small stack of ids that must all be uniform
+                uint32_t stack[16], sp = 0, seen = 0;
+                stack[sp++] = in[o + 4];
+                uniform = true;
+                while (sp && uniform && seen++ < 32) {
+                    uint32_t id = stack[--sp];
+                    if (id >= bound || !def[id]) { uniform = false; break; }
+                    const uint32_t *d = in + def[id];
+                    uint16_t dop = d[0] & 0xffff;
+                    if (dop == 43 || dop == 44) continue;                                  // constants
+                    if (dop == 61 && d[3] < bound && pc_ptr[d[3]]) continue;               // load from push constants
+                    if ((dop == 128 || dop == 130 || dop == 132 || dop == 194 || dop == 196 || dop == 199) && sp + 2 <= 16) {
+                        stack[sp++] = d[3]; stack[sp++] = d[4]; continue;                  // IAdd ISub IMul shifts BitwiseAnd
+                    }
+                    uniform = false;
+                }
+            }
+            if (uniform) {
+                out[w++] = (4u << 16) | 83u; // OpCopyObject type result value
+                out[w++] = in[o + 1];
+                out[w++] = in[o + 2];
+                out[w++] = in[o + 4];
+                fixes++;
+            } else {
+                memcpy(out + w, in + o, len * 4);
+                w += len;
+            }
+            o += len;
+        }
+        g_fix_out_bytes = w * 4;
+        if (!fixes) { free(out); out = NULL; }
+    }
+    free(def);
+    free(pc_ptr);
+    if (fixes) {
+        static _Atomic uint32_t logged;
+        if (atomic_fetch_add(&logged, 1) < 4)
+            fprintf(stderr, "mali-compat: %u uniform BroadcastFirst replaced in a shader (vendor compiler abort)\n", fixes);
+    }
+    return out;
+}
+
+#define SpvOpTypeInt_ 21
+#define SpvOpTypeVector_ 23
+#define SpvOpConvertUToF_ 112
+#define SpvOpUConvert_ 113
+static uint32_t *spv_fix_u64_to_float(const uint32_t *in, size_t bytes) {
+    if (!in || bytes < 20 || bytes % 4 || in[0] != 0x07230203) return NULL;
+    size_t n = bytes / 4;
+    uint32_t bound = in[3];
+    if (!bound || bound > (1u << 22)) return NULL;
+    uint8_t *wide = calloc(bound, 1);   // type id -> 1 if a 64-bit int (or vector of them)
+    uint32_t *src = calloc(bound, 4);   // OpUConvert result (64-bit) -> its operand
+    if (!wide || !src) { free(wide); free(src); return NULL; }
+    bool any = false;
+    for (size_t o = 5; o < n;) {
+        uint16_t op = in[o] & 0xffff, len = in[o] >> 16;
+        if (!len || o + len > n) break;
+        if (op == SpvOpTypeInt_ && len >= 4 && in[o + 1] < bound && in[o + 2] == 64) wide[in[o + 1]] = 1;
+        else if (op == SpvOpTypeVector_ && len >= 4 && in[o + 1] < bound && in[o + 2] < bound && wide[in[o + 2]]) wide[in[o + 1]] = 1;
+        else if (op == SpvOpUConvert_ && len == 4 && in[o + 1] < bound && in[o + 2] < bound && wide[in[o + 1]]) {
+            src[in[o + 2]] = in[o + 3];
+            any = true;
+        }
+        o += len;
+    }
+    uint32_t *out = NULL;
+    uint32_t fixes = 0;
+    if (any && (out = malloc(bytes))) {
+        memcpy(out, in, bytes);
+        for (size_t o = 5; o < n;) {
+            uint16_t op = out[o] & 0xffff, len = out[o] >> 16;
+            if (!len || o + len > n) break;
+            if (op == SpvOpConvertUToF_ && len == 4 && out[o + 3] < bound && src[out[o + 3]]) {
+                out[o + 3] = src[out[o + 3]];
+                fixes++;
+            }
+            o += len;
+        }
+        if (!fixes) { free(out); out = NULL; }
+        else g_fix_out_bytes = bytes;
+    }
+    if (out) {
+        // Drop the OpUConvert instructions nothing uses any more: the vendor compiler aborts on the dead zero
+        // extension as well. Any word equal to the id counts as a use, so a literal that happens to match only
+        // keeps the instruction (safe).
+        uint32_t *uses = calloc(bound, 4);
+        uint32_t *packed = uses ? malloc(bytes) : NULL;
+        if (packed) {
+            for (size_t o = 5; o < n;) {
+                uint16_t op = out[o] & 0xffff, len = out[o] >> 16;
+                if (!len || o + len > n) break;
+                // literals and debug/annotation targets are not uses: OpSource(3), OpSourceExtension(4),
+                // OpName(5), OpMemberName(6), OpString(7), OpLine(8), OpConstant(43), OpSpecConstant(50),
+                // OpDecorate(71), OpMemberDecorate(72), OpModuleProcessed(330)
+                bool meta = op == 3 || op == 4 || op == 5 || op == 6 || op == 7 || op == 8 || op == 43 || op == 50 ||
+                            op == 71 || op == 72 || op == 330;
+                for (uint16_t k = 1; k < len && !meta; k++) {
+                    bool def = op == SpvOpUConvert_ && k == 2;
+                    if (!def && out[o + k] < bound) uses[out[o + k]]++;
+                }
+                o += len;
+            }
+            size_t w = 0;
+            memcpy(packed, out, 5 * 4);
+            w = 5;
+            for (size_t o = 5; o < n;) {
+                uint16_t op = out[o] & 0xffff, len = out[o] >> 16;
+                if (!len || o + len > n) { memcpy(packed + w, out + o, (n - o) * 4); w += n - o; break; }
+                bool drop = op == SpvOpUConvert_ && len == 4 && out[o + 2] < bound && src[out[o + 2]] && !uses[out[o + 2]];
+                // names and decorations of a dropped OpUConvert go with it
+                if ((op == 5 || op == 71) && len >= 2 && out[o + 1] < bound && src[out[o + 1]] && !uses[out[o + 1]]) drop = true;
+                if (!drop) { memcpy(packed + w, out + o, len * 4); w += len; }
+                o += len;
+            }
+            free(out);
+            out = packed;
+            g_fix_out_bytes = w * 4;
+        }
+        free(uses);
+    }
+    free(wide);
+    free(src);
+    if (fixes) {
+        static _Atomic uint32_t logged;
+        if (atomic_fetch_add(&logged, 1) < 4)
+            fprintf(stderr, "mali-compat: %u u64-to-float conversion(s) narrowed in a shader (vendor compiler abort)\n", fixes);
+    }
     return out;
 }
 
@@ -1461,6 +1652,29 @@ static void fragdepth_module_put(VkShaderModule m, const uint32_t *code, size_t 
     pthread_mutex_unlock(&g_hash_mutex);
 }
 
+// with /root/mali-spv-inflight: every module's SPIR-V as the driver gets it, for dump_inflight_* (debug only)
+static struct CodeNode *g_inflight_modules[HASH_BUCKETS];
+static void inflight_module_put(VkShaderModule m, const uint32_t *code, size_t bytes) {
+    struct CodeNode *e = malloc(sizeof *e);
+    if (!e || !(e->code = malloc(bytes))) { free(e); return; }
+    memcpy(e->code, code, bytes);
+    e->bytes = bytes;
+    e->module = (uint64_t)m;
+    uint32_t b = handle_bucket(e->module, HASH_BUCKETS);
+    pthread_mutex_lock(&g_hash_mutex);
+    e->next = g_inflight_modules[b];
+    g_inflight_modules[b] = e;
+    pthread_mutex_unlock(&g_hash_mutex);
+}
+static const struct CodeNode *inflight_module_get(VkShaderModule m) {
+    const struct CodeNode *found = NULL;
+    pthread_mutex_lock(&g_hash_mutex);
+    for (struct CodeNode *e = g_inflight_modules[handle_bucket((uint64_t)m, HASH_BUCKETS)]; e; e = e->next)
+        if (e->module == (uint64_t)m) { found = e; break; }
+    pthread_mutex_unlock(&g_hash_mutex);
+    return found;
+}
+
 static const struct CodeNode *fragdepth_module_get(VkShaderModule m) {
     const struct CodeNode *found = NULL;
     pthread_mutex_lock(&g_hash_mutex);
@@ -1491,9 +1705,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
         mod_ci.pCode = patched;
         mod_ci.codeSize = patched_bytes;
         r = d->fpCreateShaderModule(device, &mod_ci, pAllocator, pShaderModule);
+        if (r == VK_SUCCESS && g_dump_inflight && pShaderModule) inflight_module_put(*pShaderModule, patched, patched_bytes);
         free(patched);
     } else {
         r = d->fpCreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
+        if (r == VK_SUCCESS && g_dump_inflight && pShaderModule) inflight_module_put(*pShaderModule, pCreateInfo->pCode, pCreateInfo->codeSize);
     }
     if (r == VK_SUCCESS && g_gpu_time && pShaderModule) hash_put(g_module_hash, (uint64_t)*pShaderModule, &hash, NULL, 1);
     if (r == VK_SUCCESS && g_fragdepth_fix && pShaderModule && spv_writes_fragdepth(pCreateInfo->pCode, pCreateInfo->codeSize))
@@ -1505,6 +1721,52 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
 // stage pNext types, inline SPIR-V) to /root/mali-spv-inflight/<tid>-*, overwriting the previous one. A thread that
 // dies inside the driver leaves the pipeline that killed it. [Claude Opus 5.5]
 #include <sys/syscall.h>
+static void dump_inflight_stage(FILE *f, long tid, uint32_t i, uint32_t st, const VkPipelineShaderStageCreateInfo *sg) {
+    fprintf(f, "  stage 0x%x module %p name %s pNext:", sg->stage, (void *)sg->module, sg->pName ? sg->pName : "?");
+    const uint32_t *code = NULL;
+    size_t bytes = 0;
+    for (const VkBaseInStructure *c = sg->pNext; c; c = c->pNext) {
+        fprintf(f, " %d", c->sType);
+        if (c->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
+            code = ((const VkShaderModuleCreateInfo *)c)->pCode, bytes = ((const VkShaderModuleCreateInfo *)c)->codeSize;
+    }
+    if (!code && sg->module) {
+        const struct CodeNode *n = inflight_module_get(sg->module);
+        if (n) code = n->code, bytes = n->bytes;
+    }
+    if (code) {
+        char sp[112];
+        snprintf(sp, sizeof sp, "/root/mali-spv-inflight/%ld-p%u-s%u.spv", tid, i, st);
+        FILE *o = fopen(sp, "wb");
+        if (o) { fwrite(code, 1, bytes, o); fclose(o); }
+        fprintf(f, " spv %zu bytes", bytes);
+    }
+    if (sg->pSpecializationInfo) fprintf(f, " spec %u entries", sg->pSpecializationInfo->mapEntryCount);
+    fprintf(f, "\n");
+}
+
+// the pipeline got through the driver: remove its record, so after a crash only the pipelines in flight are left
+static void dump_inflight_done(void) {
+    if (!g_dump_inflight) return;
+    char path[96];
+    snprintf(path, sizeof path, "/root/mali-spv-inflight/%ld-info.txt", (long)syscall(SYS_gettid));
+    unlink(path);
+}
+
+static void dump_inflight_compute(uint32_t count, const VkComputePipelineCreateInfo *infos) {
+    if (!g_dump_inflight) return;
+    long tid = syscall(SYS_gettid);
+    char path[96];
+    snprintf(path, sizeof path, "/root/mali-spv-inflight/%ld-info.txt", tid);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    for (uint32_t i = 0; i < count; i++) {
+        fprintf(f, "compute pipeline %u: flags 0x%x layout %p\n", i, infos[i].flags, (void *)infos[i].layout);
+        dump_inflight_stage(f, tid, i, 0, &infos[i].stage);
+    }
+    fclose(f);
+}
+
 static void dump_inflight_pipeline(uint32_t count, const VkGraphicsPipelineCreateInfo *infos) {
     if (!g_dump_inflight) return;
     long tid = syscall(SYS_gettid);
@@ -1517,22 +1779,7 @@ static void dump_inflight_pipeline(uint32_t count, const VkGraphicsPipelineCreat
                 infos[i].stageCount, (void *)infos[i].layout, (void *)infos[i].renderPass);
         for (const VkBaseInStructure *c = infos[i].pNext; c; c = c->pNext) fprintf(f, " %d", c->sType);
         fprintf(f, "\n");
-        for (uint32_t st = 0; st < infos[i].stageCount; st++) {
-            const VkPipelineShaderStageCreateInfo *sg = &infos[i].pStages[st];
-            fprintf(f, "  stage 0x%x module %p name %s pNext:", sg->stage, (void *)sg->module, sg->pName ? sg->pName : "?");
-            for (const VkBaseInStructure *c = sg->pNext; c; c = c->pNext) {
-                fprintf(f, " %d", c->sType);
-                if (c->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
-                    const VkShaderModuleCreateInfo *sm = (const VkShaderModuleCreateInfo *)c;
-                    char sp[112];
-                    snprintf(sp, sizeof sp, "/root/mali-spv-inflight/%ld-p%u-s%u.spv", tid, i, st);
-                    FILE *o = fopen(sp, "wb");
-                    if (o) { fwrite(sm->pCode, 1, sm->codeSize, o); fclose(o); }
-                }
-            }
-            if (sg->pSpecializationInfo) fprintf(f, " spec %u entries", sg->pSpecializationInfo->mapEntryCount);
-            fprintf(f, "\n");
-        }
+        for (uint32_t st = 0; st < infos[i].stageCount; st++) dump_inflight_stage(f, tid, i, st, &infos[i].pStages[st]);
     }
     fclose(f);
 }
@@ -1702,9 +1949,10 @@ static void pc_destroy(struct DeviceData *d) {
 
 // Only the game's background compile threads use the shared cache: with one cache the driver serialises compiles on
 // it, and a pipeline the render thread needs then waited behind thousands of background compiles (HZD's menu froze
-// at 0 fps, 2026-10-29 test 6). MALI_COMPAT_PIPELINE_CACHE_THREADS=<comm prefix> limits it to some threads (default "*",
-// every thread: with one cache per thread (=2) nothing is shared, so the filter is no longer needed).
-static const char *g_pc_threads = "*";
+// at 0 fps, 2026-10-29 test 6). MALI_COMPAT_PIPELINE_CACHE_THREADS=<comm prefix> (default "AsyncPso", HZD's compile
+// queue; "*" = every thread). "*" broke HZD's start (2026-10-30): with a cache on the main thread vkd3d's first compute
+// pipelines crashed (C0000005 in vkCreateComputePipelines, or FEX "Unhandled non-JIT atomic" after a 2 min hang).
+static const char *g_pc_threads = "AsyncPso";
 static __thread int tl_pc_use; // 0 unknown, 1 shared cache, 2 the app's
 static bool pc_thread_ok(void) {
     if (!tl_pc_use) {
@@ -1867,6 +2115,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
         }
     dump_inflight_pipeline(createInfoCount, modified);
     VkResult res = d->fpCreateGraphicsPipelines(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount, modified, pAllocator, pPipelines);
+    dump_inflight_done();
     for (uint32_t k = 0; k < zero_div_count; k++) zero_div[k]->divisor = 0;
     if (res != VK_SUCCESS) {
         fprintf(stderr, "mali-compat: vkCreateGraphicsPipelines FAILED: %d\n", res);
@@ -1891,7 +2140,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
     VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
     const VkComputePipelineCreateInfo *pCreateInfos, const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines) {
     struct DeviceData *d = get_device_data(device);
+    dump_inflight_compute(createInfoCount, pCreateInfos);
     VkResult res = d->fpCreateComputePipelinesReal(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount, pCreateInfos, pAllocator, pPipelines);
+    dump_inflight_done();
     for (uint32_t i = 0; i < createInfoCount; i++) {
         uint32_t hash[1], stage[1];
         uint32_t n = stage_hashes(&pCreateInfos[i].stage, 1, hash, stage);
@@ -3634,6 +3885,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_pcache_mem_only = g_pcache_on && !strcmp(getenv("MALI_COMPAT_PIPELINE_CACHE"), "2");
     if (getenv("MALI_COMPAT_PIPELINE_CACHE_THREADS")) g_pc_threads = getenv("MALI_COMPAT_PIPELINE_CACHE_THREADS");
     g_force_coherent = getenv("MALI_COMPAT_FORCE_COHERENT") && strcmp(getenv("MALI_COMPAT_FORCE_COHERENT"), "0") != 0;
+    g_spv_fix = getenv("MALI_COMPAT_SPV_FIX") && strcmp(getenv("MALI_COMPAT_SPV_FIX"), "0") != 0;
     g_fake_occlusion = getenv("MALI_COMPAT_FAKE_OCCLUSION") && strcmp(getenv("MALI_COMPAT_FAKE_OCCLUSION"), "0") != 0;
     g_vendor_id = getenv("MALI_COMPAT_VENDOR_ID") ? (uint32_t)strtoul(getenv("MALI_COMPAT_VENDOR_ID"), NULL, 16) : 0;
     // on by default: the write it removes is discarded by the spec anyway (MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off)
@@ -4125,7 +4377,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         struct DeviceData *dd = get_device_data(device);
         if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
     }
-    if (g_gpu_time || g_dump_hash_count || g_pcache_on) MATCH_DEV(CreateComputePipelines);
+    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
         MATCH_DEV(CreateQueryPool);
         MATCH_DEV(DestroyQueryPool);
