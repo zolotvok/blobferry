@@ -101,6 +101,31 @@ static uint32_t *spv_fix_u64_to_float(const uint32_t *in, size_t bytes);
 static __thread size_t g_fix_out_bytes; // size of spv_fix_u64_to_float's result
 static uint32_t *spv_fix_broadcast_first(const uint32_t *in, size_t bytes);
 static bool g_spv_fix; // MALI_COMPAT_SPV_FIX=1: the two vendor-compiler workarounds below (Control); off by default
+
+// MALI_COMPAT_SPV_DONTUNROLL=1: every loop gets the DontUnroll loop control (Unroll cleared). The Witcher 3's DX11
+// skinning vertex shaders have a 192-iteration loop, and the vendor compiler took 4.4-6.5 s on each pipeline with
+// them, stalling DXVK's CS thread (0 FPS, 2026-10-30); suspect: full unrolling. Returns a patched copy or NULL.
+// [Claude Opus 5.5] 2026-10-30
+static bool g_spv_dontunroll;
+static uint32_t *spv_dont_unroll(const uint32_t *in, size_t bytes) {
+    if (!in || bytes < 20 || bytes % 4 || in[0] != 0x07230203) return NULL;
+    size_t n = bytes / 4;
+    uint32_t *out = NULL;
+    for (size_t o = 5; o < n;) {
+        uint32_t wc = in[o] >> 16, op = in[o] & 0xffff;
+        if (!wc || o + wc > n) { free(out); return NULL; }
+        if (op == 246 && wc >= 4 && (in[o + 3] & 3) != 2) { // OpLoopMerge %merge %continue LoopControl
+            if (!out) {
+                if (!(out = malloc(bytes))) return NULL;
+                memcpy(out, in, bytes);
+            }
+            out[o + 3] = (in[o + 3] & ~1u) | 2u;
+        }
+        o += wc;
+    }
+    return out;
+}
+
 static uint32_t *compat_patch_spirv(const uint32_t *inWords, size_t inBytes, size_t *pOutBytes) {
     uint32_t *out = compat_patch_spirv_impl(inWords, inBytes, pOutBytes);
     uint32_t *fixed = g_spv_fix ? spv_fix_u64_to_float(out ? out : inWords, out ? *pOutBytes : inBytes) : NULL;
@@ -112,6 +137,12 @@ static uint32_t *compat_patch_spirv(const uint32_t *inWords, size_t inBytes, siz
     fixed = g_spv_fix ? spv_fix_broadcast_first(out ? out : inWords, out ? *pOutBytes : inBytes) : NULL;
     if (fixed) {
         *pOutBytes = g_fix_out_bytes;
+        free(out);
+        out = fixed;
+    }
+    fixed = g_spv_dontunroll ? spv_dont_unroll(out ? out : inWords, out ? *pOutBytes : inBytes) : NULL;
+    if (fixed) {
+        if (!out) *pOutBytes = inBytes;
         free(out);
         out = fixed;
     }
@@ -1470,6 +1501,31 @@ static uint32_t g_dump_hash_count;
 static uint32_t g_gt_trace; // MALI_COMPAT_GT_TRACE=<hex>: write every pass whose fragment/compute shader has this hash
                             // (=all: every pass and dispatch, in GPU order with its start time)
 static uint32_t g_skip_hash; // MALI_COMPAT_SKIP_HASH, see gt_skip
+static uint32_t g_noatt_w, g_noatt_h; // MALI_COMPAT_NOATT_AREA, see compat_CmdBeginRendering
+static _Atomic uint64_t g_noatt_clamped;
+// Graphics pipeline compiles per thread since the last timing report: did a stall come from the vendor compiler?
+struct PcStat { char comm[16]; uint32_t count; uint64_t sum_ns, max_ns; };
+static struct PcStat g_pcstat[16];
+static pthread_mutex_t g_pcstat_m = PTHREAD_MUTEX_INITIALIZER;
+static void pcstat_add(uint32_t count, uint64_t ns) {
+    static __thread char comm[16];
+    if (!comm[0]) {
+        FILE *f = fopen("/proc/thread-self/comm", "r");
+        if (!f || !fgets(comm, sizeof comm, f)) snprintf(comm, sizeof comm, "?");
+        if (f) fclose(f);
+        comm[strcspn(comm, "\n")] = 0;
+    }
+    pthread_mutex_lock(&g_pcstat_m);
+    int i = 0;
+    while (i < 16 && g_pcstat[i].count && strcmp(g_pcstat[i].comm, comm)) i++;
+    if (i < 16) {
+        if (!g_pcstat[i].count) snprintf(g_pcstat[i].comm, sizeof g_pcstat[i].comm, "%s", comm);
+        g_pcstat[i].count += count;
+        g_pcstat[i].sum_ns += ns;
+        if (ns > g_pcstat[i].max_ns) g_pcstat[i].max_ns = ns;
+    }
+    pthread_mutex_unlock(&g_pcstat_m);
+}
 static _Atomic uint64_t g_skipped_draws;
 
 static uint32_t spv_hash(const uint32_t *code, size_t bytes) {
@@ -2369,6 +2425,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
                     fprintf(stderr, "mali-compat: stream output: GS %08x kept (%s), stages %u, in points %d, out points %d, one vertex %d\n", h,
                             why ? why : "shape not handled", ci->stageCount, gsm ? gm.in_points : -1, gsm ? gm.out_points : -1,
                             gsm ? gm.one_vertex : -1);
+                    // both shaders to /root/mali-xfb-<gs hash>-{vs,gs}.spv, to build the rewrite for this shape
+                    for (int w = 0; w < 2; w++) {
+                        const VkShaderModuleCreateInfo *m = w ? gsm : vsm;
+                        char path[64];
+                        snprintf(path, sizeof path, "/root/mali-xfb-%08x-%s.spv", h, w ? "gs" : "vs");
+                        FILE *f = m ? fopen(path, "wb") : NULL;
+                        if (f) { fwrite(m->pCode, 1, m->codeSize, f); fclose(f); }
+                    }
                 }
                 continue;
             }
@@ -2444,7 +2508,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
             if (div) atomic_fetch_add(&g_div_pipes, 1);
         }
     dump_inflight_pipeline(createInfoCount, modified);
+    uint64_t t0 = g_gpu_time ? now_ns() : 0;
     VkResult res = d->fpCreateGraphicsPipelines(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount, modified, pAllocator, pPipelines);
+    if (g_gpu_time) {
+        uint64_t dt = now_ns() - t0;
+        pcstat_add(createInfoCount, dt);
+        // compiles over a second stall the game (DXVK compiles on its CS thread): name their shaders
+        for (uint32_t i = 0; dt > 1000000000ull && gt_hash && i < createInfoCount; i++) {
+            fprintf(stderr, "mali-compat: slow pipeline compile %.0f ms (%u in the call):", dt / 1e6, createInfoCount);
+            for (uint32_t k = 0; k < gt_n[i]; k++) fprintf(stderr, " 0x%x:%08x", gt_hash[i][3 + k], gt_hash[i][k]);
+            fprintf(stderr, "%s\n", modified[i].stageCount != pCreateInfos[i].stageCount ? " (GS dropped)" : "");
+            // the stages as compiled (after the layer's rewrites) to /root/mali-slow-<hash>.spv, once per hash
+            for (uint32_t k = 0; k < modified[i].stageCount; k++) {
+                const VkShaderModuleCreateInfo *sm = find_struct(modified[i].pStages[k].pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+                if (!sm) continue;
+                char path[64];
+                snprintf(path, sizeof path, "/root/mali-slow-%08x.spv", spv_hash(sm->pCode, sm->codeSize));
+                if (access(path, F_OK) == 0) continue;
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite(sm->pCode, 1, sm->codeSize, f); fclose(f); }
+            }
+        }
+    }
     dump_inflight_done();
     for (uint32_t k = 0; k < zero_div_count; k++) zero_div[k]->divisor = 0;
     if (res != VK_SUCCESS) {
@@ -3794,12 +3879,23 @@ static void gt_report(struct GpuTime *g, double interval_s) {
         fprintf(f, " | firstInstance!=0 draws %llu, divisor!=1 pipelines %llu, vertex inputs %llu",
                 (unsigned long long)atomic_load(&g_div_draws), (unsigned long long)atomic_load(&g_div_pipes),
                 (unsigned long long)atomic_load(&g_div_vi));
+        if (g_noatt_w) fprintf(f, " | attachment-less passes clamped %llu", (unsigned long long)atomic_load(&g_noatt_clamped));
         if (g_xfb_vs) fprintf(f, " | stream-output pipelines without GS %llu", (unsigned long long)atomic_load(&g_xfb_vs_pipes));
         if (g_skip_hash) fprintf(f, " | skipped draws (%08x) %llu", g_skip_hash, (unsigned long long)atomic_load(&g_skipped_draws));
         if (g_fake_occlusion)
             fprintf(f, " | faked occlusion copies %llu, reads %llu", (unsigned long long)atomic_load(&g_occl_copies),
                     (unsigned long long)atomic_load(&g_occl_reads));
         fprintf(f, "\n");
+        pthread_mutex_lock(&g_pcstat_m);
+        if (g_pcstat[0].count) {
+            fprintf(f, "graphics pipeline compiles:");
+            for (int k = 0; k < 16 && g_pcstat[k].count; k++)
+                fprintf(f, " %s %u in %.0f ms (max %.0f)", g_pcstat[k].comm, g_pcstat[k].count, g_pcstat[k].sum_ns / 1e6,
+                        g_pcstat[k].max_ns / 1e6);
+            fprintf(f, "\n");
+        }
+        memset(g_pcstat, 0, sizeof g_pcstat);
+        pthread_mutex_unlock(&g_pcstat_m);
         for (uint32_t i = 0; i < n && i < 25; i++) {
             char desc[160];
             gt_pipe_desc(v[i].pipeline, desc, sizeof desc);
@@ -4090,6 +4186,20 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRendering(VkCommandBuffer cmd, 
         if (ri->pStencilAttachment) { ste = *ri->pStencilAttachment; susres_attachment(&ste, resume, suspend, 2); plain.pStencilAttachment = &ste; }
         ri = &plain;
     }
+    // Attachment-less passes (MALI_COMPAT_NOATT_AREA=<W>x<H>): DXVK opens them for draws without render targets
+    // (stream output, UAV-only) with the device's maximum size, 16384x16384 and 256 layers here. On the vendor driver
+    // such a pass took ~118 ms with nothing to draw and finally hung the GPU (Witcher 3 next-gen DX11, 2026-10-30).
+    // The area is clamped and the layer count set to 1; with no attachments only UAV writes outside it could be lost.
+    VkRenderingInfo clamped;
+    if (g_noatt_w && !ri->colorAttachmentCount && !ri->pDepthAttachment && !ri->pStencilAttachment &&
+        (ri->renderArea.extent.width > g_noatt_w || ri->renderArea.extent.height > g_noatt_h || ri->layerCount > 1)) {
+        clamped = *ri;
+        if (clamped.renderArea.extent.width > g_noatt_w) clamped.renderArea.extent.width = g_noatt_w;
+        if (clamped.renderArea.extent.height > g_noatt_h) clamped.renderArea.extent.height = g_noatt_h;
+        if (!clamped.viewMask) clamped.layerCount = 1;
+        atomic_fetch_add(&g_noatt_clamped, 1);
+        ri = &clamped;
+    }
     gt_render_begin(cmd, ri->renderArea.extent.width, ri->renderArea.extent.height, ri->colorAttachmentCount, ri);
     get_device_data_by_cmd(cmd)->gt->fpCmdBeginRendering(cmd, ri);
 }
@@ -4249,7 +4359,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
     g_gt_trace = getenv("MALI_COMPAT_GT_TRACE") ? (uint32_t)strtoul(getenv("MALI_COMPAT_GT_TRACE"), NULL, 16) : 0;
     if (getenv("MALI_COMPAT_GT_TRACE") && !strcmp(getenv("MALI_COMPAT_GT_TRACE"), "all")) g_gt_trace = UINT32_MAX;
+    g_spv_dontunroll = getenv("MALI_COMPAT_SPV_DONTUNROLL") && strcmp(getenv("MALI_COMPAT_SPV_DONTUNROLL"), "0") != 0;
     g_xfb_vs = getenv("MALI_COMPAT_XFB_VS") && strcmp(getenv("MALI_COMPAT_XFB_VS"), "0") != 0;
+    g_noatt_w = g_noatt_h = 0;
+    if (getenv("MALI_COMPAT_NOATT_AREA") && sscanf(getenv("MALI_COMPAT_NOATT_AREA"), "%ux%u", &g_noatt_w, &g_noatt_h) != 2)
+        g_noatt_w = g_noatt_h = 0;
     g_skip_hash = getenv("MALI_COMPAT_SKIP_HASH") ? (uint32_t)strtoul(getenv("MALI_COMPAT_SKIP_HASH"), NULL, 16) : 0;
     g_dump_hash_count = 0;
     for (const char *h = getenv("MALI_COMPAT_DUMP_HASH"); h && *h && g_dump_hash_count < 16;) {
