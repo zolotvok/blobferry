@@ -72,7 +72,7 @@ In short (2026-10-30):
 | The Witcher 3 (current release) | DX11 → DXVK | in game, ~18-22 FPS at low settings; with `NOATT_AREA` (GPU hang otherwise), `PIPELINE_CACHE` and `ASYNC_PSO` (compile stalls) |
 | The Witcher 3 (current release) | DX12 → vkd3d-proton | in game, ~17-22 FPS; the prologue runs, one GPU hang left later in the game |
 | Horizon Zero Dawn | DX12 → vkd3d-proton | benchmark completes (avg 14-16 FPS); the static world geometry (buildings, props, cliffs) is missing |
-| Control | DX12 → vkd3d-proton | does not start: the vendor shader compiler aborts on one of vkd3d-proton's compute shaders |
+| Control | DX12 → vkd3d-proton | starts, intro and 3D visible, plays at ~12-13 FPS (autoplay 3 min, exit 0). Recipe: `MALI_COMPAT_NO_SUSPEND_RESUME=1` with one of `GPU_TIME`/`ASYNC_PSO`/`NOATT_AREA`/`GT_TRACE` on (its hooks do the work), plus `FEX_DISKCACHE=0` in the guest; the compute shader that aborted the vendor compiler is replaced through `VKD3D_SHADER_OVERRIDE` |
 
 ## Session on the vendor driver
 
