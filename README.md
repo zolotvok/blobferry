@@ -180,4 +180,8 @@ the latter for reviews). Code comments carry a `[model]` tag where an agent wrot
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Third-party parts and credits are listed in [NOTICE.md](NOTICE.md).
+Blobferry's own code is licensed under the GNU General Public License, version 3 or (at your option) any later version
+(GPL-3.0-or-later), see [LICENSE](LICENSE). Versions up to and including commit 4077514 (the last pushed before the
+relicense) remain available under the MIT license. Third-party parts keep their own licenses, and credits are listed in
+[NOTICE.md](NOTICE.md). Blobferry ships no vendor blobs: the proprietary Mali driver stays on the phone and is loaded from
+there at run time.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // xfb-probe: what costs ~1.4 ms per draw in Unity's DX11 GPU skinning on the vendor driver? DXVK turns D3D11 stream
 // output into a passthrough geometry shader with transform feedback (Yooka-Laylee IL, 2026-10-30: 26 such draws of
 // ~3848 points take 35-41 ms per frame). Each case records FRAMES x 26 draws of 3848 points, every draw inside its own

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // bc-probe: does the compat layer's BC emulation decode an upload? Creates BC1/BC3 images (the layer makes them
 // RGBA8), uploads known blocks with vkCmdCopyBufferToImage, reads the RGBA8 texels back. [Claude Opus 5.5] 2026-10-26
 // Run with the compat layer only:

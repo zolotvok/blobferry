@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Minimal libhybris (common + bionic Q linker plugin) for aarch64 glibc, cross-built with clang and
 # the Debian bookworm arm64 sysroot used for PanVK. [Claude Sonnet 5.5] 2026-10-26
 # Usage: bridge/build-libhybris.sh configure|make|install   (log: bridge/build/libhybris-<step>.log)

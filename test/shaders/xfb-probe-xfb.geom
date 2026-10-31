@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 // xfb-probe: DXVK's stream-output passthrough geometry shader (points in, one point out, captured)
 layout(points) in;

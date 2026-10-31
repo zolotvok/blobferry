@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # package.sh  pack the built bridge into build/dist/blobferry-<commit>.zip (run build-libhybris.sh install, build-wsi.sh
 # and build-bridge.sh build first). The zip holds:
 #   rootfs/            files for the DroidDeck guest rootfs (shim, compat + WSI layers and their manifests, libhybris)
@@ -74,7 +75,7 @@ Install
 Not importable into Winlator, GameHub or GameNative: the shim is a glibc Linux Vulkan driver that loads the Android
 driver through libhybris inside DroidDeck's rootfs, and the layers are installed as Vulkan implicit layers there.
 
-License: MIT (LICENSE); third-party parts and credits in NOTICE.md and licenses/.
+License: GPL-3.0-or-later (LICENSE); third-party parts and credits in NOTICE.md and licenses/.
 EOF
 (cd "$B/build/dist" && rm -f "blobferry-$V.zip" && zip -q -r -y "blobferry-$V.zip" "blobferry-$V")
 ls -l "$B/build/dist/blobferry-$V.zip"

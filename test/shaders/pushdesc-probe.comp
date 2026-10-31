@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 // pushdesc-probe: set 0 = output SSBO, set 1 = a plain UBO, set 2 = push-descriptor UBO (vkd3d's root CBV layout)
 layout(local_size_x = 16) in;

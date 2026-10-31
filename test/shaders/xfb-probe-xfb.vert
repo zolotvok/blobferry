@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 // xfb-probe: the same vertex shader, captured directly (no geometry shader)
 layout(location = 0) in vec4 a0;

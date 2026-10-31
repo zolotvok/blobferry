@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 in float gl_ClipDistance[2];
 layout(location=0) out vec4 c;

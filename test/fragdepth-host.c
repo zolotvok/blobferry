@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // fragdepth-host: runs the compat layer's FragDepth strip (MALI_COMPAT_FRAGDEPTH_FIX) on SPIR-V files on the host and
 // writes <file>.out; check the result with spirv-val. [Claude Opus 5.5] 2026-10-28
 // cc -I../panvk-kbase-android/work/mesa/include -Isrc/compat test/fragdepth-host.c -o fragdepth-host -lpthread -lm

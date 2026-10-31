@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 // xfb-probe: vertex shader shaped like Unity's stream-output skinning VS (3 attributes in, 3 vec4 out, some ALU)
 layout(location = 0) in vec4 a0;

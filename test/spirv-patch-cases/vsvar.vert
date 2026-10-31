@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 // Plain VS with clip + cull (the common DXVK D3D11 case).
 layout(location=0) in vec4 p;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // rt-comp-probe: does the vendor driver compress The Witcher 3's render targets, and what turns it off?
 // Witcher 3's colour targets come from DXVK with usage 0x1f (transfer src/dst, sampled, STORAGE, colour attachment) and
 // all report VK_IMAGE_COMPRESSION_DISABLED (2026-10-28 image log). For each format and usage this prints what the

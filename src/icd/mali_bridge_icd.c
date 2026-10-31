@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Khronos ICD shim over the phone's Android Vulkan HAL, loaded in process with libhybris. [Claude Sonnet 5.5]
 // Env: MALI_BRIDGE_DEBUG=1 logs to stderr; MALI_BRIDGE_HAL=<path> overrides /vendor/lib64/hw/vulkan.mali.so.
 #include <dlfcn.h>

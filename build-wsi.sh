@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Builds the Vulkan WSI layer with Wayland and dma_buf_heaps allocator (system heap)
 # for aarch64 glibc using clang and the bookworm sysroot. [Gemini 3.8 Flash] 2026-10-26
 set -eu

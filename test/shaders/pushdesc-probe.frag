@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 // pushdesc-probe graphics case: each of the 12 pixels copies its vec4 of the push UBO into the SSBO
 layout(set = 0, binding = 0) buffer Out { vec4 o[]; };

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Host harness: runs the compat layer's SPIR-V patches (clip/cull strip, u64-to-float fix) on .spv files and writes
 // <file>.out for spirv-val. Build: cc -I../panvk-kbase-android/work/mesa/include -Isrc/compat test/spirv-patch-host.c
 // [Claude Opus 5.5] 2026-10-26

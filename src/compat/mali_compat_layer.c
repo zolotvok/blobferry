@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #define _GNU_SOURCE
 // Mali Compatibility Layer for DXVK / Proton (VK_LAYER_DROIDDECK_mali_compat)
 // Implements feature masking, polygon mode override, SPIR-V clip/cull distance stripping,

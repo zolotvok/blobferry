@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Summarises the compat layer's image log (/root/mali-images.txt): estimated uncompressed bytes per
 # (format, bc-shadow, flags, compression) group, biggest first. Fixed-rate (comp 0x2) groups are also shown at their
 # rate (2 bpc = 8 bpp, 3 bpc = 12 bpp for 4-channel 8-bit formats). [Claude Opus 5.5] 2026-10-26

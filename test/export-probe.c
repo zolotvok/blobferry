@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // export-probe: does a GPU write reach an exportable dma-buf image the way gamescope allocates one? Creates a linear
 // B8G8R8A8 image with a DRM modifier list and dma-buf export (as gamescope's output images), binds dedicated exportable
 // memory, clears it to red with vkCmdClearColorImage, waits, then reads the dma-buf through vkGetMemoryFdKHR + mmap.

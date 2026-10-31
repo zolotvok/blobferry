@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // pushdesc-probe: does the vendor driver read a push-descriptor UBO correctly in vkd3d's root-CBV layout? With
 // MALI_COMPAT_VENDOR_ID=5143 vkd3d binds root CBVs as a push-descriptor UBO in the last set (set 2 behind its bindless
 // sets) and the DX12 Witcher renders white (2026-10-28). A compute shader copies the 12 vec4 of the push UBO into an

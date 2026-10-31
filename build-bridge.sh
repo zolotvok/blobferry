@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Builds the Mali bridge ICD shim + hal-probe for aarch64 glibc (host clang, PanVK's Debian bookworm sysroot) and
 # deploys them into the DroidDeck rootfs. [Claude Sonnet 5.5] 2026-10-26
 # Usage: bridge/build-bridge.sh build|zip|install-driver|deploy   (needs build-libhybris.sh install done; deploy logs to ../adb-device-changes.txt)

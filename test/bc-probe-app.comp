@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 // bc-probe's "app" compute shader: writes its push-constant value to the push-constant address. Used to check that
 // the compat layer restores the app's compute pipeline and push constants after a BC decode. [Claude Opus 5.5]

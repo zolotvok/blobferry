@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 // xfb-probe: the same passthrough geometry shader without capture
 layout(points) in;

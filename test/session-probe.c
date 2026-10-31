@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // session-probe: can the session (gamescope, Steam's ANGLE) run on the bridge instead of PanVK? Lists what gamescope
 // 3.16 asks of its Vulkan device (src/rendervulkan.cpp) and of the instance, and what the driver offers: device and
 // instance extensions, VK_EXT_physical_device_drm's nodes (emulated by the compat layer with MALI_COMPAT_DRM_NODE),

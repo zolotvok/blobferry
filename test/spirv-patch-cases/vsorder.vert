@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 out gl_PerVertex { float gl_ClipDistance[1]; vec4 gl_Position; float gl_PointSize; };
 layout(location=0) out float o;

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Regenerate the BC decoder SPIR-V headers (compute + fragment variants).
 set -eu
 cd "$(dirname "$0")"

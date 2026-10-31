@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Host harness for the compat layer's stream-output rewrite (MALI_COMPAT_XFB_VS): xfb-vs-host VS.spv GS.spv OUT.spv
 // writes the vertex shader that captures what the passthrough geometry shader captured; check it with spirv-val.
 // Build: cc -I../panvk-kbase-android/work/mesa/include -Isrc/compat test/xfb-vs-host.c -lpthread [Claude Opus 5.5] 2026-10-30

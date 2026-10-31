@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // img-probe: which dma-buf swapchain-style VkImage create infos the vendor Mali driver accepts. [Claude Opus 5.5] 2026-10-26
 // Run through the loader with only the bridge ICD (no layers):
 //   VK_DRIVER_FILES=<bridge icd.json> HYBRIS_USE_VENDOR_NAMESPACE=1 img-probe

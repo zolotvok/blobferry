@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Runs the compat layer's ClipDistance/CullDistance SPIR-V patcher on the cases in test/spirv-patch-cases/ and on
 # the saved Oblivion module dumps (build/spv-diag, build/spv-run12), and checks every result with spirv-val.
 # Needs glslangValidator and spirv-val (Fedora: glslang, spirv-tools). Exit 0 = no module invalid after patching

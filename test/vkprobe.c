@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // M3 test 3: x86-64 Windows program, run by Proton (x86-64 code under FEX inside the arm64ec Wine). [Claude Sonnet 5.5]
 // Goes the way a game does: LoadLibrary("vulkan-1.dll") -> winevulkan -> the guest's Khronos loader -> the ICD chosen by
 // VK_DRIVER_FILES. No import library and no Windows SDK needed beyond windows.h/stdio.h.

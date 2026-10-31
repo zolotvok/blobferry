@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // M2 probe: load the vendor Vulkan HAL through libhybris, print device name and driver info. [Claude Sonnet 5.5]
 // Build: bridge/build-bridge.sh build. Usage: hal-probe [path-to-vulkan.<hw>.so]
 #include <dlfcn.h>

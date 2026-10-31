@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // LD_PRELOAD crash reporter for the guest (no gdb/strace there): prints the fault address, pc/lr/sp and a frame-pointer
 // backtrace as module+offset (from /proc/self/maps), then exits 139. aarch64 only. [Claude Sonnet 5.5]
 // Use: LD_PRELOAD=/usr/lib/mali_bridge/segv-report.so ./program ...

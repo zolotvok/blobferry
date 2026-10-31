@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // afrc-probe: which fixed-rate (AFRC) compression rates the vendor driver offers and applies for the BC shadow
 // formats (RGBA8 UNORM/SRGB, RG16, RGBA16F) with the shadows' usage (sampled + transfer). [Claude Opus 5.5] 2026-10-26
 // Run on the ICD alone: VK_DRIVER_FILES=<bridge icd.json> HYBRIS_USE_VENDOR_NAMESPACE=1 VK_LOADER_LAYERS_DISABLE=~implicit~

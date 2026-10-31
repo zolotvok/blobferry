@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 // Arrays of blocks in both directions; CullDistance only on one side.
 layout(vertices=3) out;

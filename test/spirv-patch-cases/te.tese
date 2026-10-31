@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 layout(triangles) in;
 in gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[1]; } gl_in[];

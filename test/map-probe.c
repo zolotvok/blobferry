@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // map-probe: can the vendor driver's CPU mappings be moved with mremap to an address the caller picks? This is what a
 // layer-side VK_EXT_map_memory_placed needs (Wine on WoW64 places mappings below 4 GiB). [Claude Opus 5.5] 2026-10-26
 // Run through the loader with only the bridge ICD:

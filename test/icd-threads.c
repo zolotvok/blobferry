@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // M3 test 2: call the Mali bridge ICD (through the Khronos loader) from the main thread and from plain glibc threads. [Claude Sonnet 5.5]
 // Each thread: vkEnumeratePhysicalDevices, vkGetPhysicalDeviceProperties2 (+ driver properties), vkCreateDevice, vkDestroyDevice.
 // Pass: every thread prints the same "name | driverInfo | apiVersion" as the main thread, rc=0, no crash.
