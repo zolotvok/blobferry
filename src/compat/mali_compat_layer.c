@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define _GNU_SOURCE
+#include <dlfcn.h> // dladdr (K-WC1 wait callers)
 // Mali Compatibility Layer for DXVK / Proton (VK_LAYER_DROIDDECK_mali_compat)
 // Implements feature masking, polygon mode override, SPIR-V clip/cull distance stripping,
 // BC1-BC7 GPU compute texture emulation via PanVK shaders, and VK_EXT_memory_budget.
@@ -10,6 +11,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -130,6 +132,274 @@ static uint32_t *spv_dont_unroll(const uint32_t *in, size_t bytes) {
     return out;
 }
 
+// BEGIN wls-clamp-1
+// MALI_COMPAT_WLS_CLAMP (WD2 B10-21) [keeper, Claude Opus 5.5] 2026-11-01: clamps every dynamic index into a
+// Workgroup-storage composite (DXVK's TGSM arrays, e.g. WD2's g0 = uint[273][15]) with GLSL.std.450 UMin(idx, len-1)
+// right before the OpAccessChain / OpInBoundsAccessChain that uses it. Loads, stores and atomics all go through the
+// chain's pointer, so they are all covered. In-range indices are unchanged (UMin(i, len-1) == i for i < len); an
+// out-of-range index (undefined behaviour in D3D11 and Vulkan) now aliases the last element, inside the object, like
+// desktop LDS, instead of walking into neighbouring GPU VA as Mali's WLS (plain memory) does (B10-20 replay: 24/24
+// translation faults with garbage g0 rows). Constant indices, struct members, OpPtrAccessChain and spec-constant
+// array lengths are left alone (the latter two are counted as "skipped"). Unset or 0 = off; 1 or "all" = every module;
+// else a comma list of hex hashes (FNV-1a of the SPIR-V as the app passed it, the GPU_TIME / DUMP_HASH hash).
+static int g_wls_clamp;                 // 0 off, 1 all modules, 2 hash list
+static uint32_t g_wls_hashes[16], g_wls_hash_count;
+static _Atomic uint32_t g_wls_logged;
+static _Atomic uint64_t g_wls_modules, g_wls_chains;
+static uint32_t spv_hash(const uint32_t *code, size_t bytes);
+
+static pthread_once_t g_wls_once = PTHREAD_ONCE_INIT;
+static void wls_clamp_init_impl(void) {
+    const char *v = getenv("MALI_COMPAT_WLS_CLAMP");
+    g_wls_clamp = 0;
+    g_wls_hash_count = 0;
+    if (!v || !*v || !strcmp(v, "0")) return;
+    if (!strcmp(v, "1") || !strcmp(v, "all")) { g_wls_clamp = 1; return; }
+    for (const char *h = v; *h && g_wls_hash_count < 16;) {
+        char *end;
+        unsigned long x = strtoul(h, &end, 16);
+        if (end == h) break;
+        g_wls_hashes[g_wls_hash_count++] = (uint32_t)x;
+        h = *end == ',' ? end + 1 : end;
+    }
+    g_wls_clamp = g_wls_hash_count ? 2 : 0;
+    if (!g_wls_clamp) fprintf(stderr, "mali-compat: MALI_COMPAT_WLS_CLAMP=%s ignored (1, all or hex hashes)\n", v);
+}
+// once per process, from vkCreateInstance and vkCreateDevice (a device made without this layer's instance still parses it)
+static void wls_clamp_init(void) { pthread_once(&g_wls_once, wls_clamp_init_impl); }
+
+static bool wls_clamp_wanted(uint32_t hash) {
+    if (g_wls_clamp == 1) return true;
+    for (uint32_t i = 0; g_wls_clamp == 2 && i < g_wls_hash_count; i++)
+        if (g_wls_hashes[i] == hash) return true;
+    return false;
+}
+
+// Opcodes < 512 that have a result type (word 1) and a result id (word 2); from SpvHasResultAndType (SPIRV-Headers
+// unified1). Ids made by other opcodes have an unknown type: a chain indexed by one is skipped, never guessed.
+static const uint64_t k_spv_typed_ops[8] = {
+    0x3adf7e0000001002ull, 0xdfffeff7ffdfe07eull, 0xfffffffffdffffffull, 0x0027ffe800ffbffcull,
+    0x5fff99f87cfcffe8ull, 0x00007fffffffe17bull, 0x00000000000f0000ull, 0x0000000000000000ull};
+static bool spv_op_typed(uint32_t op) { return op < 512 && ((k_spv_typed_ops[op >> 6] >> (op & 63)) & 1); }
+
+struct WlsCtx {
+    const uint32_t *in;
+    uint32_t bound, next;     // input id bound, next free id
+    uint32_t *def, *type;     // id -> word offset of the defining instruction, id -> result type id
+    uint32_t nconst;          // constants to add: (type, value lo, value hi, id)
+    uint32_t cst[64][4];
+    bool cst_new[64];
+};
+
+// value of an OpConstant / OpConstantNull integer id; false if it is not one (spec constants count as dynamic)
+static bool wls_const_val(const struct WlsCtx *c, uint32_t id, uint64_t *v) {
+    if (id >= c->bound || !c->def[id]) return false;
+    const uint32_t *d = c->in + c->def[id];
+    uint32_t op = d[0] & 0xffff, len = d[0] >> 16;
+    if (op == 46) { *v = 0; return true; } // OpConstantNull
+    if (op != 43 || len < 4) return false;
+    *v = len >= 5 ? ((uint64_t)d[4] << 32 | d[3]) : d[3];
+    return true;
+}
+
+// id of an integer constant of type t (32/64-bit) with value v: an existing OpConstant, else a new one (added once)
+static uint32_t wls_const(struct WlsCtx *c, uint32_t t, uint64_t v, uint32_t width) {
+    for (uint32_t i = 0; i < c->nconst; i++)
+        if (c->cst[i][0] == t && c->cst[i][1] == (uint32_t)v && c->cst[i][2] == (uint32_t)(v >> 32)) return c->cst[i][3];
+    if (c->nconst >= 64) return 0;
+    uint32_t id = 0;
+    for (uint32_t k = 1; k < c->bound && !id; k++) { // existing constant (first one in the module)
+        uint64_t x;
+        if (c->type[k] == t && wls_const_val(c, k, &x) && (c->in[c->def[k]] & 0xffff) == 43 && x == v) id = k;
+    }
+    bool fresh = !id;
+    if (fresh) id = c->next++;
+    uint32_t *e = c->cst[c->nconst];
+    e[0] = t; e[1] = (uint32_t)v; e[2] = width > 32 ? (uint32_t)(v >> 32) : 0; e[3] = id;
+    c->cst_new[c->nconst++] = fresh;
+    return id;
+}
+
+// Plans the clamps of one access chain at word offset o: rep[k] = UMin bound constant id for index k (0 = keep).
+// Returns 1 if the base is a Workgroup pointer, 0 otherwise; *skipped = a dynamic index that could not be clamped.
+static int wls_chain_plan(struct WlsCtx *c, size_t o, uint32_t rep[], uint32_t *nrep, bool *skipped) {
+    const uint32_t *w = c->in + o;
+    uint32_t len = w[0] >> 16, base = w[3], nidx = len - 4;
+    for (uint32_t k = 0; k < nidx; k++) rep[k] = 0;
+    *nrep = 0;
+    *skipped = false;
+    if (base >= c->bound || !c->type[base] || c->type[base] >= c->bound || !c->def[c->type[base]]) return 0;
+    const uint32_t *pt = c->in + c->def[c->type[base]];
+    if ((pt[0] & 0xffff) != 32 || (pt[0] >> 16) < 4 || pt[2] != 4 /* Workgroup */) return 0;
+    uint32_t cur = pt[3];
+    for (uint32_t k = 0; k < nidx; k++) {
+        uint32_t idx = w[4 + k];
+        if (cur >= c->bound || !c->def[cur]) { *skipped = true; break; }
+        const uint32_t *td = c->in + c->def[cur];
+        uint32_t top = td[0] & 0xffff;
+        uint64_t iv, count = 0;
+        bool is_const = wls_const_val(c, idx, &iv);
+        if (top == 30) { // struct: constant member index
+            if (!is_const || 2 + iv >= (td[0] >> 16)) { *skipped = true; break; }
+            cur = td[2 + iv];
+            continue;
+        }
+        if (top == 28) { // array: length is a constant id
+            if (!wls_const_val(c, td[3], &count) || (c->in[c->def[td[3]]] & 0xffff) != 43) count = 0;
+        } else if (top == 23 || top == 24) { // vector / matrix: literal count
+            count = td[3];
+        } else { // runtime array or anything else: cannot be clamped (Workgroup has no runtime arrays)
+            if (!is_const) *skipped = true;
+            break;
+        }
+        cur = td[2];
+        if (is_const) continue;
+        if (!count) { *skipped = true; continue; }
+        uint32_t it = idx < c->bound ? c->type[idx] : 0;
+        const uint32_t *itd = it && it < c->bound && c->def[it] ? c->in + c->def[it] : NULL;
+        if (!itd || (itd[0] & 0xffff) != 21 || (itd[2] != 32 && itd[2] != 64)) { *skipped = true; continue; }
+        uint32_t cid = wls_const(c, it, count - 1, itd[2]);
+        if (!cid) { *skipped = true; continue; }
+        rep[k] = cid;
+        (*nrep)++;
+    }
+    return 1;
+}
+
+// Returns a patched copy (size in *out_bytes) or NULL (nothing to clamp / not SPIR-V / malformed).
+// st[0] Workgroup chains with >= 1 clamped index, st[1] clamped indices, st[2] Workgroup chains seen, st[3] skipped.
+static uint32_t *spv_wls_clamp(const uint32_t *in, size_t bytes, size_t *out_bytes, uint32_t st[4]) {
+    st[0] = st[1] = st[2] = st[3] = 0;
+    if (!in || bytes < 20 || bytes % 4 || in[0] != 0x07230203) return NULL;
+    size_t n = bytes / 4;
+    uint32_t bound = in[3];
+    if (!bound || bound > (1u << 22)) return NULL;
+    struct WlsCtx c = {.in = in, .bound = bound, .next = bound};
+    c.def = calloc(bound, 4);
+    c.type = calloc(bound, 4);
+    uint32_t *out = NULL;
+    if (!c.def || !c.type) goto done;
+    size_t mm_off = 0, fn_off = 0;
+    uint32_t glsl = 0;
+    for (size_t o = 5; o < n;) {
+        uint32_t op = in[o] & 0xffff, len = in[o] >> 16;
+        if (!len || o + len > n) goto done;
+        if (spv_op_typed(op) && len >= 3 && in[o + 2] < bound && in[o + 1] < bound) {
+            c.def[in[o + 2]] = (uint32_t)o;
+            c.type[in[o + 2]] = in[o + 1];
+        } else if (op >= 19 && op <= 38 && len >= 2 && in[o + 1] < bound) {
+            c.def[in[o + 1]] = (uint32_t)o; // OpType*
+        } else if (op == 11 && len >= 3 && !glsl) { // OpExtInstImport
+            char name[16] = {0};
+            memcpy(name, in + o + 2, (len - 2) * 4 < 15 ? (len - 2) * 4 : 15);
+            if (!strcmp(name, "GLSL.std.450")) glsl = in[o + 1];
+        }
+        if (op == 14 && !mm_off) mm_off = o;      // OpMemoryModel
+        if (op == 54 && !fn_off) fn_off = o;      // first OpFunction
+        o += len;
+    }
+    if (!mm_off || !fn_off) goto done;
+    // phase A: plan every chain (allocates the constant ids), count
+    uint32_t rep[64], nrep, clamps = 0;
+    bool skipped;
+    for (size_t o = fn_off; o < n; o += in[o] >> 16) {
+        uint32_t op = in[o] & 0xffff, len = in[o] >> 16;
+        if ((op != 65 && op != 66 && op != 67 && op != 70) || len < 4) continue;
+        if (op == 67 || op == 70) { // OpPtrAccessChain / OpInBoundsPtrAccessChain on Workgroup: not handled
+            uint32_t b = in[o + 3];
+            const uint32_t *pt = b < bound && c.type[b] < bound && c.def[c.type[b]] ? in + c.def[c.type[b]] : NULL;
+            if (pt && (pt[0] & 0xffff) == 32 && pt[2] == 4) { st[2]++; st[3]++; }
+            continue;
+        }
+        if (len - 4 > 64) continue;
+        if (!wls_chain_plan(&c, o, rep, &nrep, &skipped)) continue;
+        st[2]++;
+        st[3] += skipped;
+        if (nrep) { st[0]++; st[1] += nrep; clamps += nrep; }
+    }
+    if (!clamps) goto done;
+    if (!glsl) glsl = c.next++;
+    uint32_t nnew = 0;
+    for (uint32_t i = 0; i < c.nconst; i++) nnew += c.cst_new[i];
+    size_t cap = n + 6 + 5 * (size_t)nnew + 7 * (size_t)clamps;
+    out = malloc(cap * 4);
+    if (!out) goto done;
+    memcpy(out, in, 5 * 4);
+    size_t w = 5;
+    bool need_import = glsl >= bound;
+    for (size_t o = 5; o < n;) {
+        uint32_t op = in[o] & 0xffff, len = in[o] >> 16;
+        if (o == mm_off && need_import) {
+            out[w++] = (6u << 16) | 11u; // OpExtInstImport %glsl "GLSL.std.450"
+            out[w++] = glsl;
+            memset(out + w, 0, 16);
+            memcpy(out + w, "GLSL.std.450", 12);
+            w += 4;
+        }
+        if (o == fn_off) {
+            for (uint32_t i = 0; i < c.nconst; i++) {
+                if (!c.cst_new[i]) continue;
+                const uint32_t *itd = in + c.def[c.cst[i][0]];
+                bool wide = itd[2] == 64;
+                out[w++] = ((wide ? 5u : 4u) << 16) | 43u; // OpConstant
+                out[w++] = c.cst[i][0];
+                out[w++] = c.cst[i][3];
+                out[w++] = c.cst[i][1];
+                if (wide) out[w++] = c.cst[i][2];
+            }
+        }
+        if (o >= fn_off && (op == 65 || op == 66) && len >= 4 && len - 4 <= 64 &&
+            wls_chain_plan(&c, o, rep, &nrep, &skipped) && nrep) {
+            uint32_t ids[64];
+            for (uint32_t k = 0; k < len - 4u; k++) {
+                ids[k] = in[o + 4 + k];
+                if (!rep[k]) continue;
+                uint32_t r = c.next++;
+                out[w++] = (7u << 16) | 12u; // OpExtInst %type %r %glsl UMin %idx %len-1
+                out[w++] = c.type[ids[k]];
+                out[w++] = r;
+                out[w++] = glsl;
+                out[w++] = 38u;
+                out[w++] = ids[k];
+                out[w++] = rep[k];
+                ids[k] = r;
+            }
+            memcpy(out + w, in + o, 4 * 4);
+            w += 4;
+            memcpy(out + w, ids, (len - 4) * 4);
+            w += len - 4;
+        } else {
+            memcpy(out + w, in + o, len * 4);
+            w += len;
+        }
+        o += len;
+    }
+    out[3] = c.next;
+    *out_bytes = w * 4;
+done:
+    free(c.def);
+    free(c.type);
+    return out;
+}
+
+// One module through the clamp (from compat_patch_spirv): orig = the app's code (hash filter), cur = the code so far.
+static uint32_t *wls_clamp_module(const uint32_t *orig, size_t orig_bytes, const uint32_t *cur, size_t cur_bytes,
+                                  size_t *out_bytes) {
+    uint32_t h = spv_hash(orig, orig_bytes);
+    if (!wls_clamp_wanted(h)) return NULL;
+    uint32_t st[4];
+    uint32_t *out = spv_wls_clamp(cur, cur_bytes, out_bytes, st);
+    if (st[2]) {
+        atomic_fetch_add(&g_wls_modules, out ? 1 : 0);
+        atomic_fetch_add(&g_wls_chains, st[0]);
+        if (atomic_fetch_add(&g_wls_logged, 1) < 512)
+            fprintf(stderr, "mali-compat: wls-clamp: module %08x chains %u idx %u wls-chains %u skipped %u%s\n", h, st[0],
+                    st[1], st[2], st[3], out ? "" : " (unchanged)");
+    }
+    return out;
+}
+// END wls-clamp-1
+
 static uint32_t *compat_patch_spirv(const uint32_t *inWords, size_t inBytes, size_t *pOutBytes) {
     uint32_t *out = compat_patch_spirv_impl(inWords, inBytes, pOutBytes);
     uint32_t *fixed = g_spv_fix ? spv_fix_u64_to_float(out ? out : inWords, out ? *pOutBytes : inBytes) : NULL;
@@ -149,6 +419,15 @@ static uint32_t *compat_patch_spirv(const uint32_t *inWords, size_t inBytes, siz
         if (!out) *pOutBytes = inBytes;
         free(out);
         out = fixed;
+    }
+    if (g_wls_clamp) { // wls-clamp-1: last, on the code so far; the hash filter uses the app's code
+        size_t wb = 0;
+        fixed = wls_clamp_module(inWords, inBytes, out ? out : inWords, out ? *pOutBytes : inBytes, &wb);
+        if (fixed) {
+            *pOutBytes = wb;
+            free(out);
+            out = fixed;
+        }
     }
     if (out) dump_spirv(inWords, inBytes, out, *pOutBytes);
     return out;
@@ -706,7 +985,13 @@ static pthread_mutex_t g_bc_image_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t handle_bucket(uint64_t v, uint32_t n) { return (uint32_t)((v ^ (v >> 17) ^ (v >> 33)) % n); }
 
+// D3b (perf review P2), [keeper, Claude Opus 5.5] 2026-10-31: set at the first BC image of the process, never cleared.
+// Until then nothing can be decoded, so vkCmdPushConstants skips its record and the BC copy hooks skip the table lookup.
+static _Atomic bool g_bc_seen;
+static _Atomic bool g_bc_untracked_logged;
+
 static void register_bc_image(VkImage img, VkFormat orig, VkFormat decoded, VkExtent3D ext) {
+    atomic_store_explicit(&g_bc_seen, true, memory_order_release);
     struct BCNode *e = calloc(1, sizeof *e);
     if (!e) return;
     e->t = (struct TrackedBCImage){.image = img, .orig_format = orig, .decoded_format = decoded, .extent = ext};
@@ -737,11 +1022,64 @@ static void unregister_bc_image(VkImage img) {
     free(e);
 }
 
+// VK_EXT_memory_budget accounting (K-CF2) [keeper, Claude Opus 5.5] 2026-10-31: live bytes per memory heap, added
+// when vkAllocateMemory succeeds and taken off again in vkFreeMemory (before, one counter only ever grew and every heap
+// reported it, so vkd3d/DXVK saw a device permanently over budget, docs/common_fixes.md section 15). Counted: the app's
+// allocations (the layer's own dma-heap export included), host-pointer imports (this process's pages, pinned for the
+// GPU) and the layer's BC staging buffers. Not counted: dma-buf fd imports (the pages belong to the exporter).
+#define BUDGET_NO_HEAP 0xFFu
+static _Atomic uint64_t g_heap_usage[VK_MAX_MEMORY_HEAPS];
+static _Atomic uint64_t g_heap_peak[VK_MAX_MEMORY_HEAPS];   // only kept while the budget log runs
+static uint64_t g_heap_budget[VK_MAX_MEMORY_HEAPS];         // last reported heapBudget, for the log
+static _Atomic uint32_t g_heap_count;
+static _Atomic uint64_t g_live_allocs, g_budget_queries;
+static uint32_t g_budget_log_s; // budget log interval in s (MALI_COMPAT_GPU_TIME or MALI_COMPAT_DEBUG), 0 = off
+
+static void budget_add(uint32_t heap, uint64_t size) {
+    if (heap >= VK_MAX_MEMORY_HEAPS) return;
+    uint64_t now = atomic_fetch_add(&g_heap_usage[heap], size) + size;
+    atomic_fetch_add(&g_live_allocs, 1);
+    if (g_budget_log_s) {
+        uint64_t p = atomic_load(&g_heap_peak[heap]);
+        while (now > p && !atomic_compare_exchange_weak(&g_heap_peak[heap], &p, now)) {}
+    }
+}
+
+static void budget_sub(uint32_t heap, uint64_t size) {
+    if (heap >= VK_MAX_MEMORY_HEAPS) return;
+    atomic_fetch_sub(&g_heap_usage[heap], size);
+    atomic_fetch_sub(&g_live_allocs, 1);
+}
+
+// One line per interval: per heap live usage / reported budget (peak since start), live allocations and how often the
+// app read the budget (0 queries = the game does not stream by it, whatever the numbers say).
+static void *budget_log_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        sleep(g_budget_log_s);
+        char line[1024];
+        size_t n = 0;
+        uint32_t hc = atomic_load(&g_heap_count);
+        for (uint32_t i = 0; i < hc && i < VK_MAX_MEMORY_HEAPS && n < sizeof line; i++)
+            n += (size_t)snprintf(line + n, sizeof line - n, " heap%u %llu/%llu MiB (peak %llu)", i,
+                                  (unsigned long long)(atomic_load(&g_heap_usage[i]) >> 20),
+                                  (unsigned long long)(g_heap_budget[i] >> 20),
+                                  (unsigned long long)(atomic_load(&g_heap_peak[i]) >> 20));
+        if (n >= sizeof line) n = sizeof line - 1;
+        line[n] = '\0';
+        fprintf(stderr, "mali-compat: budget%s, %llu allocs, %llu queries\n", line,
+                (unsigned long long)atomic_load(&g_live_allocs), (unsigned long long)atomic_load(&g_budget_queries));
+    }
+    return NULL;
+}
+
 struct StagingResource {
     VkBuffer buffer;
     VkDeviceMemory memory;
     VkDeviceSize size;      // power-of-two bucket, >= STAGING_MIN
     VkDeviceAddress addr;
+    VkDeviceSize mem_size;  // accounted in g_heap_usage[heap] while memory is set
+    uint32_t heap;
 };
 
 // Decode staging buffers are pooled per device: a command buffer's buffers go back to the pool when it is begun,
@@ -767,8 +1105,16 @@ struct PushRec {
     VkPipelineLayout layout;
     VkShaderStageFlags stages;
     uint32_t offset, size;
+    uint32_t seq;                   // CmdBufData.push_seq at the last update: replay order (D3a)
+    bool v2;                        // recorded from vkCmdPushConstants2(KHR): replayed with it (pc2-restore-1)
     uint8_t data[256];
 };
+
+// pc2-restore-1 (WD2 B10-18) [keeper, Claude Opus 5.5] 2026-11-01: DXVK pushes with vkCmdPushConstants2KHR
+// (VK_KHR_maintenance6), which this layer did not hook, so the restore after a BC decode left DXVK's next compute
+// dispatch with the decoder's 56 push bytes. Both entry points now feed the PushRec list above. Cumulative counters,
+// one stderr line every 10 s once any is non-zero (pc2_log_thread).
+static _Atomic uint64_t g_pc2_v1, g_pc2_v2, g_pc2_v2_unrec, g_pc2_decodes, g_pc2_decodes_v2;
 
 // The app's compute push descriptors (vkd3d-proton pushes its root CBVs this way with MALI_COMPAT_VENDOR_ID=5143),
 // merged per binding since the last layout change, so they can be pushed again after a BC decode like the push
@@ -788,6 +1134,28 @@ struct PushDescRec {
 // tracked state above. Hash table (the first version kept 128 command buffers and leaked everything recorded in any
 // other). [Claude Opus 5.5]
 struct DeviceData;
+// GPU timing, per pass (KZ1/KZ2): draws with a depth EQUAL/no-write pipeline (eq), with depth write (dw), with a
+// VS-stage store (vsw), and the sum of vertex/index count x instance count of the direct draws (vxi).
+struct GtCnt { uint32_t eq, dw, vsw; uint64_t vxi; };
+static inline void gt_cnt_add(struct GtCnt *t, const struct GtCnt *a) {
+    t->eq += a->eq; t->dw += a->dw; t->vsw += a->vsw; t->vxi += a->vxi;
+}
+
+// desc-capture-1: one shadowed descriptor (type = VkDescriptorType + 1, 0 = never written) and the per-command-buffer
+// compute set-0 state (see "desc-capture-1" below).
+#define DC_NB 16
+struct DcDesc { uint64_t h, off, range; uint32_t type, pad; };
+struct DcCmd {
+    uint8_t kind;               // 0 nothing bound, 1 descriptor set, 2 push descriptors (set 0, compute)
+    uint16_t dyn_mask;          // bindings with a dynamic offset from the last bind
+    uint64_t set0, bind_seq;    // bound set, descriptor write sequence at the bind
+    uint32_t dyn[DC_NB];
+    struct DcDesc push[DC_NB];
+    uint32_t ndisp;             // captured dispatches since begin
+    uint64_t first_seq, last_seq;
+};
+struct DcFns;
+
 struct CmdBufData {
     VkCommandBuffer cmdbuf;
     struct DeviceData *dev;
@@ -797,14 +1165,26 @@ struct CmdBufData {
     uint32_t staging_capacity;
     VkPipeline compute_pipeline;    // last app compute pipeline, VK_NULL_HANDLE if none since begin
     bool descriptor_buffers;        // vkCmdBindDescriptorBuffersEXT was recorded since begin
-    uint32_t push_count;            // records in push[], oldest first
+    uint32_t push_count;            // records in push[], unordered; replay in seq order (D3a)
+    uint32_t push_seq;              // last seq handed out since begin
+    bool push_untracked;            // push constants were recorded before the first BC image (D3b): restore incomplete
     struct PushRec push[PUSH_RECS];
     struct PushDescRec cpd;         // compute push descriptors, layout VK_NULL_HANDLE if none since begin
     struct PushDescRec gpd;         // graphics push descriptors (full pushes, see compat_CmdPushDescriptorSetKHR)
     VkPipeline gfx_pipeline;        // last app graphics pipeline (GPU timing)
+    uint16_t gfx_flags;             // its PF_* flags (GPU timing only)
+    uint8_t dyn_depth;              // K-DW: DD_* depth test / write / EQUAL as last set dynamically in this cmd buffer
     int32_t gt_rec;                 // GPU timing record of the open render pass, -1 if none
+    bool gt_susp;                   // the open pass instance suspends: gt_rec stays open for the resuming part (K4)
     VkImageView gt_src;             // first image view of the last push-descriptor write (GPU timing details)
+    // GPU timing: draws recorded without an open pass record (secondary command buffers: DXVK's tiler mode), handed
+    // to the primary's pass at vkCmdExecuteCommands. First draw's pipeline, counts and source view.
+    uint32_t gt_sdraws, gt_svcount, gt_sicount;
+    struct GtCnt gt_scnt;           // and their eq/dw/vsw/vxi counters
+    VkPipeline gt_spipe;
+    VkImageView gt_ssrc;
     bool async_skip;                // the bound graphics pipeline is still compiling (MALI_COMPAT_ASYNC_PSO)
+    struct DcCmd dc;                // desc-capture-1 (MALI_COMPAT_DESC_CAPTURE)
     struct CmdBufData *next;
 };
 
@@ -858,6 +1238,8 @@ struct DeviceData {
     PFN_vkGetBufferDeviceAddress fpGetBufferDeviceAddress;
     PFN_vkCmdBindPipeline fpCmdBindPipeline;
     PFN_vkCmdPushConstants fpCmdPushConstants;
+    PFN_vkCmdPushConstants2 fpCmdPushConstants2;       // driver's, NULL if it lacks the name (pc2-restore-1)
+    PFN_vkCmdPushConstants2KHR fpCmdPushConstants2KHR;
     PFN_vkCmdDispatch fpCmdDispatch;
     PFN_vkCmdPipelineBarrier fpCmdPipelineBarrier;
     PFN_vkCmdCopyBufferToImage fpCmdCopyBufferToImage;
@@ -876,6 +1258,7 @@ struct DeviceData {
     PFN_vkInvalidateMappedMemoryRanges fpInvalidateMappedMemoryRanges;
     uint32_t coherent_types; // memory types with HOST_COHERENT
     uint8_t coherent_remap[VK_MAX_MEMORY_TYPES]; // MALI_COMPAT_FORCE_COHERENT: non-coherent host type -> coherent type + 1 (0 = none)
+    uint8_t type_heap[VK_MAX_MEMORY_TYPES]; // memory type -> heap index for the budget (BUDGET_NO_HEAP = not counted)
     PFN_vkGetImageSubresourceLayout2KHR fpGetImageSubresourceLayout2KHR; // only with g_log_images
 
     // BC compute decoder resources
@@ -892,8 +1275,13 @@ struct DeviceData {
     bool afrc; // VK_EXT_image_compression_control enabled by the layer for the BC shadows
     bool zero_divisor_emulated; // divisor 0 -> UINT32_MAX (the vendor lacks vertexAttributeInstanceRateZeroDivisor)
     PFN_vkCmdSetVertexInputEXT fpCmdSetVertexInputEXT;
+    PFN_vkCmdSetDepthCompareOp fpCmdSetDepthCompareOp; // MALI_COMPAT_DEPTH_EQUAL / GT_DYNDEPTH only
+    PFN_vkCmdSetDepthTestEnable fpCmdSetDepthTestEnable;   // MALI_COMPAT_GT_DYNDEPTH only
+    PFN_vkCmdSetDepthWriteEnable fpCmdSetDepthWriteEnable; // MALI_COMPAT_GT_DYNDEPTH only
     PFN_vkCreateComputePipelines fpCreateComputePipelinesReal; // for the GPU timing's pipeline hashes
     struct GpuTime *gt; // MALI_COMPAT_GPU_TIME
+    struct DcFns *dcf;  // desc-capture-1 driver entry points, NULL when off
+    PFN_vkGetDeviceMemoryOpaqueCaptureAddress fpGetDeviceMemoryOpaqueCaptureAddress; // desc-capture-1 only
 };
 
 #define MAX_INSTANCES 32
@@ -942,64 +1330,80 @@ static struct InstanceData *get_instance_by_phys_dev(VkPhysicalDevice phys_dev) 
     return fallback;
 }
 
+// D1 (perf review P3), [keeper, Claude Opus 5.5] 2026-10-31: a per-thread cache of the last dispatch-key lookup, so
+// the hot hooks stop taking g_table_mutex. g_devices[] entries move on destroy (compaction), so the cache is only used
+// while g_device_gen is unchanged; both writers (compat_CreateDevice, compat_DestroyDevice) bump it under
+// g_table_mutex after changing the array. Only exact key hits are cached, never the fallback (last device).
+static _Atomic uint64_t g_device_gen;
+static __thread void *tl_dev_key;
+static __thread struct DeviceData *tl_dev;
+static __thread uint64_t tl_dev_gen;
+
+// Caller holds g_table_mutex. The newest device with this dispatch key, NULL if none.
+static struct DeviceData *device_by_key_locked(void *key) {
+    for (int32_t i = (int32_t)g_device_count - 1; key && i >= 0; i--)
+        if (g_devices[i].dispatch_key == key) return &g_devices[i];
+    return NULL;
+}
+
 static struct DeviceData *get_device_data(VkDevice dev) {
-    pthread_mutex_lock(&g_table_mutex);
-    for (int32_t i = (int32_t)g_device_count - 1; i >= 0; i--) {
-        if (g_devices[i].device == dev) {
-            pthread_mutex_unlock(&g_table_mutex);
-            return &g_devices[i];
-        }
-    }
     void *key = dev ? *(void **)dev : NULL;
-    if (key) {
-        for (int32_t i = (int32_t)g_device_count - 1; i >= 0; i--) {
-            if (g_devices[i].dispatch_key == key) {
-                pthread_mutex_unlock(&g_table_mutex);
-                return &g_devices[i];
-            }
-        }
-    }
+    uint64_t gen = atomic_load_explicit(&g_device_gen, memory_order_acquire);
+    // A cached key hit whose handle matches is what the handle scan below would return: a later entry with the same
+    // handle would also carry the same key, and the cached entry is the newest one with that key.
+    if (key && tl_dev_key == key && tl_dev_gen == gen && tl_dev && tl_dev->device == dev) return tl_dev;
+    pthread_mutex_lock(&g_table_mutex);
+    struct DeviceData *found = NULL;
+    for (int32_t i = (int32_t)g_device_count - 1; i >= 0 && !found; i--)
+        if (g_devices[i].device == dev) found = &g_devices[i];
+    struct DeviceData *by_key = device_by_key_locked(key);
     struct DeviceData *fallback = g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
     pthread_mutex_unlock(&g_table_mutex);
-    return fallback;
+    if (by_key) { tl_dev_key = key; tl_dev = by_key; tl_dev_gen = gen; }
+    return found ? found : by_key ? by_key : fallback;
 }
 
 static struct DeviceData *get_device_data_by_cmd(VkCommandBuffer cmd) {
-    pthread_mutex_lock(&g_table_mutex);
     void *key = cmd ? *(void **)cmd : NULL;
-    if (key) {
-        for (int32_t i = (int32_t)g_device_count - 1; i >= 0; i--) {
-            if (g_devices[i].dispatch_key == key) {
-                pthread_mutex_unlock(&g_table_mutex);
-                return &g_devices[i];
-            }
-        }
-    }
+    uint64_t gen = atomic_load_explicit(&g_device_gen, memory_order_acquire);
+    if (key && tl_dev_key == key && tl_dev_gen == gen && tl_dev) return tl_dev;
+    pthread_mutex_lock(&g_table_mutex);
+    struct DeviceData *by_key = device_by_key_locked(key);
     struct DeviceData *fallback = g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
     pthread_mutex_unlock(&g_table_mutex);
-    return fallback;
+    if (by_key) { tl_dev_key = key; tl_dev = by_key; tl_dev_gen = gen; }
+    return by_key ? by_key : fallback;
 }
 
-static struct DeviceData *get_device_data_by_cmd(VkCommandBuffer cmd);
-
 // The command buffer's entry, created on first use. The command buffer is externally synchronized, so the fields are
-// only touched by the thread recording it; the table itself is under g_cmdbuf_mutex.
+// only touched by the thread recording it; the table itself is under g_cmdbuf_mutex. The device is resolved only when
+// the entry has to be created (D1), outside g_cmdbuf_mutex; the chain is searched again before the insert.
 static struct CmdBufData *cmd_data(VkCommandBuffer cmd) {
     uint64_t gen = atomic_load_explicit(&g_cmdbuf_gen, memory_order_acquire);
     if (tl_cmd == cmd && tl_cmd_gen == gen && tl_cmd_data) return tl_cmd_data;
-    struct DeviceData *dev = get_device_data_by_cmd(cmd);
-    pthread_mutex_lock(&g_cmdbuf_mutex);
     uint32_t bkt = handle_bucket((uint64_t)(uintptr_t)cmd, CMDBUF_BUCKETS);
+    pthread_mutex_lock(&g_cmdbuf_mutex);
     struct CmdBufData *entry = g_cmdbufs[bkt];
     while (entry && entry->cmdbuf != cmd) entry = entry->next;
-    if (!entry && (entry = calloc(1, sizeof *entry))) {
-        entry->cmdbuf = cmd;
-        entry->dev = dev;
-        entry->gt_rec = -1;
-        entry->next = g_cmdbufs[bkt];
-        g_cmdbufs[bkt] = entry;
-    }
     pthread_mutex_unlock(&g_cmdbuf_mutex);
+    if (!entry) {
+        struct DeviceData *dev = get_device_data_by_cmd(cmd);
+        struct CmdBufData *fresh = calloc(1, sizeof *fresh);
+        pthread_mutex_lock(&g_cmdbuf_mutex);
+        entry = g_cmdbufs[bkt];
+        while (entry && entry->cmdbuf != cmd) entry = entry->next;
+        if (!entry && (entry = fresh)) {
+            fresh = NULL;
+            entry->cmdbuf = cmd;
+            entry->dev = dev;
+            entry->gt_rec = -1;
+            entry->gt_susp = false;
+            entry->next = g_cmdbufs[bkt];
+            g_cmdbufs[bkt] = entry;
+        }
+        pthread_mutex_unlock(&g_cmdbuf_mutex);
+        free(fresh); // another thread inserted the same command buffer meanwhile (or calloc failed: NULL)
+    }
     tl_cmd = cmd;
     tl_cmd_data = entry;
     tl_cmd_gen = gen;
@@ -1017,9 +1421,1004 @@ static void add_staging_resource(VkCommandBuffer cmd, struct StagingResource res
         entry->staging_resources[entry->staging_count++] = res;
 }
 
+// -----------------------------------------------------------------------------
+// desc-capture-1 [keeper, Claude Opus 5.5] 2026-11-01 (WD2 B10-19). Off unless MALI_COMPAT_DESC_CAPTURE=<cs hashes>
+// (hex, comma separated: the FNV-1a hash of the compute shader's SPIR-V = the GPU_TIME "cs:" hash). For every
+// vkCmdDispatch* recorded with one of those compute pipelines bound, one X row lists each written set-0 binding
+// (bindings 0..DC_NB-1, array element 0) resolved down to buffer device address, view offset/range/format, buffer size
+// and memory, as ids of B rows (identical binding tuples are written once). Object and descriptor state is shadowed
+// from the create/bind/update/push/destroy entry points; D rows log the destroy/free/reset of every object that was
+// ever part of a captured dispatch, W rows the first rewrite of a captured set, S rows the submit of a command buffer
+// with captured dispatches, F rows the fence/timeline wait that saw it done (GPU_TIME wait hooks only).
+// File MALI_COMPAT_DESC_CAPTURE_FILE (default /root/mali-desc-<pid>.tsv), own fd, whole lines only, flushed every
+// 100 ms and at each captured submit, cap MALI_COMPAT_DESC_CAPTURE_MB (default 512) then a TRUNC row and stop.
+// Times: CLOCK_REALTIME ms with us decimals (logcat alignment). Counters every 10 s on stderr ("mali-compat: desc:").
+// -----------------------------------------------------------------------------
+#define DC_HASH_MAX 16
+#define DC_BUCKETS (1u << 16)
+#define DC_DEDUP (1u << 18)
+#define DC_BUF (256u << 10) // output buffer
+static bool g_dc_on;
+static uint32_t g_dc_hashes[DC_HASH_MAX], g_dc_hash_count;
+static pthread_mutex_t g_dc_m = PTHREAD_MUTEX_INITIALIZER;   // object tables, sequence numbers
+static pthread_mutex_t g_dc_fm = PTHREAD_MUTEX_INITIALIZER;  // output buffer
+static int g_dc_fd = -1;
+static char *g_dc_buf;
+static size_t g_dc_len;
+static uint64_t g_dc_bytes, g_dc_cap = 512ull << 20;
+static bool g_dc_stopped;
+static char g_dc_path[300];
+static uint64_t g_dc_seq;      // dispatch / bind sequence (g_dc_m)
+static uint64_t g_dc_wseq;     // descriptor write sequence (g_dc_m)
+static uint32_t g_dc_next_bid; // binding tuple ids (g_dc_m)
+struct DcDedup { uint64_t key; uint32_t id; };
+static struct DcDedup *g_dc_dedup;
+static uint32_t g_dc_dedup_n;
+
+enum { DCC_UPD, DCC_UPD_W, DCC_UPD_C, DCC_UPD_TPL, DCC_BIND, DCC_BIND2, DCC_PUSH, DCC_PUSH2, DCC_PUSH_TPL, DCC_PUSH_TPL2,
+       DCC_SET_ALLOC, DCC_SET_FREE, DCC_POOL_RESET, DCC_POOL_DESTROY, DCC_TPL, DCC_DSL, DCC_PL, DCC_BUF, DCC_BUF_BDA,
+       DCC_BUF_BIND, DCC_VIEW, DCC_MEM, DCC_PIPE, DCC_DISP, DCC_DISP_ALL, DCC_SUBMIT, DCC_DONE, DCC_D, DCC_W, DCC_N };
+static const char *const g_dcc_name[DCC_N] = {
+    "upd", "upd-writes", "upd-copies", "upd-tpl", "bind", "bind2", "push", "push2", "push-tpl", "push-tpl2",
+    "set-alloc", "set-free", "pool-reset", "pool-destroy", "tpl", "dsl", "pl", "buf", "buf-bda", "buf-bind", "view",
+    "mem", "cap-pipes", "cap-disp", "disp", "cap-submits", "cap-done", "D", "W"};
+static _Atomic uint64_t g_dcc[DCC_N];
+#define DCC(i) atomic_fetch_add_explicit(&g_dcc[i], 1, memory_order_relaxed)
+
+enum { DCK_BUF = 1, DCK_MEM, DCK_VIEW, DCK_TPL, DCK_DSL, DCK_PL, DCK_SET, DCK_POOL, DCK_PIPE };
+struct DcTplEntry { uint32_t binding, elem, count, type; size_t offset, stride; };
+struct DcObj {
+    uint64_t h;
+    struct DcObj *next;
+    uint8_t kind;
+    bool dead, cap;     // cap: part of a captured dispatch (destroy/free gets a D row)
+    double t0, t_dead;  // create / destroy time (ms, realtime)
+    union {
+        struct { uint64_t size, usage, mem, memoff, va; uint8_t va_kind; double t_bind; } buf; // va_kind 0 none, 1 BDA, 2 memory capture address + offset
+        struct { uint64_t size, mva; uint32_t type; } mem;
+        struct { uint64_t buffer, offset, range; uint32_t format; } view;
+        struct { struct DcTplEntry *e; uint32_t n, type, bp, set; uint64_t layout; } tpl;
+        struct { uint8_t type[DC_NB]; uint32_t count[DC_NB]; uint16_t present; uint32_t ndyn; } dsl;
+        struct { uint64_t sl[8]; uint32_t n; } pl;
+        struct { uint64_t pool, layout, last_cap_seq, wseq; struct DcDesc *b; bool used_cap; } set;
+        struct { uint64_t *sets; uint32_t n, cap; } pool;
+        struct { uint32_t hash; uint64_t layout; } pipe;
+    } u;
+};
+static struct DcObj **g_dc_tab;
+
+static double dc_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+static uint32_t dc_bucket(uint8_t kind, uint64_t h) {
+    uint64_t v = h * 0x9E3779B97F4A7C15ull ^ kind;
+    return (uint32_t)((v ^ (v >> 29) ^ (v >> 47)) & (DC_BUCKETS - 1));
+}
+// g_dc_m held. create: a new entry when missing (zeroed apart from h/kind/t0).
+static struct DcObj *dc_get(uint8_t kind, uint64_t h, bool create) {
+    if (!g_dc_tab || !h) return NULL;
+    uint32_t b = dc_bucket(kind, h);
+    for (struct DcObj *o = g_dc_tab[b]; o; o = o->next)
+        if (o->h == h && o->kind == kind) return o;
+    if (!create) return NULL;
+    struct DcObj *o = calloc(1, sizeof *o);
+    if (!o) return NULL;
+    o->h = h; o->kind = kind; o->t0 = dc_now();
+    o->next = g_dc_tab[b];
+    g_dc_tab[b] = o;
+    return o;
+}
+// A create that reuses a handle: drop the old state (keep the node).
+static struct DcObj *dc_fresh(uint8_t kind, uint64_t h) {
+    struct DcObj *o = dc_get(kind, h, true);
+    if (!o) return NULL;
+    if (kind == DCK_TPL) free(o->u.tpl.e);
+    if (kind == DCK_POOL) free(o->u.pool.sets);
+    struct DcDesc *keep = kind == DCK_SET ? o->u.set.b : NULL;
+    struct DcObj *next = o->next;
+    memset(o, 0, sizeof *o);
+    o->h = h; o->kind = kind; o->t0 = dc_now(); o->next = next;
+    if (kind == DCK_SET) { o->u.set.b = keep ? keep : calloc(DC_NB, sizeof *keep); if (keep) memset(keep, 0, DC_NB * sizeof *keep); }
+    return o;
+}
+
+// ---- output
+static void dc_flush_locked(void) {
+    size_t off = 0;
+    while (g_dc_fd >= 0 && off < g_dc_len) {
+        ssize_t w = write(g_dc_fd, g_dc_buf + off, g_dc_len - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    g_dc_len = 0;
+}
+static void dc_out(const char *line, size_t n) {
+    pthread_mutex_lock(&g_dc_fm);
+    if (!g_dc_stopped && g_dc_buf && n < DC_BUF) {
+        if (g_dc_bytes + n > g_dc_cap) {
+            char t[96];
+            int k = snprintf(t, sizeof t, "TRUNC\t%.3f\t%llu\n", dc_now(), (unsigned long long)g_dc_bytes);
+            if (g_dc_len + (size_t)k > DC_BUF) dc_flush_locked();
+            memcpy(g_dc_buf + g_dc_len, t, (size_t)k);
+            g_dc_len += (size_t)k;
+            dc_flush_locked();
+            g_dc_stopped = true;
+            close(g_dc_fd);
+            g_dc_fd = -1;
+        } else {
+            if (g_dc_len + n > DC_BUF) dc_flush_locked();
+            memcpy(g_dc_buf + g_dc_len, line, n);
+            g_dc_len += n;
+            g_dc_bytes += n;
+        }
+    }
+    pthread_mutex_unlock(&g_dc_fm);
+}
+static void dc_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void dc_printf(const char *fmt, ...) {
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n > 0) dc_out(line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
+}
+static void dc_flush(void) {
+    pthread_mutex_lock(&g_dc_fm);
+    if (g_dc_buf) dc_flush_locked();
+    pthread_mutex_unlock(&g_dc_fm);
+}
+static void *dc_thread(void *arg) {
+    (void)arg;
+    uint64_t last[DCC_N] = {0};
+    for (uint32_t tick = 1;; tick++) {
+        usleep(100000);
+        dc_flush();
+        if (tick % 100) continue;
+        uint64_t v[DCC_N];
+        bool any = false, changed = false;
+        for (int i = 0; i < DCC_N; i++) { v[i] = atomic_load(&g_dcc[i]); any |= v[i] != 0; changed |= v[i] != last[i]; }
+        if (!any || !changed) continue;
+        memcpy(last, v, sizeof last);
+        char s[1200];
+        size_t k = (size_t)snprintf(s, sizeof s, "mali-compat: desc:");
+        for (int i = 0; i < DCC_N && k < sizeof s; i++)
+            k += (size_t)snprintf(s + k, sizeof s - k, " %s %llu%s", g_dcc_name[i], (unsigned long long)v[i], i + 1 < DCC_N ? "," : "");
+        pthread_mutex_lock(&g_dc_fm);
+        uint64_t bytes = g_dc_bytes;
+        bool trunc = g_dc_stopped;
+        pthread_mutex_unlock(&g_dc_fm);
+        if (k < sizeof s) snprintf(s + k, sizeof s - k, ", file %llu KiB%s", (unsigned long long)(bytes >> 10), trunc ? " TRUNC" : "");
+        fprintf(stderr, "%s\n", s);
+    }
+    return NULL;
+}
+
+// Once per process (vkCreateInstance and vkCreateDevice both call it): parse the env, open the file.
+static pthread_once_t g_dc_once = PTHREAD_ONCE_INIT;
+static void dc_init_impl(void) {
+    const char *h = getenv("MALI_COMPAT_DESC_CAPTURE");
+    for (; h && *h && g_dc_hash_count < DC_HASH_MAX;) {
+        char *end;
+        unsigned long v = strtoul(h, &end, 16);
+        if (end == h) break;
+        g_dc_hashes[g_dc_hash_count++] = (uint32_t)v;
+        h = *end == ',' ? end + 1 : end;
+    }
+    if (!g_dc_hash_count) return;
+    const char *mb = getenv("MALI_COMPAT_DESC_CAPTURE_MB");
+    if (mb && strtoull(mb, NULL, 10)) g_dc_cap = strtoull(mb, NULL, 10) << 20;
+    const char *f = getenv("MALI_COMPAT_DESC_CAPTURE_FILE");
+    if (f && *f) snprintf(g_dc_path, sizeof g_dc_path, "%s", f);
+    else snprintf(g_dc_path, sizeof g_dc_path, "/root/mali-desc-%d.tsv", (int)getpid());
+    g_dc_tab = calloc(DC_BUCKETS, sizeof *g_dc_tab);
+    g_dc_dedup = calloc(DC_DEDUP, sizeof *g_dc_dedup);
+    g_dc_buf = malloc(DC_BUF);
+    g_dc_fd = g_dc_tab && g_dc_dedup && g_dc_buf ? open(g_dc_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644) : -1;
+    if (g_dc_fd < 0) {
+        fprintf(stderr, "mali-compat: desc-capture-1: cannot open %s: %s (capture off)\n", g_dc_path, strerror(errno));
+        return;
+    }
+    g_dc_on = true;
+    char comm[32] = "unknown";
+    FILE *cf = fopen("/proc/self/comm", "r");
+    if (cf) { if (fgets(comm, sizeof comm, cf)) comm[strcspn(comm, "\n")] = 0; fclose(cf); }
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char hs[DC_HASH_MAX * 9 + 1] = "";
+    for (uint32_t i = 0; i < g_dc_hash_count; i++)
+        snprintf(hs + strlen(hs), sizeof hs - strlen(hs), "%s%08x", i ? "," : "", g_dc_hashes[i]);
+    dc_printf("# mali-compat desc-capture-1 pid %d comm %s start_ms %.3f tz_min %ld hashes %s cap %llu MiB nb %d\n",
+              (int)getpid(), comm, dc_now(), (long)(tm.tm_gmtoff / 60), hs, (unsigned long long)(g_dc_cap >> 20), DC_NB);
+    dc_printf("# P t_ms pipeline hash layout | X t_ms seq cmdbuf hash gx gy gz src(set|push|none) set set_flags bindings(b=id ...)\n"
+              "# B id binding type handle buffer va off range lo hi format bufsize mem memsize memoff buf_t mem_t flags\n"
+              "# S t_ms queue cmdbuf first_seq last_seq ndisp fence sem:value | F t_ms fence|sem handle value first_seq last_seq\n"
+              "# D t_ms kind handle info | W t_ms set last_cap_seq\n");
+    atexit(dc_flush);
+    pthread_t t;
+    if (pthread_create(&t, NULL, dc_thread, NULL) == 0) pthread_detach(t);
+}
+static void dc_init(void) { pthread_once(&g_dc_once, dc_init_impl); }
+
+static bool dc_hash_wanted(uint32_t hash) {
+    for (uint32_t i = 0; i < g_dc_hash_count; i++)
+        if (g_dc_hashes[i] == hash) return true;
+    return false;
+}
+
+// ---- object tables
+static void dc_buf_create(struct DeviceData *d, VkBuffer b, const VkBufferCreateInfo *ci) {
+    (void)d;
+    DCC(DCC_BUF);
+    if (ci->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) DCC(DCC_BUF_BDA);
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = dc_fresh(DCK_BUF, (uint64_t)b);
+    if (o) { o->u.buf.size = ci->size; o->u.buf.usage = ci->usage; }
+    pthread_mutex_unlock(&g_dc_m);
+}
+static void dc_buf_bind(struct DeviceData *d, VkDevice dev, VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
+    DCC(DCC_BUF_BIND);
+    uint64_t va = 0;
+    uint8_t kind = 0;
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = dc_get(DCK_BUF, (uint64_t)b, false);
+    bool bda = o && (o->u.buf.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    struct DcObj *mo = dc_get(DCK_MEM, (uint64_t)m, false);
+    uint64_t mva = mo ? mo->u.mem.mva : 0;
+    pthread_mutex_unlock(&g_dc_m);
+    if (bda && d->fpGetBufferDeviceAddress) {
+        VkBufferDeviceAddressInfo bi = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, b};
+        va = d->fpGetBufferDeviceAddress(dev, &bi);
+        kind = va ? 1 : 0;
+    }
+    if (!va && mva) { va = mva + off; kind = 2; }
+    pthread_mutex_lock(&g_dc_m);
+    if ((o = dc_get(DCK_BUF, (uint64_t)b, false))) {
+        o->u.buf.mem = (uint64_t)m; o->u.buf.memoff = off; o->u.buf.va = va; o->u.buf.va_kind = kind; o->u.buf.t_bind = dc_now();
+    }
+    pthread_mutex_unlock(&g_dc_m);
+}
+// The capture address only for allocations with DEVICE_ADDRESS_BIT (valid usage); buffers without BDA usage get
+// VA = that address + bind offset (flag VAM).
+static bool dc_mem_devaddr(const void *chain) {
+    const VkMemoryAllocateFlagsInfo *f = find_struct(chain, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
+    return f && (f->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT);
+}
+static void dc_mem_alloc(struct DeviceData *d, VkDevice dev, VkDeviceMemory m, VkDeviceSize size, uint32_t type, bool devaddr) {
+    DCC(DCC_MEM);
+    uint64_t mva = 0;
+    if (devaddr && d->fpGetDeviceMemoryOpaqueCaptureAddress) {
+        VkDeviceMemoryOpaqueCaptureAddressInfo ci = {VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO, NULL, m};
+        mva = d->fpGetDeviceMemoryOpaqueCaptureAddress(dev, &ci);
+    }
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = dc_fresh(DCK_MEM, (uint64_t)m);
+    if (o) { o->u.mem.size = size; o->u.mem.type = type; o->u.mem.mva = mva; }
+    pthread_mutex_unlock(&g_dc_m);
+}
+// Destroy/free of a buffer, memory or view: D row when it was part of a captured dispatch.
+static void dc_dead(uint8_t kind, uint64_t h) {
+    if (!h) return;
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = dc_get(kind, h, false);
+    bool log = o && o->cap && !o->dead;
+    if (o) { o->dead = true; o->t_dead = dc_now(); }
+    double t = o ? o->t_dead : 0;
+    pthread_mutex_unlock(&g_dc_m);
+    if (log) {
+        DCC(DCC_D);
+        dc_printf("D\t%.3f\t%s\t0x%llx\t-\n", t, kind == DCK_BUF ? "buf" : kind == DCK_MEM ? "mem" : "view", (unsigned long long)h);
+    }
+}
+static void dc_view_create(VkBufferView v, const VkBufferViewCreateInfo *ci) {
+    DCC(DCC_VIEW);
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = dc_fresh(DCK_VIEW, (uint64_t)v);
+    if (o) { o->u.view.buffer = (uint64_t)ci->buffer; o->u.view.offset = ci->offset; o->u.view.range = ci->range; o->u.view.format = ci->format; }
+    pthread_mutex_unlock(&g_dc_m);
+}
+static void dc_pipe_create(VkPipeline p, uint32_t hash, VkPipelineLayout layout) {
+    bool want = dc_hash_wanted(hash);
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = want ? dc_fresh(DCK_PIPE, (uint64_t)p) : dc_get(DCK_PIPE, (uint64_t)p, false);
+    if (o && want) { o->u.pipe.hash = hash; o->u.pipe.layout = (uint64_t)layout; }
+    else if (o) o->dead = true; // handle reused by a pipeline that is not captured
+    pthread_mutex_unlock(&g_dc_m);
+    if (want) {
+        DCC(DCC_PIPE);
+        dc_printf("P\t%.3f\t0x%llx\t%08x\t0x%llx\n", dc_now(), (unsigned long long)(uint64_t)p, hash, (unsigned long long)(uint64_t)layout);
+    }
+}
+
+// ---- descriptor writes into a shadow (set or push), element 0 of bindings < DC_NB. g_dc_m held.
+static bool dc_is_dyn(uint32_t t) {
+    return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+}
+static bool dc_is_buf(uint32_t t) {
+    return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || dc_is_dyn(t);
+}
+static bool dc_is_texel(uint32_t t) {
+    return t == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+}
+static bool dc_is_img(uint32_t t) {
+    return t == VK_DESCRIPTOR_TYPE_SAMPLER || t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+           t == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+}
+static uint32_t dc_bcount(const struct DcObj *dsl, uint32_t b) {
+    if (dsl && b < DC_NB && (dsl->u.dsl.present >> b & 1)) return dsl->u.dsl.count[b] ? dsl->u.dsl.count[b] : 1;
+    return 1;
+}
+// count descriptors from base (stride apart) into (binding, elem) on, rolling over to the next binding (spec rule).
+static void dc_put(struct DcDesc *sh, const struct DcObj *dsl, uint32_t binding, uint32_t elem, uint32_t count,
+                   uint32_t type, const uint8_t *base, size_t stride) {
+    if (!sh || !base || type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) return;
+    for (uint32_t i = 0; i < count && binding < DC_NB; i++, elem++) {
+        while (binding < DC_NB && elem >= dc_bcount(dsl, binding)) { elem -= dc_bcount(dsl, binding); binding++; }
+        if (binding >= DC_NB) break;
+        if (elem) continue;
+        const uint8_t *p = base + i * stride;
+        struct DcDesc *d = &sh[binding];
+        memset(d, 0, sizeof *d);
+        d->type = type + 1;
+        if (dc_is_buf(type)) {
+            const VkDescriptorBufferInfo *bi = (const void *)p;
+            d->h = (uint64_t)bi->buffer; d->off = bi->offset; d->range = bi->range;
+        } else if (dc_is_texel(type)) {
+            d->h = (uint64_t)*(const VkBufferView *)p;
+        } else if (dc_is_img(type)) {
+            const VkDescriptorImageInfo *ii = (const void *)p;
+            d->h = type == VK_DESCRIPTOR_TYPE_SAMPLER ? (uint64_t)ii->sampler : (uint64_t)ii->imageView;
+        } else {
+            d->h = *(const uint64_t *)p; // acceleration structure etc.: handle only
+        }
+    }
+}
+static void dc_put_write(struct DcDesc *sh, const struct DcObj *dsl, const VkWriteDescriptorSet *w) {
+    const void *base = dc_is_buf(w->descriptorType) ? (const void *)w->pBufferInfo
+                     : dc_is_texel(w->descriptorType) ? (const void *)w->pTexelBufferView
+                     : dc_is_img(w->descriptorType) ? (const void *)w->pImageInfo : NULL;
+    size_t stride = dc_is_buf(w->descriptorType) ? sizeof(VkDescriptorBufferInfo)
+                  : dc_is_texel(w->descriptorType) ? sizeof(VkBufferView) : sizeof(VkDescriptorImageInfo);
+    dc_put(sh, dsl, w->dstBinding, w->dstArrayElement, w->descriptorCount, w->descriptorType, base, stride);
+}
+static void dc_put_tpl(struct DcDesc *sh, const struct DcObj *dsl, const struct DcObj *tpl, const void *data) {
+    for (uint32_t i = 0; tpl && data && i < tpl->u.tpl.n; i++) {
+        const struct DcTplEntry *e = &tpl->u.tpl.e[i];
+        dc_put(sh, dsl, e->binding, e->elem, e->count, e->type, (const uint8_t *)data + e->offset, e->stride);
+    }
+}
+// Set about to be written: W row on the first write after a captured use. g_dc_m held; returns true for a W row.
+static bool dc_set_touch(struct DcObj *s, double *t, uint64_t *seq) {
+    s->u.set.wseq = ++g_dc_wseq;
+    if (!s->u.set.used_cap) return false;
+    s->u.set.used_cap = false;
+    *t = dc_now();
+    *seq = s->u.set.last_cap_seq;
+    return true;
+}
+static const struct DcObj *dc_set_dsl(const struct DcObj *s) {
+    return s ? dc_get(DCK_DSL, s->u.set.layout, false) : NULL;
+}
+static void dc_update_sets(uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) {
+    DCC(DCC_UPD);
+    uint64_t wset[8], wseq[8];
+    double wt[8];
+    uint32_t nW = 0;
+    pthread_mutex_lock(&g_dc_m);
+    for (uint32_t i = 0; i < nw; i++) {
+        DCC(DCC_UPD_W);
+        struct DcObj *s = dc_get(DCK_SET, (uint64_t)w[i].dstSet, false);
+        if (!s || !s->u.set.b) continue;
+        if (dc_set_touch(s, &wt[nW < 8 ? nW : 7], &wseq[nW < 8 ? nW : 7]) && nW < 8) wset[nW++] = s->h;
+        dc_put_write(s->u.set.b, dc_set_dsl(s), &w[i]);
+    }
+    for (uint32_t i = 0; i < nc; i++) {
+        DCC(DCC_UPD_C);
+        struct DcObj *src = dc_get(DCK_SET, (uint64_t)c[i].srcSet, false), *dst = dc_get(DCK_SET, (uint64_t)c[i].dstSet, false);
+        if (!src || !dst || !src->u.set.b || !dst->u.set.b) continue;
+        if (dc_set_touch(dst, &wt[nW < 8 ? nW : 7], &wseq[nW < 8 ? nW : 7]) && nW < 8) wset[nW++] = dst->h;
+        for (uint32_t k = 0; k < c[i].descriptorCount; k++) {
+            uint32_t sb = c[i].srcBinding + k, db = c[i].dstBinding + k; // element 0, one per binding (approximation)
+            if (c[i].srcArrayElement || c[i].dstArrayElement || sb >= DC_NB || db >= DC_NB) break;
+            dst->u.set.b[db] = src->u.set.b[sb];
+        }
+    }
+    pthread_mutex_unlock(&g_dc_m);
+    for (uint32_t i = 0; i < nW; i++) {
+        DCC(DCC_W);
+        dc_printf("W\t%.3f\t0x%llx\t%llu\n", wt[i], (unsigned long long)wset[i], (unsigned long long)wseq[i]);
+    }
+}
+static void dc_update_tpl(VkDescriptorSet set, VkDescriptorUpdateTemplate tpl, const void *data) {
+    DCC(DCC_UPD_TPL);
+    double t = 0;
+    uint64_t seq = 0;
+    bool w = false;
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *s = dc_get(DCK_SET, (uint64_t)set, false), *to = dc_get(DCK_TPL, (uint64_t)tpl, false);
+    if (s && s->u.set.b) {
+        w = dc_set_touch(s, &t, &seq);
+        dc_put_tpl(s->u.set.b, dc_set_dsl(s), to, data);
+    }
+    pthread_mutex_unlock(&g_dc_m);
+    if (w) {
+        DCC(DCC_W);
+        dc_printf("W\t%.3f\t0x%llx\t%llu\n", t, (unsigned long long)(uint64_t)set, (unsigned long long)seq);
+    }
+}
+static void dc_tpl_create(VkDescriptorUpdateTemplate t, const VkDescriptorUpdateTemplateCreateInfo *ci) {
+    DCC(DCC_TPL);
+    struct DcTplEntry *e = calloc(ci->descriptorUpdateEntryCount ? ci->descriptorUpdateEntryCount : 1, sizeof *e);
+    for (uint32_t i = 0; e && i < ci->descriptorUpdateEntryCount; i++) {
+        const VkDescriptorUpdateTemplateEntry *s = &ci->pDescriptorUpdateEntries[i];
+        e[i] = (struct DcTplEntry){s->dstBinding, s->dstArrayElement, s->descriptorCount, s->descriptorType, s->offset, s->stride};
+    }
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = dc_fresh(DCK_TPL, (uint64_t)t);
+    if (o) {
+        o->u.tpl.e = e; o->u.tpl.n = e ? ci->descriptorUpdateEntryCount : 0; o->u.tpl.type = ci->templateType;
+        o->u.tpl.bp = ci->pipelineBindPoint; o->u.tpl.set = ci->set; o->u.tpl.layout = (uint64_t)ci->pipelineLayout;
+    } else free(e);
+    pthread_mutex_unlock(&g_dc_m);
+}
+static void dc_tpl_destroy(VkDescriptorUpdateTemplate t) {
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = dc_get(DCK_TPL, (uint64_t)t, false);
+    if (o) { free(o->u.tpl.e); o->u.tpl.e = NULL; o->u.tpl.n = 0; o->dead = true; }
+    pthread_mutex_unlock(&g_dc_m);
+}
+static void dc_dsl_create(VkDescriptorSetLayout l, const VkDescriptorSetLayoutCreateInfo *ci) {
+    DCC(DCC_DSL);
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = dc_fresh(DCK_DSL, (uint64_t)l);
+    for (uint32_t i = 0; o && i < ci->bindingCount; i++) {
+        const VkDescriptorSetLayoutBinding *b = &ci->pBindings[i];
+        if (dc_is_dyn(b->descriptorType)) o->u.dsl.ndyn += b->descriptorCount;
+        if (b->binding < DC_NB) {
+            o->u.dsl.type[b->binding] = (uint8_t)b->descriptorType;
+            o->u.dsl.count[b->binding] = b->descriptorCount;
+            o->u.dsl.present |= (uint16_t)(1u << b->binding);
+        }
+    }
+    pthread_mutex_unlock(&g_dc_m);
+}
+static void dc_pl_create(VkPipelineLayout l, const VkPipelineLayoutCreateInfo *ci) {
+    DCC(DCC_PL);
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *o = dc_fresh(DCK_PL, (uint64_t)l);
+    for (uint32_t i = 0; o && i < ci->setLayoutCount && i < 8; i++) o->u.pl.sl[o->u.pl.n++] = (uint64_t)ci->pSetLayouts[i];
+    pthread_mutex_unlock(&g_dc_m);
+}
+static void dc_sets_alloc(const VkDescriptorSetAllocateInfo *ai, const VkDescriptorSet *sets) {
+    pthread_mutex_lock(&g_dc_m);
+    for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
+        DCC(DCC_SET_ALLOC);
+        struct DcObj *o = dc_fresh(DCK_SET, (uint64_t)sets[i]);
+        if (o) { o->u.set.pool = (uint64_t)ai->descriptorPool; o->u.set.layout = (uint64_t)ai->pSetLayouts[i]; }
+    }
+    pthread_mutex_unlock(&g_dc_m);
+}
+// Free / pool reset / pool destroy: D rows for the captured sets. what: "set-free", "set-reset", "set-pooldestroy".
+static void dc_sets_dead(VkDescriptorPool pool, uint32_t n, const VkDescriptorSet *sets, const char *what) {
+    uint64_t logged[64];
+    uint32_t nl = 0, more = 0;
+    double t = dc_now();
+    pthread_mutex_lock(&g_dc_m);
+    if (sets) {
+        for (uint32_t i = 0; i < n; i++) {
+            DCC(DCC_SET_FREE);
+            struct DcObj *s = dc_get(DCK_SET, (uint64_t)sets[i], false);
+            if (!s || s->dead) continue;
+            s->dead = true; s->t_dead = t;
+            if (s->cap) { if (nl < 64) logged[nl++] = s->h; else more++; }
+        }
+    } else {
+        struct DcObj *p = dc_get(DCK_POOL, (uint64_t)pool, false);
+        for (uint32_t i = 0; p && i < p->u.pool.n; i++) {
+            struct DcObj *s = dc_get(DCK_SET, p->u.pool.sets[i], false);
+            if (!s || s->dead || s->u.set.pool != (uint64_t)pool) continue;
+            s->dead = true; s->t_dead = t;
+            if (nl < 64) logged[nl++] = s->h; else more++;
+        }
+        if (p) p->u.pool.n = 0;
+    }
+    pthread_mutex_unlock(&g_dc_m);
+    for (uint32_t i = 0; i < nl; i++) {
+        DCC(DCC_D);
+        dc_printf("D\t%.3f\t%s\t0x%llx\tpool 0x%llx\n", t, what, (unsigned long long)logged[i], (unsigned long long)(uint64_t)pool);
+    }
+    if (more) dc_printf("D\t%.3f\t%s\t-\t%u more in pool 0x%llx\n", t, what, more, (unsigned long long)(uint64_t)pool);
+}
+
+// ---- command buffer state (compute bind point, set 0)
+static const struct DcObj *dc_pl_dsl(uint64_t layout, uint32_t set) { // g_dc_m held
+    const struct DcObj *pl = dc_get(DCK_PL, layout, false);
+    return pl && set < pl->u.pl.n ? dc_get(DCK_DSL, pl->u.pl.sl[set], false) : NULL;
+}
+static void dc_bind_sets(struct CmdBufData *c, uint32_t bp, VkPipelineLayout layout, uint32_t first, uint32_t n,
+                         const VkDescriptorSet *sets, uint32_t ndyn, const uint32_t *dyn, bool v2) {
+    DCC(v2 ? DCC_BIND2 : DCC_BIND);
+    if (!c || bp != VK_PIPELINE_BIND_POINT_COMPUTE || first != 0 || !n || !sets) return;
+    pthread_mutex_lock(&g_dc_m);
+    c->dc.kind = 1;
+    c->dc.set0 = (uint64_t)sets[0];
+    c->dc.bind_seq = g_dc_wseq;
+    memset(c->dc.dyn, 0, sizeof c->dc.dyn);
+    c->dc.dyn_mask = 0;
+    const struct DcObj *dsl = dc_pl_dsl((uint64_t)layout, 0);
+    struct DcObj *s = dc_get(DCK_SET, (uint64_t)sets[0], false);
+    if (!dsl) dsl = dc_set_dsl(s);
+    uint32_t k = 0;
+    for (uint32_t b = 0; b < DC_NB && k < ndyn && dyn; b++) {
+        bool isdyn = dsl ? (dsl->u.dsl.present >> b & 1) && dc_is_dyn(dsl->u.dsl.type[b])
+                         : s && s->u.set.b && s->u.set.b[b].type && dc_is_dyn(s->u.set.b[b].type - 1);
+        if (!isdyn) continue;
+        c->dc.dyn[b] = dyn[k];
+        c->dc.dyn_mask |= (uint16_t)(1u << b);
+        k += dsl ? dc_bcount(dsl, b) : 1;
+    }
+    pthread_mutex_unlock(&g_dc_m);
+}
+static void dc_push_writes(struct CmdBufData *c, uint32_t bp, VkPipelineLayout layout, uint32_t set, uint32_t n,
+                           const VkWriteDescriptorSet *w, bool v2) {
+    DCC(v2 ? DCC_PUSH2 : DCC_PUSH);
+    if (!c || bp != VK_PIPELINE_BIND_POINT_COMPUTE || set != 0) return;
+    pthread_mutex_lock(&g_dc_m);
+    if (c->dc.kind != 2) memset(c->dc.push, 0, sizeof c->dc.push);
+    c->dc.kind = 2;
+    c->dc.bind_seq = g_dc_wseq;
+    c->dc.dyn_mask = 0;
+    const struct DcObj *dsl = dc_pl_dsl((uint64_t)layout, 0);
+    for (uint32_t i = 0; i < n; i++) dc_put_write(c->dc.push, dsl, &w[i]);
+    pthread_mutex_unlock(&g_dc_m);
+}
+static void dc_push_tpl(struct CmdBufData *c, VkDescriptorUpdateTemplate tpl, VkPipelineLayout layout, uint32_t set,
+                        const void *data, bool v2) {
+    DCC(v2 ? DCC_PUSH_TPL2 : DCC_PUSH_TPL);
+    if (!c || set != 0) return;
+    pthread_mutex_lock(&g_dc_m);
+    const struct DcObj *to = dc_get(DCK_TPL, (uint64_t)tpl, false);
+    if (to && to->u.tpl.bp == VK_PIPELINE_BIND_POINT_COMPUTE) {
+        if (c->dc.kind != 2) memset(c->dc.push, 0, sizeof c->dc.push);
+        c->dc.kind = 2;
+        c->dc.bind_seq = g_dc_wseq;
+        c->dc.dyn_mask = 0;
+        dc_put_tpl(c->dc.push, dc_pl_dsl((uint64_t)layout, 0), to, data);
+    }
+    pthread_mutex_unlock(&g_dc_m);
+}
+
+// ---- dispatch: one X row (+ B rows for new binding tuples)
+#define DCF_RANGE_GT_BUF 0x1
+#define DCF_DEAD 0x2
+#define DCF_VA0 0x4
+#define DCF_SETWRITE_AFTER_BIND 0x8
+#define DCF_UNKNOWN 0x10
+#define DCF_VA_FROM_MEM 0x20
+#define DCF_WHOLE 0x40
+#define DCF_NO_MEM 0x80
+static void dc_flags_str(uint32_t f, char *s, size_t n) {
+    static const char *const names[] = {"RANGE>BUF", "DEAD", "VA0", "SETWRITE-AFTER-BIND", "UNK", "VAM", "WHOLE", "NOMEM"};
+    size_t k = 0;
+    s[0] = 0;
+    for (int i = 0; i < 8; i++)
+        if (f >> i & 1) k += (size_t)snprintf(s + k, n > k ? n - k : 0, "%s%s", k ? "," : "", names[i]);
+    if (!k) snprintf(s, n, "-");
+}
+struct DcTuple { // memset before filling: hashed as bytes
+    uint64_t handle, buffer, va, off, range, bufsize, mem, memsize, memoff;
+    double buf_t, mem_t;
+    uint32_t binding, type, format, flags;
+};
+static uint64_t dc_fnv(const void *p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= ((const uint8_t *)p)[i]; h *= 1099511628211ull; }
+    return h ? h : 1;
+}
+// g_dc_m held. Returns the id; *fresh = a B row is due.
+static uint32_t dc_tuple_id(const struct DcTuple *t, bool *fresh) {
+    uint64_t key = dc_fnv(t, sizeof *t);
+    uint32_t i = (uint32_t)key & (DC_DEDUP - 1);
+    if (g_dc_dedup_n < DC_DEDUP / 4 * 3) {
+        while (g_dc_dedup[i].key) {
+            if (g_dc_dedup[i].key == key) { *fresh = false; return g_dc_dedup[i].id; }
+            i = (i + 1) & (DC_DEDUP - 1);
+        }
+        g_dc_dedup[i].key = key;
+        g_dc_dedup[i].id = ++g_dc_next_bid;
+        g_dc_dedup_n++;
+        *fresh = true;
+        return g_dc_next_bid;
+    }
+    *fresh = true; // table full: every tuple gets a new id and row
+    return ++g_dc_next_bid;
+}
+// g_dc_m held. Marks the object captured (D rows later).
+static void dc_mark(struct DcObj *o) { if (o) o->cap = true; }
+static void dc_resolve(const struct DcDesc *d, uint32_t binding, uint32_t dynoff, bool dyn_valid, bool swab, struct DcTuple *t) {
+    memset(t, 0, sizeof *t);
+    uint32_t type = d->type - 1;
+    t->binding = binding; t->type = type; t->handle = d->h;
+    if (swab) t->flags |= DCF_SETWRITE_AFTER_BIND;
+    if (dc_is_img(type) || (!dc_is_buf(type) && !dc_is_texel(type))) return;
+    uint64_t buf = d->h, off = d->off, range = d->range;
+    if (dc_is_texel(type)) {
+        struct DcObj *v = dc_get(DCK_VIEW, d->h, false);
+        if (!v) { t->flags |= DCF_UNKNOWN | DCF_VA0; return; }
+        dc_mark(v);
+        if (v->dead) t->flags |= DCF_DEAD;
+        buf = v->u.view.buffer; off = v->u.view.offset; range = v->u.view.range; t->format = v->u.view.format;
+    } else if (dc_is_dyn(type) && dyn_valid) {
+        off += dynoff;
+    }
+    t->buffer = buf; t->off = off;
+    struct DcObj *b = dc_get(DCK_BUF, buf, false);
+    if (!b) { t->range = range; t->flags |= DCF_UNKNOWN | DCF_VA0; return; }
+    dc_mark(b);
+    if (b->dead) t->flags |= DCF_DEAD;
+    t->bufsize = b->u.buf.size; t->buf_t = b->t0;
+    if (range == VK_WHOLE_SIZE) { range = b->u.buf.size > off ? b->u.buf.size - off : 0; t->flags |= DCF_WHOLE; }
+    t->range = range;
+    if (off + range > b->u.buf.size) t->flags |= DCF_RANGE_GT_BUF;
+    t->va = b->u.buf.va;
+    if (!t->va) t->flags |= DCF_VA0;
+    if (b->u.buf.va_kind == 2) t->flags |= DCF_VA_FROM_MEM;
+    t->mem = b->u.buf.mem; t->memoff = b->u.buf.memoff;
+    struct DcObj *m = dc_get(DCK_MEM, b->u.buf.mem, false);
+    if (!m) { t->flags |= DCF_NO_MEM; return; }
+    dc_mark(m);
+    if (m->dead) t->flags |= DCF_DEAD;
+    t->memsize = m->u.mem.size; t->mem_t = m->t0;
+}
+static void dc_dispatch(struct CmdBufData *c, VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z) {
+    DCC(DCC_DISP_ALL);
+    if (!c || !c->compute_pipeline) return;
+    char row[1024], brows[DC_NB][300];
+    uint32_t nb = 0;
+    pthread_mutex_lock(&g_dc_m);
+    struct DcObj *p = dc_get(DCK_PIPE, (uint64_t)c->compute_pipeline, false);
+    if (!p || p->dead) { pthread_mutex_unlock(&g_dc_m); return; }
+    uint64_t seq = ++g_dc_seq;
+    double t = dc_now();
+    const struct DcDesc *sh = NULL;
+    struct DcObj *s = NULL;
+    const char *src = "none", *sflags = "-";
+    if (c->dc.kind == 1) {
+        src = "set";
+        s = dc_get(DCK_SET, c->dc.set0, false);
+        if (!s || !s->u.set.b) sflags = "UNK";
+        else {
+            sh = s->u.set.b;
+            if (s->dead) sflags = "DEAD";
+            if (!s->cap) {
+                s->cap = true;
+                struct DcObj *po = dc_get(DCK_POOL, s->u.set.pool, true);
+                if (po && po->u.pool.n == po->u.pool.cap) {
+                    uint32_t nc = po->u.pool.cap ? po->u.pool.cap * 2 : 64;
+                    uint64_t *ns = realloc(po->u.pool.sets, nc * sizeof *ns);
+                    if (ns) { po->u.pool.sets = ns; po->u.pool.cap = nc; }
+                }
+                if (po && po->u.pool.n < po->u.pool.cap) po->u.pool.sets[po->u.pool.n++] = s->h;
+            }
+            s->u.set.used_cap = true;
+            s->u.set.last_cap_seq = seq;
+        }
+    } else if (c->dc.kind == 2) {
+        src = "push";
+        sh = c->dc.push;
+    }
+    bool swab = s && s->u.set.wseq > c->dc.bind_seq;
+    int k = snprintf(row, sizeof row, "X\t%.3f\t%llu\t%p\t%08x\t%u\t%u\t%u\t%s\t0x%llx\t%s\t", t, (unsigned long long)seq,
+                     (void *)cmd, p->u.pipe.hash, x, y, z, src, (unsigned long long)(c->dc.kind == 1 ? c->dc.set0 : 0), sflags);
+    for (uint32_t b = 0; sh && b < DC_NB && k > 0 && (size_t)k < sizeof row - 24; b++) {
+        if (!sh[b].type) continue;
+        struct DcTuple tu;
+        dc_resolve(&sh[b], b, c->dc.dyn[b], c->dc.dyn_mask >> b & 1, swab, &tu);
+        bool fresh;
+        uint32_t id = dc_tuple_id(&tu, &fresh);
+        k += snprintf(row + k, sizeof row - (size_t)k, "%s%u=%u", nb ? " " : "", b, id);
+        if (fresh) {
+            char fl[96];
+            dc_flags_str(tu.flags, fl, sizeof fl);
+            snprintf(brows[nb], sizeof brows[nb],
+                     "B\t%u\t%u\t%u\t0x%llx\t0x%llx\t0x%llx\t%llu\t%llu\t0x%llx\t0x%llx\t%u\t%llu\t0x%llx\t%llu\t%llu\t%.3f\t%.3f\t%s\n",
+                     id, b, tu.type, (unsigned long long)tu.handle, (unsigned long long)tu.buffer, (unsigned long long)tu.va,
+                     (unsigned long long)tu.off, (unsigned long long)tu.range,
+                     (unsigned long long)(tu.va ? tu.va + tu.off : 0), (unsigned long long)(tu.va ? tu.va + tu.off + tu.range : 0),
+                     tu.format, (unsigned long long)tu.bufsize, (unsigned long long)tu.mem, (unsigned long long)tu.memsize,
+                     (unsigned long long)tu.memoff, tu.buf_t, tu.mem_t, fl);
+        } else brows[nb][0] = 0;
+        nb++;
+    }
+    if (!c->dc.ndisp++) c->dc.first_seq = seq;
+    c->dc.last_seq = seq;
+    pthread_mutex_unlock(&g_dc_m);
+    DCC(DCC_DISP);
+    for (uint32_t i = 0; i < nb; i++) if (brows[i][0]) dc_out(brows[i], strlen(brows[i]));
+    if (k > 0 && (size_t)k < sizeof row - 1) { row[k++] = '\n'; dc_out(row, (size_t)k); }
+}
+
+// ---- submits and completion (fence / timeline semaphore waits seen by the GPU_TIME wait hooks)
+#define DC_PEND 1024
+struct DcPend { uint64_t fence, sem, value, first, last; };
+static struct DcPend g_dc_pend[DC_PEND];
+static uint32_t g_dc_pend_next;
+static void dc_pend_add(uint64_t fence, uint64_t sem, uint64_t value, uint64_t first, uint64_t last) { // g_dc_m held
+    g_dc_pend[g_dc_pend_next] = (struct DcPend){fence, sem, value, first, last};
+    g_dc_pend_next = (g_dc_pend_next + 1) % DC_PEND;
+}
+// One submit batch: cbs[] with their (optional) first timeline signal and the batch's fence (last batch only).
+static void dc_submit_batch(VkQueue q, uint32_t ncb, VkCommandBuffer const *cbs, const VkCommandBufferSubmitInfo *cbi,
+                            uint64_t sem, uint64_t value, VkFence fence) {
+    bool any = false;
+    for (uint32_t i = 0; i < ncb; i++) {
+        VkCommandBuffer cb = cbs ? cbs[i] : cbi[i].commandBuffer;
+        struct CmdBufData *c = cmd_data(cb);
+        if (!c || !c->dc.ndisp) continue;
+        any = true;
+        DCC(DCC_SUBMIT);
+        double t = dc_now();
+        pthread_mutex_lock(&g_dc_m);
+        dc_pend_add((uint64_t)fence, sem, value, c->dc.first_seq, c->dc.last_seq);
+        pthread_mutex_unlock(&g_dc_m);
+        dc_printf("S\t%.3f\t%p\t%p\t%llu\t%llu\t%u\t0x%llx\t0x%llx:%llu\n", t, (void *)q, (void *)cb,
+                  (unsigned long long)c->dc.first_seq, (unsigned long long)c->dc.last_seq, c->dc.ndisp,
+                  (unsigned long long)(uint64_t)fence, (unsigned long long)sem, (unsigned long long)value);
+    }
+    if (any) dc_flush();
+}
+static void dc_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence fence) {
+    for (uint32_t i = 0; si && i < n; i++) {
+        uint64_t sem = 0, val = 0;
+        const VkTimelineSemaphoreSubmitInfo *ts = find_struct(si[i].pNext, VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO);
+        if (si[i].signalSemaphoreCount) {
+            sem = (uint64_t)si[i].pSignalSemaphores[0];
+            if (ts && ts->signalSemaphoreValueCount && ts->pSignalSemaphoreValues) val = ts->pSignalSemaphoreValues[0];
+        }
+        dc_submit_batch(q, si[i].commandBufferCount, si[i].pCommandBuffers, NULL, sem, val, i + 1 == n ? fence : VK_NULL_HANDLE);
+    }
+}
+static void dc_submit2(VkQueue q, uint32_t n, const VkSubmitInfo2 *si, VkFence fence) {
+    for (uint32_t i = 0; si && i < n; i++) {
+        uint64_t sem = 0, val = 0;
+        if (si[i].signalSemaphoreInfoCount) { sem = (uint64_t)si[i].pSignalSemaphoreInfos[0].semaphore; val = si[i].pSignalSemaphoreInfos[0].value; }
+        dc_submit_batch(q, si[i].commandBufferInfoCount, NULL, si[i].pCommandBufferInfos, sem, val, i + 1 == n ? fence : VK_NULL_HANDLE);
+    }
+}
+static void dc_done(bool is_fence, uint64_t h, uint64_t value) { // a wait returned VK_SUCCESS for h (>= value)
+    struct DcPend hit[16];
+    uint32_t nh = 0;
+    pthread_mutex_lock(&g_dc_m);
+    for (uint32_t i = 0; i < DC_PEND && nh < 16; i++) {
+        struct DcPend *p = &g_dc_pend[i];
+        if (!p->first) continue;
+        if (is_fence ? p->fence == h : (p->sem == h && p->value && p->value <= value)) { hit[nh++] = *p; p->first = 0; }
+    }
+    pthread_mutex_unlock(&g_dc_m);
+    double t = dc_now();
+    for (uint32_t i = 0; i < nh; i++) {
+        DCC(DCC_DONE);
+        dc_printf("F\t%.3f\t%s\t0x%llx\t%llu\t%llu\t%llu\n", t, is_fence ? "fence" : "sem", (unsigned long long)h,
+                  (unsigned long long)(is_fence ? 0 : hit[i].value), (unsigned long long)hit[i].first, (unsigned long long)hit[i].last);
+    }
+}
+
+// ---- desc-capture-1 entry points (only handed out while MALI_COMPAT_DESC_CAPTURE is on, and only for names the driver has)
+struct DcFns {
+    PFN_vkBindBufferMemory2 BindBufferMemory2;
+    PFN_vkDestroyBufferView DestroyBufferView;
+    PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout;
+    PFN_vkCreateDescriptorUpdateTemplate CreateDescriptorUpdateTemplate;
+    PFN_vkDestroyDescriptorUpdateTemplate DestroyDescriptorUpdateTemplate;
+    PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
+    PFN_vkFreeDescriptorSets FreeDescriptorSets;
+    PFN_vkResetDescriptorPool ResetDescriptorPool;
+    PFN_vkDestroyDescriptorPool DestroyDescriptorPool;
+    PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
+    PFN_vkUpdateDescriptorSetWithTemplate UpdateDescriptorSetWithTemplate;
+    PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
+    PFN_vkCmdBindDescriptorSets2 CmdBindDescriptorSets2;
+    PFN_vkCmdPushDescriptorSet2 CmdPushDescriptorSet2;
+    PFN_vkCmdPushDescriptorSetWithTemplate CmdPushDescriptorSetWithTemplate;
+    PFN_vkCmdPushDescriptorSetWithTemplate2 CmdPushDescriptorSetWithTemplate2;
+};
+static void dc_device_init(struct DeviceData *d, PFN_vkGetDeviceProcAddr gdpa, VkDevice dev) {
+    struct DcFns *f = calloc(1, sizeof *f);
+    if (!f) return;
+    #define DC_LOAD(fn) if (!(f->fn = (PFN_vk##fn)gdpa(dev, "vk" #fn))) f->fn = (PFN_vk##fn)gdpa(dev, "vk" #fn "KHR")
+    DC_LOAD(BindBufferMemory2);
+    DC_LOAD(DestroyBufferView);
+    DC_LOAD(CreateDescriptorSetLayout);
+    DC_LOAD(CreateDescriptorUpdateTemplate);
+    DC_LOAD(DestroyDescriptorUpdateTemplate);
+    DC_LOAD(AllocateDescriptorSets);
+    DC_LOAD(FreeDescriptorSets);
+    DC_LOAD(ResetDescriptorPool);
+    DC_LOAD(DestroyDescriptorPool);
+    DC_LOAD(UpdateDescriptorSets);
+    DC_LOAD(UpdateDescriptorSetWithTemplate);
+    DC_LOAD(CmdBindDescriptorSets);
+    DC_LOAD(CmdBindDescriptorSets2);
+    DC_LOAD(CmdPushDescriptorSet2);
+    DC_LOAD(CmdPushDescriptorSetWithTemplate);
+    DC_LOAD(CmdPushDescriptorSetWithTemplate2);
+    #undef DC_LOAD
+    if (!d->fpGetDeviceMemoryOpaqueCaptureAddress) {
+        d->fpGetDeviceMemoryOpaqueCaptureAddress = (PFN_vkGetDeviceMemoryOpaqueCaptureAddress)gdpa(dev, "vkGetDeviceMemoryOpaqueCaptureAddress");
+        if (!d->fpGetDeviceMemoryOpaqueCaptureAddress)
+            d->fpGetDeviceMemoryOpaqueCaptureAddress = (PFN_vkGetDeviceMemoryOpaqueCaptureAddress)gdpa(dev, "vkGetDeviceMemoryOpaqueCaptureAddressKHR");
+    }
+    d->dcf = f;
+    char hs[DC_HASH_MAX * 9 + 1] = "";
+    for (uint32_t i = 0; i < g_dc_hash_count; i++)
+        snprintf(hs + strlen(hs), sizeof hs - strlen(hs), "%s%08x", i ? "," : "", g_dc_hashes[i]);
+    fprintf(stderr, "mali-compat: desc-capture-1 active: VkDevice %p, hashes %s, file %s, cap %llu MiB, driver BDA %s, "
+            "capture address %s, template %s, bind2 %s, push %s, push2 %s, push-tpl %s, push-tpl2 %s\n", (void *)dev, hs,
+            g_dc_path, (unsigned long long)(g_dc_cap >> 20), d->fpGetBufferDeviceAddress ? "yes" : "no",
+            d->fpGetDeviceMemoryOpaqueCaptureAddress ? "yes" : "no", f->UpdateDescriptorSetWithTemplate ? "yes" : "no",
+            f->CmdBindDescriptorSets2 ? "yes" : "no", d->fpCmdPushDescriptorSetKHR ? "yes" : "no",
+            f->CmdPushDescriptorSet2 ? "yes" : "no", f->CmdPushDescriptorSetWithTemplate ? "yes" : "no",
+            f->CmdPushDescriptorSetWithTemplate2 ? "yes" : "no");
+    dc_printf("# device %p marker desc-capture-1 bda %d capaddr %d\n", (void *)dev, d->fpGetBufferDeviceAddress != NULL,
+              d->fpGetDeviceMemoryOpaqueCaptureAddress != NULL);
+}
+
+static VKAPI_ATTR void VKAPI_CALL compat_DcDestroyBuffer(VkDevice device, VkBuffer b, const VkAllocationCallbacks *a) {
+    dc_dead(DCK_BUF, (uint64_t)b);
+    get_device_data(device)->fpDestroyBuffer(device, b, a);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_DcBindBufferMemory(VkDevice device, VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
+    struct DeviceData *d = get_device_data(device);
+    VkResult r = d->fpBindBufferMemory(device, b, m, off);
+    if (r == VK_SUCCESS) dc_buf_bind(d, device, b, m, off);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_DcBindBufferMemory2(VkDevice device, uint32_t n, const VkBindBufferMemoryInfo *bi) {
+    struct DeviceData *d = get_device_data(device);
+    VkResult r = d->dcf->BindBufferMemory2(device, n, bi);
+    for (uint32_t i = 0; r == VK_SUCCESS && i < n; i++) dc_buf_bind(d, device, bi[i].buffer, bi[i].memory, bi[i].memoryOffset);
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL compat_DcDestroyBufferView(VkDevice device, VkBufferView v, const VkAllocationCallbacks *a) {
+    dc_dead(DCK_VIEW, (uint64_t)v);
+    get_device_data(device)->dcf->DestroyBufferView(device, v, a);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_DcCreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo *ci,
+                                                                          const VkAllocationCallbacks *a, VkDescriptorSetLayout *l) {
+    VkResult r = get_device_data(device)->dcf->CreateDescriptorSetLayout(device, ci, a, l);
+    if (r == VK_SUCCESS) dc_dsl_create(*l, ci);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_DcCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo *ci,
+                                                                     const VkAllocationCallbacks *a, VkPipelineLayout *l) {
+    VkResult r = get_device_data(device)->fpCreatePipelineLayout(device, ci, a, l);
+    if (r == VK_SUCCESS) dc_pl_create(*l, ci);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_DcCreateDescriptorUpdateTemplate(VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *ci,
+                                                                               const VkAllocationCallbacks *a, VkDescriptorUpdateTemplate *t) {
+    VkResult r = get_device_data(device)->dcf->CreateDescriptorUpdateTemplate(device, ci, a, t);
+    if (r == VK_SUCCESS) dc_tpl_create(*t, ci);
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL compat_DcDestroyDescriptorUpdateTemplate(VkDevice device, VkDescriptorUpdateTemplate t,
+                                                                           const VkAllocationCallbacks *a) {
+    dc_tpl_destroy(t);
+    get_device_data(device)->dcf->DestroyDescriptorUpdateTemplate(device, t, a);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_DcAllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo *ai,
+                                                                       VkDescriptorSet *sets) {
+    VkResult r = get_device_data(device)->dcf->AllocateDescriptorSets(device, ai, sets);
+    if (r == VK_SUCCESS) dc_sets_alloc(ai, sets);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_DcFreeDescriptorSets(VkDevice device, VkDescriptorPool pool, uint32_t n,
+                                                                   const VkDescriptorSet *sets) {
+    dc_sets_dead(pool, n, sets, "set-free");
+    return get_device_data(device)->dcf->FreeDescriptorSets(device, pool, n, sets);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_DcResetDescriptorPool(VkDevice device, VkDescriptorPool pool, VkDescriptorPoolResetFlags fl) {
+    DCC(DCC_POOL_RESET);
+    dc_sets_dead(pool, 0, NULL, "set-reset");
+    return get_device_data(device)->dcf->ResetDescriptorPool(device, pool, fl);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_DcDestroyDescriptorPool(VkDevice device, VkDescriptorPool pool, const VkAllocationCallbacks *a) {
+    DCC(DCC_POOL_DESTROY);
+    dc_sets_dead(pool, 0, NULL, "set-pooldestroy");
+    get_device_data(device)->dcf->DestroyDescriptorPool(device, pool, a);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_DcUpdateDescriptorSets(VkDevice device, uint32_t nw, const VkWriteDescriptorSet *w,
+                                                                uint32_t nc, const VkCopyDescriptorSet *c) {
+    dc_update_sets(nw, w, nc, c);
+    get_device_data(device)->dcf->UpdateDescriptorSets(device, nw, w, nc, c);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_DcUpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet set,
+                                                                           VkDescriptorUpdateTemplate t, const void *data) {
+    dc_update_tpl(set, t, data);
+    get_device_data(device)->dcf->UpdateDescriptorSetWithTemplate(device, set, t, data);
+}
+static struct DeviceData *dc_cmd_dev(VkCommandBuffer cmd, struct CmdBufData *c) { return c ? c->dev : get_device_data_by_cmd(cmd); }
+static VKAPI_ATTR void VKAPI_CALL compat_DcCmdBindDescriptorSets(VkCommandBuffer cmd, VkPipelineBindPoint bp, VkPipelineLayout layout,
+                                                                 uint32_t first, uint32_t n, const VkDescriptorSet *sets,
+                                                                 uint32_t ndyn, const uint32_t *dyn) {
+    struct CmdBufData *c = cmd_data(cmd);
+    dc_bind_sets(c, bp, layout, first, n, sets, ndyn, dyn, false);
+    dc_cmd_dev(cmd, c)->dcf->CmdBindDescriptorSets(cmd, bp, layout, first, n, sets, ndyn, dyn);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_DcCmdBindDescriptorSets2(VkCommandBuffer cmd, const VkBindDescriptorSetsInfo *i) {
+    struct CmdBufData *c = cmd_data(cmd);
+    dc_bind_sets(c, i->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
+                 i->layout, i->firstSet, i->descriptorSetCount, i->pDescriptorSets, i->dynamicOffsetCount, i->pDynamicOffsets, true);
+    dc_cmd_dev(cmd, c)->dcf->CmdBindDescriptorSets2(cmd, i);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_DcCmdPushDescriptorSet2(VkCommandBuffer cmd, const VkPushDescriptorSetInfo *i) {
+    struct CmdBufData *c = cmd_data(cmd);
+    dc_push_writes(c, i->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
+                   i->layout, i->set, i->descriptorWriteCount, i->pDescriptorWrites, true);
+    dc_cmd_dev(cmd, c)->dcf->CmdPushDescriptorSet2(cmd, i);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_DcCmdPushDescriptorSetWithTemplate(VkCommandBuffer cmd, VkDescriptorUpdateTemplate t,
+                                                                            VkPipelineLayout layout, uint32_t set, const void *data) {
+    struct CmdBufData *c = cmd_data(cmd);
+    dc_push_tpl(c, t, layout, set, data, false);
+    dc_cmd_dev(cmd, c)->dcf->CmdPushDescriptorSetWithTemplate(cmd, t, layout, set, data);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_DcCmdPushDescriptorSetWithTemplate2(VkCommandBuffer cmd, const VkPushDescriptorSetWithTemplateInfo *i) {
+    struct CmdBufData *c = cmd_data(cmd);
+    dc_push_tpl(c, i->descriptorUpdateTemplate, i->layout, i->set, i->pData, true);
+    dc_cmd_dev(cmd, c)->dcf->CmdPushDescriptorSetWithTemplate2(cmd, i);
+}
+// vkGetDeviceProcAddr part: the hook only when the driver answers the name (else NULL = not handled here).
+static PFN_vkVoidFunction dc_proc(VkDevice device, const char *n) {
+    static const struct { const char *name; PFN_vkVoidFunction fn; } t[] = {
+        {"vkDestroyBuffer", (PFN_vkVoidFunction)compat_DcDestroyBuffer},
+        {"vkBindBufferMemory", (PFN_vkVoidFunction)compat_DcBindBufferMemory},
+        {"vkBindBufferMemory2", (PFN_vkVoidFunction)compat_DcBindBufferMemory2},
+        {"vkBindBufferMemory2KHR", (PFN_vkVoidFunction)compat_DcBindBufferMemory2},
+        {"vkDestroyBufferView", (PFN_vkVoidFunction)compat_DcDestroyBufferView},
+        {"vkCreateDescriptorSetLayout", (PFN_vkVoidFunction)compat_DcCreateDescriptorSetLayout},
+        {"vkCreatePipelineLayout", (PFN_vkVoidFunction)compat_DcCreatePipelineLayout},
+        {"vkCreateDescriptorUpdateTemplate", (PFN_vkVoidFunction)compat_DcCreateDescriptorUpdateTemplate},
+        {"vkCreateDescriptorUpdateTemplateKHR", (PFN_vkVoidFunction)compat_DcCreateDescriptorUpdateTemplate},
+        {"vkDestroyDescriptorUpdateTemplate", (PFN_vkVoidFunction)compat_DcDestroyDescriptorUpdateTemplate},
+        {"vkDestroyDescriptorUpdateTemplateKHR", (PFN_vkVoidFunction)compat_DcDestroyDescriptorUpdateTemplate},
+        {"vkAllocateDescriptorSets", (PFN_vkVoidFunction)compat_DcAllocateDescriptorSets},
+        {"vkFreeDescriptorSets", (PFN_vkVoidFunction)compat_DcFreeDescriptorSets},
+        {"vkResetDescriptorPool", (PFN_vkVoidFunction)compat_DcResetDescriptorPool},
+        {"vkDestroyDescriptorPool", (PFN_vkVoidFunction)compat_DcDestroyDescriptorPool},
+        {"vkUpdateDescriptorSets", (PFN_vkVoidFunction)compat_DcUpdateDescriptorSets},
+        {"vkUpdateDescriptorSetWithTemplate", (PFN_vkVoidFunction)compat_DcUpdateDescriptorSetWithTemplate},
+        {"vkUpdateDescriptorSetWithTemplateKHR", (PFN_vkVoidFunction)compat_DcUpdateDescriptorSetWithTemplate},
+        {"vkCmdBindDescriptorSets", (PFN_vkVoidFunction)compat_DcCmdBindDescriptorSets},
+        {"vkCmdBindDescriptorSets2", (PFN_vkVoidFunction)compat_DcCmdBindDescriptorSets2},
+        {"vkCmdBindDescriptorSets2KHR", (PFN_vkVoidFunction)compat_DcCmdBindDescriptorSets2},
+        {"vkCmdPushDescriptorSet2", (PFN_vkVoidFunction)compat_DcCmdPushDescriptorSet2},
+        {"vkCmdPushDescriptorSet2KHR", (PFN_vkVoidFunction)compat_DcCmdPushDescriptorSet2},
+        {"vkCmdPushDescriptorSetWithTemplate", (PFN_vkVoidFunction)compat_DcCmdPushDescriptorSetWithTemplate},
+        {"vkCmdPushDescriptorSetWithTemplateKHR", (PFN_vkVoidFunction)compat_DcCmdPushDescriptorSetWithTemplate},
+        {"vkCmdPushDescriptorSetWithTemplate2", (PFN_vkVoidFunction)compat_DcCmdPushDescriptorSetWithTemplate2},
+        {"vkCmdPushDescriptorSetWithTemplate2KHR", (PFN_vkVoidFunction)compat_DcCmdPushDescriptorSetWithTemplate2},
+    };
+    if (strncmp(n, "vkCmd", 5) && !strstr(n, "Descriptor") && !strstr(n, "Buffer") && !strstr(n, "PipelineLayout")) return NULL;
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        if (strcmp(n, t[i].name)) continue;
+        struct DeviceData *dd = get_device_data(device);
+        if (dd && dd->dcf && dd->get_device_proc_addr(device, n)) return t[i].fn;
+        return NULL;
+    }
+    return NULL;
+}
+
 static void destroy_staging(struct DeviceData *d, struct StagingResource *r) {
     if (r->buffer) d->fpDestroyBuffer(d->device, r->buffer, NULL);
-    if (r->memory) d->fpFreeMemory(d->device, r->memory, NULL);
+    if (r->memory) {
+        d->fpFreeMemory(d->device, r->memory, NULL);
+        budget_sub(r->heap, r->mem_size);
+    }
 }
 
 // Back into the device's pool, or freed when the pool is full.
@@ -1072,6 +2471,11 @@ static VkResult acquire_staging(struct DeviceData *d, VkDeviceSize size, struct 
         VkMemoryAllocateFlagsInfo flags_info = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
         VkMemoryAllocateInfo a_info = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags_info, mem_req.size, type};
         r = d->fpAllocateMemory(d->device, &a_info, NULL, &out->memory);
+        if (r == VK_SUCCESS) {
+            out->mem_size = mem_req.size;
+            out->heap = type < VK_MAX_MEMORY_TYPES ? d->type_heap[type] : BUDGET_NO_HEAP;
+            budget_add(out->heap, out->mem_size);
+        }
     }
     if (r == VK_SUCCESS) r = d->fpBindBufferMemory(d->device, out->buffer, out->memory, 0);
     if (r != VK_SUCCESS) {
@@ -1115,20 +2519,28 @@ static void reset_cmd_data(struct DeviceData *dev_data, VkCommandBuffer cmd, boo
     e->compute_pipeline = VK_NULL_HANDLE;
     e->descriptor_buffers = false;
     e->push_count = 0;
+    e->push_seq = 0;
+    e->push_untracked = false;
     e->cpd.layout = VK_NULL_HANDLE;
     e->gpd.layout = VK_NULL_HANDLE;
     e->gfx_pipeline = VK_NULL_HANDLE;
+    e->gfx_flags = 0;
+    e->dyn_depth = 0;
     e->gt_rec = -1;
+    e->gt_susp = false;
     e->gt_src = VK_NULL_HANDLE;
+    e->gt_sdraws = e->gt_svcount = e->gt_sicount = 0;
+    memset(&e->gt_scnt, 0, sizeof e->gt_scnt);
+    e->gt_spipe = VK_NULL_HANDLE;
+    e->gt_ssrc = VK_NULL_HANDLE;
     e->async_skip = false;
+    memset(&e->dc, 0, sizeof e->dc);
     if (remove) {
         free(e->staging_resources);
         free(e);
     }
 }
 
-// Memory budget tracking
-static _Atomic uint64_t g_allocated_bytes = 0;
 
 // -----------------------------------------------------------------------------
 // BC Compute Pipeline Initializer
@@ -1333,12 +2745,20 @@ static uint32_t g_vendor_id;
 // emulated zero divisor included) reads undefined instance data. Pipelines and dynamic vertex inputs with such
 // bindings, and draws with firstInstance != 0.
 static _Atomic uint64_t g_div_pipes, g_div_vi, g_div_draws;
-// MALI_COMPAT_NO_SUSPEND_RESUME=1 (experiment, needs GPU timing for the hook): vkd3d-proton splits render passes on
+// MALI_COMPAT_NO_SUSPEND_RESUME=1 (own switch for the CmdBeginRendering hook since 2026-10-31, no GPU_TIME needed;
+// without GPU_TIME the hook does no timing work, [keeper, Claude Opus 5.5]): vkd3d-proton splits render passes on
 // tilers with VK_RENDERING_SUSPENDING/RESUMING_BIT. Turn each part into a plain pass: a suspending part stores its
 // attachments, a resuming part loads them, and only the last part resolves. Same result, more bandwidth; tests whether
 // this driver loses draws in resumed passes (HZD's missing static meshes, 2026-10-29). Counters of such passes.
 static bool g_no_susres;
 static _Atomic uint64_t g_susp_passes, g_resu_passes;
+// MALI_COMPAT_SUSRES_BARRIER=1 (K-CS1, 2026-10-31, [keeper, Claude Opus 5.5]; only with NO_SUSPEND_RESUME): as plain
+// passes, the parts of a split render pass are separate render pass instances, so the previous part's attachment writes
+// (draws, STORE) and the next part's LOAD and draws are a hazard. vkd3d-proton cannot record a barrier there (forbidden
+// between suspend and resume), so the layer inserts one global memory barrier before each converted resuming part.
+// Control's 16384x2048 d32 shadow atlas is split into 7-9 parts per frame past the gate (shadow flicker, control.md).
+static bool g_susres_barrier;
+static _Atomic uint64_t g_susres_barriers;
 static __thread bool tl_div_bound; // the last vertex input this thread set or bound has a divisor != 1 (approximate)
 
 // VK_EXT_physical_device_drm, emulated (MALI_COMPAT_DRM_NODE=<device node>, e.g. /dev/mali0). gamescope refuses a
@@ -1580,6 +3000,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_GetPhysicalDeviceImageFormatPropert
     return r;
 }
 
+// VK_EXT_memory_budget cap per heap; MALI_COMPAT_BUDGET_MB=<MiB> overrides the 5 GiB default (read once at init).
+// 5 GiB (K-CF2): HZD runs stable at 4.6-4.8 GiB of driver memory, and the process dies/stalls at ~7.3 GiB with
+// 0.6-1.1 GiB of it outside the app's allocations (docs/common_fixes.md section 15).
+static uint64_t g_budget_cap = 5ULL << 30;
+
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceMemoryProperties2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties2 *pMemoryProperties) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
@@ -1592,12 +3017,12 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceMemoryProperties2(
         if (header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) {
             VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget =
                 (VkPhysicalDeviceMemoryBudgetPropertiesEXT *)header;
-            uint64_t allocated = atomic_load(&g_allocated_bytes);
+            atomic_fetch_add(&g_budget_queries, 1);
             for (uint32_t i = 0; i < VK_MAX_MEMORY_HEAPS; i++) {
                 if (i < pMemoryProperties->memoryProperties.memoryHeapCount) {
                     VkDeviceSize heap_size = pMemoryProperties->memoryProperties.memoryHeaps[i].size;
-                    budget->heapBudget[i] = heap_size > (6ULL << 30) ? (6ULL << 30) : heap_size;
-                    budget->heapUsage[i] = allocated;
+                    budget->heapBudget[i] = heap_size > g_budget_cap ? g_budget_cap : heap_size;
+                    budget->heapUsage[i] = atomic_load(&g_heap_usage[i]);
                 } else {
                     budget->heapBudget[i] = 0;
                     budget->heapUsage[i] = 0;
@@ -1694,6 +3119,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_EnumerateDeviceExtensionProperties(
 // /root/mali-spv-<hash>.spv when they are created. The timing itself is further down (gt_*).
 // -----------------------------------------------------------------------------
 static bool g_gpu_time;
+static bool g_wait_callers; // MALI_COMPAT_WAIT_CALLERS=1 (with GPU_TIME): who waits on which fence (K-WC1)
 static uint32_t g_dump_hashes[16];
 static uint32_t g_dump_hash_count;
 static uint32_t g_gt_trace; // MALI_COMPAT_GT_TRACE=<hex>: write every pass whose fragment/compute shader has this hash
@@ -1701,6 +3127,45 @@ static uint32_t g_gt_trace; // MALI_COMPAT_GT_TRACE=<hex>: write every pass whos
 static uint32_t g_skip_hash; // MALI_COMPAT_SKIP_HASH, see gt_skip
 static uint32_t g_noatt_w, g_noatt_h; // MALI_COMPAT_NOATT_AREA, see compat_CmdBeginRendering
 static _Atomic uint64_t g_noatt_clamped;
+// HZD statics (requests KZ1/KZ2 of game/hzd, 2026-10-30). [keeper, Claude Opus 5.5]
+// MALI_COMPAT_DEPTH_EQUAL=always|lequal|gequal: graphics pipelines with depth test on, depth write off and compare op
+// EQUAL get this op instead (on a copy of the depth/stencil state); a dynamic vkCmdSetDepthCompareOp(EQUAL) too. Tests
+// whether the G-buffer draws after the depth prepass are lost to a prepass/G-buffer position mismatch.
+static bool g_depth_equal_on;
+static VkCompareOp g_depth_equal_op;
+static _Atomic uint64_t g_deq_pipes, g_deq_replaced, g_deq_dynamic; // EQUAL/no-write pipelines seen, replaced; dynamic ops
+// Pipeline flags in the pipeline table (GPU timing): per-pass draw counters eq / dw / vsw of the timing report.
+enum { PF_EQ = 1, PF_DW = 2, PF_VSW = 4 };
+// K-DW (witcher-tiler.md request, 2026-11-01): DXVK sets depth test, write and compare op dynamically (extended dynamic
+// state), so the static bits above are 0 for every DXVK pipeline. MALI_COMPAT_GT_DYNDEPTH=1 (+GPU_TIME) also records
+// which of the three are dynamic and their static values, hooks vkCmdSetDepth{Test,Write}Enable / CompareOp, and the
+// draw counters use the state in effect at the draw (gt_depth_flags). Default off. [keeper, Claude Opus 5.5]
+enum { PF_DYN_DT = 8, PF_DYN_DW = 16, PF_DYN_OP = 32, PF_S_DT = 64, PF_S_DW = 128, PF_S_EQ = 256 };
+enum { DD_DT = 1, DD_DW = 2, DD_EQ = 4 };
+static bool g_gt_dyndepth;
+static _Atomic uint64_t g_dd_pipes; // pipelines with a dynamic depth test / write / op (reported once)
+// The K-DW pipeline bits of one create info: which depth states are dynamic, and the static values of the others.
+static uint16_t pf_dyn_depth(const VkGraphicsPipelineCreateInfo *ci) {
+    uint16_t f = 0;
+    const VkPipelineDynamicStateCreateInfo *dy = ci->pDynamicState;
+    for (uint32_t k = 0; dy && k < dy->dynamicStateCount; k++) {
+        VkDynamicState st = dy->pDynamicStates[k];
+        if (st == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE) f |= PF_DYN_DT;
+        else if (st == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE) f |= PF_DYN_DW;
+        else if (st == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP) f |= PF_DYN_OP;
+    }
+    const VkPipelineDepthStencilStateCreateInfo *ds = ci->pDepthStencilState;
+    if (ds && ds->depthTestEnable) f |= PF_S_DT;
+    if (ds && ds->depthWriteEnable) f |= PF_S_DW;
+    if (ds && ds->depthCompareOp == VK_COMPARE_OP_EQUAL) f |= PF_S_EQ;
+    if ((f & (PF_DYN_DT | PF_DYN_DW | PF_DYN_OP)) && atomic_fetch_add(&g_dd_pipes, 1) == 0)
+        fprintf(stderr, "mali-compat: GT_DYNDEPTH: first pipeline with dynamic depth state (flags 0x%x)\n", f);
+    return f;
+}
+// VS-stage store scan (KZ2): on with GPU_TIME, or log-only with MALI_COMPAT_VS_STORES=1. See spv_vs_stores.
+static bool g_vs_scan;
+static _Atomic uint64_t g_vsw_pipes;
+static _Atomic uint32_t g_vsw_shaders;
 // Graphics pipeline compiles per thread since the last timing report: did a stall come from the vendor compiler?
 struct PcStat { char comm[16]; uint32_t count; uint64_t sum_ns, max_ns; };
 static struct PcStat g_pcstat[16];
@@ -1744,15 +3209,17 @@ static void spv_dump_if_wanted(const uint32_t *code, size_t bytes, uint32_t hash
 }
 
 // handle -> hash tables (shader modules; pipelines with up to 3 stage hashes)
-struct HashNode { uint64_t handle; uint32_t hash[3]; uint32_t stages[3]; struct HashNode *next; };
+struct HashNode { uint64_t handle; uint32_t hash[3]; uint32_t stages[3]; uint32_t flags; struct HashNode *next; }; // flags: PF_*
 #define HASH_BUCKETS 4096
 static struct HashNode *g_module_hash[HASH_BUCKETS], *g_pipeline_hash[HASH_BUCKETS];
 static pthread_mutex_t g_hash_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void hash_put(struct HashNode **table, uint64_t handle, const uint32_t *hash, const uint32_t *stages, uint32_t n) {
+static void hash_put(struct HashNode **table, uint64_t handle, const uint32_t *hash, const uint32_t *stages, uint32_t n,
+                     uint32_t flags) {
     struct HashNode *e = calloc(1, sizeof *e);
     if (!e) return;
     e->handle = handle;
+    e->flags = flags;
     for (uint32_t i = 0; i < n && i < 3; i++) { e->hash[i] = hash[i]; e->stages[i] = stages ? stages[i] : 0; }
     uint32_t b = handle_bucket(handle, HASH_BUCKETS);
     pthread_mutex_lock(&g_hash_mutex);
@@ -1768,6 +3235,78 @@ static bool hash_get(struct HashNode **table, uint64_t handle, struct HashNode *
         if (e->handle == handle) { *out = *e; found = true; break; }
     pthread_mutex_unlock(&g_hash_mutex);
     return found;
+}
+
+// KZ2: does a vertex/tessellation/geometry module write memory? The device lacks vertexPipelineStoresAndAtomics, and
+// vkd3d's FL 12_2 override hides that from the game, so such writes may be lost. Counts OpImageWrite (typed UAVs, and
+// raw/structured ones as R32UI texel buffers), the writing atomics, and OpStore/OpCopyMemory through a StorageBuffer or
+// PhysicalStorageBuffer pointer (or a Uniform BufferBlock one, old-style SSBOs) into cnt[0..2]; cnt[3] = execution model
+// of the first such entry point. False for modules without a vertex-pipeline entry point (early exit after the header)
+// or without writes. Whole module: a store in another entry point's function counts too. [keeper, Claude Opus 5.5]
+static bool spv_vs_stores(const uint32_t *code, size_t bytes, uint32_t cnt[4]) {
+    size_t n = bytes / 4;
+    cnt[0] = cnt[1] = cnt[2] = 0;
+    cnt[3] = UINT32_MAX;
+    if (n < 5 || code[0] != 0x07230203 || !code[3] || code[3] > (1u << 22)) return false;
+    uint32_t bound = code[3];
+    size_t i = 5;
+    for (; i < n;) { // capabilities, extensions, memory model, entry points, execution modes, debug names
+        uint32_t wc = code[i] >> 16, op = code[i] & 0xffff;
+        if (!wc || i + wc > n) return false;
+        if (op > 17 && op != 317 && op != 330 && op != 331) break;
+        if (op == SpvOpEntryPoint && wc >= 3 && code[i + 1] <= 3 && cnt[3] == UINT32_MAX) cnt[3] = code[i + 1];
+        i += wc;
+    }
+    if (cnt[3] == UINT32_MAX) return false; // Vertex 0, TessellationControl 1, TessellationEvaluation 2, Geometry 3
+    // per id: 1 pointer type to SSBO memory, 4 struct decorated BufferBlock, 8 value pointing into SSBO memory
+    uint8_t *k = calloc(bound, 1);
+    if (!k) return false;
+    for (; i < n;) {
+        uint32_t wc = code[i] >> 16, op = code[i] & 0xffff;
+        const uint32_t *w = code + i;
+        if (!wc || i + wc > n) break;
+        i += wc;
+        if (op == SpvOpDecorate && wc >= 3 && w[1] < bound && w[2] == 3 /* BufferBlock */) k[w[1]] |= 4;
+        else if (op == SpvOpTypePointer && wc >= 4 && w[1] < bound && w[3] < bound) {
+            if (w[2] == 12 || w[2] == 5349 || (w[2] == 2 && (k[w[3]] & 4))) k[w[1]] |= 1;
+        } else if (op == SpvOpTypeForwardPointer && wc >= 3 && w[1] < bound) {
+            if (w[2] == 5349) k[w[1]] |= 1;
+        } else if ((op == SpvOpVariable || op == SpvOpFunctionParameter || op == SpvOpLoad || op == 57 /* FunctionCall */ ||
+                    op == 120 /* ConvertUToPtr */ || op == 124 /* Bitcast */ || op == 169 /* Select */ ||
+                    op == 245 /* Phi */) && wc >= 3 && w[1] < bound && w[2] < bound) {
+            if (k[w[1]] & 1) k[w[2]] |= 8;
+        } else if ((spv_is_chain(op) || op == 83 /* CopyObject */) && wc >= 4 && w[1] < bound && w[2] < bound && w[3] < bound) {
+            if ((k[w[1]] & 1) || (k[w[3]] & 8)) k[w[2]] |= 8; // Uniform BufferBlock: the base carries it
+        } else if ((op == SpvOpStore || op == SpvOpCopyMemory) && wc >= 3 && w[1] < bound) {
+            if (k[w[1]] & 8) cnt[2]++;
+        } else if (op == 99 /* ImageWrite */) {
+            cnt[0]++;
+        } else if ((op >= 228 && op <= 242) || op == 318 || op == 319 || op == 5614 || op == 5615 || op == 6035) {
+            cnt[1]++; // AtomicStore .. AtomicXor, AtomicFlagTestAndSet/Clear, AtomicFMin/FMax/FAddEXT (not AtomicLoad)
+        }
+    }
+    free(k);
+    return cnt[0] || cnt[1] || cnt[2];
+}
+
+// KZ2: logs the first 32 shaders with vertex-pipeline writes (then at 64, 128, ...), once per hash.
+static void vs_store_note(uint32_t hash, const uint32_t cnt[4], bool inline_spv) {
+    static uint32_t seen[4096];
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    uint32_t key = hash ? hash : 1, b = (key * 2654435761u) % 4096, total = 0;
+    pthread_mutex_lock(&m);
+    for (uint32_t p = 0; p < 4096; p++, b = (b + 1) % 4096) {
+        if (seen[b] == key) break;
+        if (!seen[b]) {
+            if (atomic_load(&g_vsw_shaders) < 4000) { seen[b] = key; total = atomic_fetch_add(&g_vsw_shaders, 1) + 1; }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&m);
+    static const char *model[4] = {"vs", "tcs", "tes", "gs"};
+    if (total && (total <= 32 || !(total & (total - 1))))
+        fprintf(stderr, "mali-compat: VS-stage store #%u %s:%08x (%s; imgwrite %u, atomic %u, store %u)\n", total,
+                cnt[3] < 4 ? model[cnt[3]] : "?", hash, inline_spv ? "inline" : "module", cnt[0], cnt[1], cnt[2]);
 }
 
 // Images and views, for the details of a STUCK or traced pass (GPU timing only). Entries are not removed: a reused
@@ -2204,10 +3743,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
     VkDevice device, const VkShaderModuleCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkShaderModule *pShaderModule) {
     struct DeviceData *d = get_device_data(device);
-    uint32_t hash = 0;
-    if (g_gpu_time || g_dump_hash_count) {
+    uint32_t hash = 0, mflags = 0, cnt[4];
+    if (g_gpu_time || g_dump_hash_count || g_vs_scan || g_dc_on) {
         hash = spv_hash(pCreateInfo->pCode, pCreateInfo->codeSize);
         spv_dump_if_wanted(pCreateInfo->pCode, pCreateInfo->codeSize, hash);
+    }
+    if (g_vs_scan && spv_vs_stores(pCreateInfo->pCode, pCreateInfo->codeSize, cnt)) { // KZ2, before any patch
+        mflags = PF_VSW;
+        vs_store_note(hash, cnt, false);
     }
     size_t patched_bytes = 0;
     uint32_t *patched = compat_patch_spirv(pCreateInfo->pCode, pCreateInfo->codeSize, &patched_bytes);
@@ -2224,7 +3767,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
         r = d->fpCreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
         if (r == VK_SUCCESS && g_dump_inflight && pShaderModule) inflight_module_put(*pShaderModule, pCreateInfo->pCode, pCreateInfo->codeSize);
     }
-    if (r == VK_SUCCESS && g_gpu_time && pShaderModule) hash_put(g_module_hash, (uint64_t)*pShaderModule, &hash, NULL, 1);
+    if (r == VK_SUCCESS && (g_gpu_time || g_dc_on) && pShaderModule) hash_put(g_module_hash, (uint64_t)*pShaderModule, &hash, NULL, 1, mflags);
     if (r == VK_SUCCESS && g_fragdepth_fix && pShaderModule && spv_writes_fragdepth(pCreateInfo->pCode, pCreateInfo->codeSize))
         fragdepth_module_put(*pShaderModule, pCreateInfo->pCode, pCreateInfo->codeSize);
     return r;
@@ -2886,6 +4429,53 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
     for (uint32_t i = 0; gt_n && i < createInfoCount; i++)
         gt_n[i] = stage_hashes(pCreateInfos[i].pStages, pCreateInfos[i].stageCount, gt_hash[i], gt_hash[i] + 3);
 
+    // KZ1/KZ2 (HZD statics): pipeline flags for the per-pass eq/dw/vsw counters (GPU timing), the depth EQUAL
+    // replacement (MALI_COMPAT_DEPTH_EQUAL) and the VS-stage store scan, all on the app's state and SPIR-V (before the
+    // patches below). The static depth state only: vkd3d keeps test, write and op static. [keeper, Claude Opus 5.5]
+    uint16_t *pf = g_gpu_time ? calloc(createInfoCount, sizeof *pf) : NULL;
+    VkPipelineDepthStencilStateCreateInfo *ds_copies = g_depth_equal_on ? malloc(createInfoCount * sizeof *ds_copies) : NULL;
+    for (uint32_t i = 0; (pf || ds_copies || g_vs_scan) && i < createInfoCount; i++) {
+        const VkGraphicsPipelineCreateInfo *ci = &pCreateInfos[i];
+        const VkPipelineDepthStencilStateCreateInfo *ds = ci->pDepthStencilState;
+        uint16_t f = 0;
+        if (ds && ds->depthTestEnable) f |= ds->depthWriteEnable ? PF_DW : ds->depthCompareOp == VK_COMPARE_OP_EQUAL ? PF_EQ : 0;
+        if (g_gt_dyndepth && pf) f |= pf_dyn_depth(ci);
+        if (f & PF_EQ) {
+            atomic_fetch_add(&g_deq_pipes, 1);
+            if (ds_copies) {
+                ds_copies[i] = *ds;
+                ds_copies[i].depthCompareOp = g_depth_equal_op;
+                modified[i].pDepthStencilState = &ds_copies[i];
+                uint64_t k = atomic_fetch_add(&g_deq_replaced, 1) + 1;
+                if (k == 1 || k == 10 || k == 100 || k == 1000 || k == 10000 || k == 100000)
+                    fprintf(stderr, "mali-compat: DEPTH_EQUAL: %llu pipelines with depth EQUAL and no depth write now use op %d\n",
+                            (unsigned long long)k, g_depth_equal_op);
+            }
+        }
+        for (uint32_t s = 0; g_vs_scan && s < ci->stageCount; s++) {
+            if (!(ci->pStages[s].stage & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT |
+                                          VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)))
+                continue;
+            const VkShaderModuleCreateInfo *sm = find_struct(ci->pStages[s].pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+            struct HashNode mod;
+            uint32_t cnt[4];
+            if (sm && spv_vs_stores(sm->pCode, sm->codeSize, cnt)) {
+                f |= PF_VSW;
+                vs_store_note(spv_hash(sm->pCode, sm->codeSize), cnt, true);
+            } else if (!sm && g_gpu_time && hash_get(g_module_hash, (uint64_t)ci->pStages[s].module, &mod)) {
+                f |= mod.flags & PF_VSW;
+            }
+        }
+        if (f & PF_VSW) atomic_fetch_add(&g_vsw_pipes, 1);
+        // a linked pipeline (VK_EXT_graphics_pipeline_library) inherits its libraries' flags
+        const VkPipelineLibraryCreateInfoKHR *lib = pf ? find_struct(ci->pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR) : NULL;
+        for (uint32_t l = 0; lib && l < lib->libraryCount; l++) {
+            struct HashNode h;
+            if (hash_get(g_pipeline_hash, (uint64_t)lib->pLibraries[l], &h)) f |= h.flags;
+        }
+        if (pf) pf[i] = f;
+    }
+
     // FragDepth without a depth/stencil attachment (MALI_COMPAT_FRAGDEPTH_FIX): own stage arrays, patched modules
     VkPipelineShaderStageCreateInfo *fd_stages = NULL;
     VkShaderModule fd_modules[16];
@@ -3106,9 +4696,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
         for (uint32_t i = 0; i < createInfoCount; i++) log_pipeline(&modified[i], res);
     if (g_gpu_time && gt_n && res == VK_SUCCESS && pPipelines)
         for (uint32_t i = 0; i < createInfoCount; i++)
-            if (pPipelines[i]) hash_put(g_pipeline_hash, (uint64_t)pPipelines[i], gt_hash[i], gt_hash[i] + 3, gt_n[i]);
+            if (pPipelines[i]) hash_put(g_pipeline_hash, (uint64_t)pPipelines[i], gt_hash[i], gt_hash[i] + 3, gt_n[i], pf ? pf[i] : 0);
     free(gt_hash);
     free(gt_n);
+    free(pf);
+    free(ds_copies);
     for (uint32_t k = 0; k < fd_module_count; k++) d->fpDestroyShaderModule(device, fd_modules[k], NULL);
     for (uint32_t k = 0; k < fd_code_count; k++) free(fd_codes[k]);
     free(fd_stages);
@@ -3126,14 +4718,39 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
     VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
     const VkComputePipelineCreateInfo *pCreateInfos, const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines) {
     struct DeviceData *d = get_device_data(device);
+    // wls-clamp-1: a compute stage with inline SPIR-V (VkShaderModuleCreateInfo in its pNext) is clamped like a module;
+    // the app's create info is patched for the call only and restored right after it.
+    VkShaderModuleCreateInfo *wls_sm[8] = {0};
+    const uint32_t *wls_code[8];
+    size_t wls_size[8];
+    uint32_t *wls_new[8] = {0};
+    for (uint32_t i = 0; g_wls_clamp && i < createInfoCount && i < 8; i++) {
+        VkShaderModuleCreateInfo *sm = (VkShaderModuleCreateInfo *)find_struct(pCreateInfos[i].stage.pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+        size_t ob = 0;
+        if (sm && sm->pCode && (wls_new[i] = wls_clamp_module(sm->pCode, sm->codeSize, sm->pCode, sm->codeSize, &ob))) {
+            wls_sm[i] = sm;
+            wls_code[i] = sm->pCode;
+            wls_size[i] = sm->codeSize;
+            sm->pCode = wls_new[i];
+            sm->codeSize = ob;
+        }
+    }
     dump_inflight_compute(createInfoCount, pCreateInfos);
     VkResult res = d->fpCreateComputePipelinesReal(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount, pCreateInfos, pAllocator, pPipelines);
     dump_inflight_done();
+    for (uint32_t i = 0; i < 8; i++)
+        if (wls_sm[i]) {
+            wls_sm[i]->pCode = wls_code[i];
+            wls_sm[i]->codeSize = wls_size[i];
+            free(wls_new[i]);
+        }
     for (uint32_t i = 0; i < createInfoCount; i++) {
         uint32_t hash[1], stage[1];
         uint32_t n = stage_hashes(&pCreateInfos[i].stage, 1, hash, stage);
         if (g_gpu_time && res == VK_SUCCESS && pPipelines && pPipelines[i])
-            hash_put(g_pipeline_hash, (uint64_t)pPipelines[i], hash, stage, n);
+            hash_put(g_pipeline_hash, (uint64_t)pPipelines[i], hash, stage, n, 0);
+        if (g_dc_on && res == VK_SUCCESS && pPipelines && pPipelines[i])
+            dc_pipe_create(pPipelines[i], n ? hash[0] : 0, pCreateInfos[i].layout);
     }
     return res;
 }
@@ -3167,6 +4784,33 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdSetPolygonModeEXT(
     (void)commandBuffer;
     (void)polygonMode;
     // Suppress line/point mode, force fill
+}
+
+// MALI_COMPAT_DEPTH_EQUAL, dynamic depth compare op (vkd3d 0bb64c56 keeps it static, state.c:3949): EQUAL becomes the
+// chosen op. The dynamic depth-write state is not tracked, so every dynamic EQUAL is replaced. [keeper, Claude Opus 5.5]
+static VKAPI_ATTR void VKAPI_CALL compat_CmdSetDepthCompareOp(VkCommandBuffer commandBuffer, VkCompareOp op) {
+    if (g_gt_dyndepth) { // K-DW: the app's op, before any DEPTH_EQUAL replacement
+        struct CmdBufData *c = cmd_data(commandBuffer);
+        if (c) c->dyn_depth = op == VK_COMPARE_OP_EQUAL ? c->dyn_depth | DD_EQ : c->dyn_depth & ~DD_EQ;
+    }
+    if (op == VK_COMPARE_OP_EQUAL && g_depth_equal_on) {
+        op = g_depth_equal_op;
+        if (atomic_fetch_add(&g_deq_dynamic, 1) == 0)
+            fprintf(stderr, "mali-compat: DEPTH_EQUAL: dynamic depth compare op EQUAL replaced by %d\n", op);
+    }
+    get_device_data_by_cmd(commandBuffer)->fpCmdSetDepthCompareOp(commandBuffer, op);
+}
+
+// K-DW: dynamic depth test / write enable (MALI_COMPAT_GT_DYNDEPTH=1 with GPU_TIME), recorded for the draw counters.
+static VKAPI_ATTR void VKAPI_CALL compat_CmdSetDepthTestEnable(VkCommandBuffer commandBuffer, VkBool32 enable) {
+    struct CmdBufData *c = cmd_data(commandBuffer);
+    if (c) c->dyn_depth = enable ? c->dyn_depth | DD_DT : c->dyn_depth & ~DD_DT;
+    get_device_data_by_cmd(commandBuffer)->fpCmdSetDepthTestEnable(commandBuffer, enable);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdSetDepthWriteEnable(VkCommandBuffer commandBuffer, VkBool32 enable) {
+    struct CmdBufData *c = cmd_data(commandBuffer);
+    if (c) c->dyn_depth = enable ? c->dyn_depth | DD_DW : c->dyn_depth & ~DD_DW;
+    get_device_data_by_cmd(commandBuffer)->fpCmdSetDepthWriteEnable(commandBuffer, enable);
 }
 
 // Debug aid: with /root/mali-images.txt present, one line per image: format, size, usage, flags, and the driver's
@@ -3558,10 +5202,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImage(
         }
     }
     if (res == VK_SUCCESS && g_log_images && pImage && *pImage) log_image(d, device, fx.use, *pImage, is_bc);
-    if (res == VK_SUCCESS && g_gpu_time && pImage && *pImage)
+    if (res == VK_SUCCESS && g_gpu_time && pImage && *pImage) // usage as the driver got it (RT_COMPRESS may strip STORAGE)
         img_put(g_img_info, (struct ImgNode){(uint64_t)*pImage, *pImage, pCreateInfo->format, pCreateInfo->extent.width,
                 pCreateInfo->extent.height, 0, pCreateInfo->mipLevels, 0, pCreateInfo->arrayLayers, pCreateInfo->samples,
-                pCreateInfo->usage, NULL});
+                fx.use->usage, NULL});
     if (res == VK_SUCCESS && g_rt_compress && pImage && *pImage && (pCreateInfo->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
         (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !is_bc) {
         if (fx.rt_stripped) {
@@ -3646,7 +5290,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBufferView(
             fprintf(stderr, "mali-compat: buffer view %d with offset %llu (not 64-aligned), format %d, range %llu\n", n + 1,
                     (unsigned long long)pCreateInfo->offset, pCreateInfo->format, (unsigned long long)pCreateInfo->range);
     }
-    return d->fpCreateBufferView(device, pCreateInfo, pAllocator, pView);
+    VkResult r = d->fpCreateBufferView(device, pCreateInfo, pAllocator, pView);
+    if (g_dc_on && r == VK_SUCCESS) dc_view_create(*pView, pCreateInfo);
+    return r;
 }
 
 // MALI_COMPAT_FAKE_OCCLUSION=1: every occlusion query result reads as "visible" (0x10000 samples, available), for the
@@ -3722,7 +5368,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
         mod.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
 
-    return d->fpCreateBuffer(device, &mod, pAllocator, pBuffer);
+    VkResult r = d->fpCreateBuffer(device, &mod, pAllocator, pBuffer);
+    if (g_dc_on && r == VK_SUCCESS) dc_buf_create(d, *pBuffer, &mod);
+    return r;
 }
 
 // -----------------------------------------------------------------------------
@@ -3738,6 +5386,7 @@ struct MemInfo {
     VkDeviceMemory memory;
     VkDeviceSize size;
     uint32_t type;
+    uint32_t heap; // accounted in g_heap_usage[heap] (BUDGET_NO_HEAP = not counted)
     void *orig;   // driver's mapping address while placed, else NULL
     void *placed; // where the mapping lives for the app
     size_t map_size;
@@ -3759,12 +5408,14 @@ static struct MemInfo *mem_find(VkDeviceMemory m) {
     return NULL;
 }
 
-static void mem_add(VkDeviceMemory m, VkDeviceSize size, uint32_t type) {
+static void mem_add(VkDeviceMemory m, VkDeviceSize size, uint32_t type, uint32_t heap) {
     struct MemInfo *e = calloc(1, sizeof *e);
-    if (!e) return;
+    if (!e) return; // not tracked, so not accounted either (vkFreeMemory finds no entry to subtract)
     e->memory = m;
     e->size = size;
     e->type = type;
+    e->heap = heap;
+    budget_add(heap, size);
     pthread_mutex_lock(&g_mem_mutex);
     uint32_t b = mem_bucket(m);
     e->next = g_mem[b];
@@ -3942,6 +5593,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
     VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
     const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMemory) {
     struct DeviceData *d = get_device_data(device);
+    // K-CF2: an app-supplied dma-buf fd import is the exporter's memory, so the budget does not count it
+    const bool fd_import = find_struct(pAllocateInfo->pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR) != NULL;
 
     // dma-buf export (MALI_COMPAT_DMABUF_EXPORT): the memory comes from the dma-heap and is imported into the driver
     struct unlinked u_exp = {0}, u_mwsi = {0};
@@ -4003,8 +5656,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
 
     VkResult res = d->fpAllocateMemory(device, &mod, pAllocator, pMemory);
     if (res == VK_SUCCESS) {
-        atomic_fetch_add(&g_allocated_bytes, pAllocateInfo->allocationSize);
-        mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex);
+        uint32_t heap = fd_import || mod.memoryTypeIndex >= VK_MAX_MEMORY_TYPES ? BUDGET_NO_HEAP : d->type_heap[mod.memoryTypeIndex];
+        mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex, heap);
+        if (g_dc_on) dc_mem_alloc(d, device, *pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex, dc_mem_devaddr(mod.pNext));
     }
     if (keep_import_fd >= 0) {
         struct ExportMem *e = res == VK_SUCCESS ? malloc(sizeof *e) : NULL;
@@ -4078,6 +5732,8 @@ static VKAPI_ATTR void VKAPI_CALL compat_FreeMemory(
         pthread_mutex_unlock(&g_export_mutex);
     }
     struct MemInfo *e = memory ? mem_remove(memory) : NULL;
+    if (e) budget_sub(e->heap, e->size);
+    if (g_dc_on) dc_dead(DCK_MEM, (uint64_t)memory); // mem_remove unlinks under g_mem_mutex, so each entry is subtracted once
     if (e && e->orig) {
         // Freeing unmaps implicitly; let the driver do it on its own address and keep Wine's range reserved.
         pthread_mutex_lock(&g_mem_mutex);
@@ -4102,36 +5758,88 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdBindPipeline(VkCommandBuffer command
     }
     if (!c) { if (drv) get_device_data_by_cmd(commandBuffer)->fpCmdBindPipeline(commandBuffer, bindPoint, drv); return; }
     if (bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) c->compute_pipeline = pipeline;
-    else if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) c->gfx_pipeline = pipeline;
+    else if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        c->gfx_pipeline = pipeline;
+        struct HashNode h;
+        c->gfx_flags = g_gpu_time && hash_get(g_pipeline_hash, (uint64_t)pipeline, &h) ? (uint16_t)h.flags : 0;
+    }
     if (drv) c->dev->fpCmdBindPipeline(commandBuffer, bindPoint, drv);
+}
+
+// Record one app push (v1 or v2) for the restore after a BC decode (pc2-restore-1: shared by both entry points).
+// Same layout/stages/range as an earlier record: update it in place with a new seq (replay order = app order, D3a:
+// was a memmove to the end). Full: the record with the smallest seq (the oldest) is overwritten.
+static void push_record(struct CmdBufData *c, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t offset,
+                        uint32_t size, const void *pValues, bool v2) {
+    if (!atomic_load_explicit(&g_bc_seen, memory_order_acquire)) {
+        c->push_untracked = true; // nothing to restore for yet (D3b); noted in case this buffer decodes later
+        return;
+    }
+    uint32_t i = 0;
+    while (i < c->push_count && !(c->push[i].layout == layout && c->push[i].stages == stages &&
+                                  c->push[i].offset == offset && c->push[i].size == size)) i++;
+    if (i == c->push_count) {
+        if (c->push_count < PUSH_RECS) c->push_count++;
+        else {
+            i = 0;
+            for (uint32_t k = 1; k < PUSH_RECS; k++)
+                if (c->push[k].seq < c->push[i].seq) i = k;
+        }
+    }
+    struct PushRec *r = &c->push[i];
+    r->layout = layout;
+    r->stages = stages;
+    r->offset = offset;
+    r->size = size;
+    r->seq = ++c->push_seq;
+    r->v2 = v2;
+    memcpy(r->data, pValues, size);
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
                                                           VkShaderStageFlags stages, uint32_t offset, uint32_t size,
                                                           const void *pValues) {
+    atomic_fetch_add_explicit(&g_pc2_v1, 1, memory_order_relaxed);
     struct CmdBufData *c = cmd_data(commandBuffer);
     if (!c) {
         get_device_data_by_cmd(commandBuffer)->fpCmdPushConstants(commandBuffer, layout, stages, offset, size, pValues);
         return;
     }
-    if (offset + size <= 256) {
-        // Same layout/stages/range as an earlier record: update it and move it to the end (replay order = app order).
-        uint32_t i = 0;
-        while (i < c->push_count && !(c->push[i].layout == layout && c->push[i].stages == stages &&
-                                      c->push[i].offset == offset && c->push[i].size == size)) i++;
-        if (i == c->push_count && c->push_count == PUSH_RECS) i = 0; // full: drop the oldest
-        if (i < c->push_count) {
-            memmove(&c->push[i], &c->push[i + 1], (c->push_count - i - 1) * sizeof c->push[0]);
-            c->push_count--;
-        }
-        struct PushRec *r = &c->push[c->push_count++];
-        r->layout = layout;
-        r->stages = stages;
-        r->offset = offset;
-        r->size = size;
-        memcpy(r->data, pValues, size);
-    }
+    if (offset + size <= 256) push_record(c, layout, stages, offset, size, pValues, false);
     c->dev->fpCmdPushConstants(commandBuffer, layout, stages, offset, size, pValues);
+}
+
+// vkCmdPushConstants2 / vkCmdPushConstants2KHR (pc2-restore-1): recorded like v1. A push with layout VK_NULL_HANDLE
+// (layout given as VkPipelineLayoutCreateInfo in pNext) or past 256 bytes is not recorded, only counted.
+static void push2_common(VkCommandBuffer commandBuffer, const VkPushConstantsInfo *info, bool khr) {
+    atomic_fetch_add_explicit(&g_pc2_v2, 1, memory_order_relaxed);
+    struct CmdBufData *c = cmd_data(commandBuffer);
+    struct DeviceData *d = c ? c->dev : get_device_data_by_cmd(commandBuffer);
+    if (info && (info->layout == VK_NULL_HANDLE || info->offset + info->size > 256))
+        atomic_fetch_add_explicit(&g_pc2_v2_unrec, 1, memory_order_relaxed);
+    else if (c && info)
+        push_record(c, info->layout, info->stageFlags, info->offset, info->size, info->pValues, true);
+    PFN_vkCmdPushConstants2 fp = khr ? d->fpCmdPushConstants2KHR : d->fpCmdPushConstants2;
+    fp(commandBuffer, info);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants2(VkCommandBuffer commandBuffer, const VkPushConstantsInfo *info) {
+    push2_common(commandBuffer, info, false);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants2KHR(VkCommandBuffer commandBuffer, const VkPushConstantsInfo *info) {
+    push2_common(commandBuffer, info, true);
+}
+
+static void *pc2_log_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        sleep(10);
+        unsigned long long v1 = atomic_load(&g_pc2_v1), v2 = atomic_load(&g_pc2_v2), un = atomic_load(&g_pc2_v2_unrec),
+                           dec = atomic_load(&g_pc2_decodes), dv2 = atomic_load(&g_pc2_decodes_v2);
+        if (v1 | v2 | un | dec | dv2)
+            fprintf(stderr, "mali-compat: pc2: v1 pushes %llu, v2 pushes %llu, v2 unrecorded %llu, BC decodes %llu, "
+                    "decodes replaying v2 %llu\n", v1, v2, un, dec, dv2);
+    }
+    return NULL;
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_CmdBindDescriptorBuffersEXT(VkCommandBuffer commandBuffer, uint32_t count,
@@ -4151,7 +5859,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
     struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
     struct TrackedBCImage tracked;
 
-    if (!d || !find_bc_image(dstImage, &tracked)) {
+    if (!d || !atomic_load_explicit(&g_bc_seen, memory_order_acquire) || !find_bc_image(dstImage, &tracked)) {
         d->fpCmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions);
         return;
     }
@@ -4242,10 +5950,30 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
     // Give the app its compute pipeline and push constants back (H1).
     if (cstate->compute_pipeline)
         d->fpCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cstate->compute_pipeline);
-    for (uint32_t i = 0; i < cstate->push_count; i++) {
-        const struct PushRec *pr = &cstate->push[i];
-        d->fpCmdPushConstants(commandBuffer, pr->layout, pr->stages, pr->offset, pr->size, pr->data);
+    // In seq order: each round the smallest seq above the last one replayed (<= 8 records, once per BC upload).
+    bool replayed_v2 = false;
+    for (uint32_t done = 0, last = 0; done < cstate->push_count; done++) {
+        const struct PushRec *pr = NULL;
+        for (uint32_t i = 0; i < cstate->push_count; i++)
+            if (cstate->push[i].seq > last && (!pr || cstate->push[i].seq < pr->seq)) pr = &cstate->push[i];
+        if (!pr) break;
+        // with the entry point the app used (pc2-restore-1); v2 without the app's pNext (only a layout create info
+        // can be there, and such pushes are not recorded)
+        PFN_vkCmdPushConstants2 fp2 = d->fpCmdPushConstants2KHR ? d->fpCmdPushConstants2KHR : d->fpCmdPushConstants2;
+        if (pr->v2 && fp2) {
+            VkPushConstantsInfo pi = {VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO, NULL, pr->layout, pr->stages, pr->offset,
+                                      pr->size, pr->data};
+            fp2(commandBuffer, &pi);
+            replayed_v2 = true;
+        } else {
+            d->fpCmdPushConstants(commandBuffer, pr->layout, pr->stages, pr->offset, pr->size, pr->data);
+        }
+        last = pr->seq;
     }
+    atomic_fetch_add_explicit(&g_pc2_decodes, 1, memory_order_relaxed);
+    if (replayed_v2) atomic_fetch_add_explicit(&g_pc2_decodes_v2, 1, memory_order_relaxed);
+    if (cstate->push_untracked && !atomic_exchange(&g_bc_untracked_logged, true))
+        LOG("BC decode in a command buffer with push constants from before the first BC image: restore may be incomplete");
     // Only with MALI_COMPAT_VENDOR_ID: the recorded writes can name image/buffer views the app has destroyed since,
     // and pushing them again crashed Horizon Zero Dawn's benchmark load (C0000005, 2026-10-28 22:49).
     if (g_vendor_id && cstate->cpd.layout && !cstate->cpd.bad && cstate->cpd.count && d->fpCmdPushDescriptorSetKHR)
@@ -4279,7 +6007,8 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage2(
     struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
     struct TrackedBCImage tracked;
 
-    if (!d || !find_bc_image(pCopyBufferToImageInfo->dstImage, &tracked)) {
+    if (!d || !atomic_load_explicit(&g_bc_seen, memory_order_acquire) ||
+        !find_bc_image(pCopyBufferToImageInfo->dstImage, &tracked)) {
         if (d && d->fpCmdCopyBufferToImage2) {
             d->fpCmdCopyBufferToImage2(commandBuffer, pCopyBufferToImageInfo);
         }
@@ -4363,10 +6092,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_ResetCommandPool(
                     e->compute_pipeline = VK_NULL_HANDLE;
                     e->descriptor_buffers = false;
                     e->push_count = 0;
+                    e->push_seq = 0;
+                    e->push_untracked = false;
                     e->cpd.layout = VK_NULL_HANDLE;
                     e->gpd.layout = VK_NULL_HANDLE;
                     e->gfx_pipeline = VK_NULL_HANDLE;
                     e->gt_rec = -1;
+                    e->gt_susp = false;
                     e->gt_src = VK_NULL_HANDLE;
                 }
             }
@@ -4415,18 +6147,27 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyCommandPool(
 // -----------------------------------------------------------------------------
 #define GT_SLOTS 16384
 enum { GT_PASS = 1, GT_DISPATCH = 2 };
+// A pass's attachments (request K1 of the Witcher agent, 2026-10-30): the first GT_ATT-1 colour targets and the
+// depth/stencil one, each with its format, load/store op, whether the image reached the driver with STORAGE (= no AFBC
+// on this driver) and the KiB the render area covers. sig hashes formats and ops (not sizes) for the grouping.
+#define GT_ATT 5
+struct GtAtt { uint32_t fmt[GT_ATT], kib[GT_ATT]; uint8_t ops[GT_ATT]; uint8_t n; uint32_t sig; };
 struct GtRec {
     _Atomic int state; // 0 free, 1 recorded
     uint8_t kind;
     bool stuck_reported, inflight;
+    bool susp_open; // the pass suspended and its end timestamp waits for the final resuming part (K4)
     uint32_t w, h, colors, draws;
     VkPipeline pipeline;
     uint64_t t_ns; // when recorded
     // details for STUCK / TRACE lines: attachments, rendering layer count, first draw, source view
     VkImageView color0, depth, src;
     uint32_t rlayers, vcount, icount;
+    struct GtAtt att; // attachment formats and load/store ops (dynamic rendering), also a grouping key of the report
+    struct GtCnt cnt; // eq / dw / vsw / vxi of the pass's draws
 };
-struct GtAgg { uint8_t kind; uint32_t w, h, colors; VkPipeline pipeline; uint64_t sum_ns, max_ns, draws; uint32_t count; };
+struct GtAgg { uint8_t kind; uint32_t w, h, colors; VkPipeline pipeline; uint64_t sum_ns, max_ns, draws; uint32_t count;
+               struct GtAtt att; struct GtCnt cnt; };
 #define GT_AGG 4096
 struct GpuTime {
     struct DeviceData *d;
@@ -4436,7 +6177,9 @@ struct GpuTime {
     uint32_t next;
     struct GtRec rec[GT_SLOTS];
     struct GtAgg agg[GT_AGG];
+    struct GtCnt tot; // since start, over the measured passes (gt thread only)
     uint32_t recorded, dropped;
+    uint64_t chain_split; // suspend/resume chains that resumed in another command buffer, not timed (gt thread only)
     char path[96];
     pthread_t thread;
     _Atomic bool stop;
@@ -4446,6 +6189,7 @@ struct GpuTime {
     PFN_vkDestroyQueryPool fpDestroyQueryPool;
     PFN_vkCmdBeginRendering fpCmdBeginRendering;
     PFN_vkCmdEndRendering fpCmdEndRendering;
+    PFN_vkCmdPipelineBarrier2 fpCmdPipelineBarrier2; // SUSRES_BARRIER
     PFN_vkCmdBeginRenderPass fpCmdBeginRenderPass;
     PFN_vkCmdEndRenderPass fpCmdEndRenderPass;
     PFN_vkCmdBeginRenderPass2 fpCmdBeginRenderPass2;
@@ -4464,15 +6208,164 @@ struct GpuTime {
     PFN_vkCmdDrawMeshTasksIndirectEXT fpCmdDrawMeshTasksIndirectEXT;
     PFN_vkCmdDrawMeshTasksIndirectCountEXT fpCmdDrawMeshTasksIndirectCountEXT;
     PFN_vkCmdDispatchBase fpCmdDispatchBase;
+    PFN_vkCmdExecuteCommands fpCmdExecuteCommands;
+    PFN_vkQueueSubmit fpQueueSubmit;
+    PFN_vkQueueSubmit2 fpQueueSubmit2;
+    PFN_vkWaitForFences fpWaitForFences;
+    PFN_vkWaitSemaphores fpWaitSemaphores;
+    PFN_vkQueueWaitIdle fpQueueWaitIdle;
+    PFN_vkDeviceWaitIdle fpDeviceWaitIdle;
 };
+
+// Queue-side CPU time per thread (request K3 of the Witcher agent, 2026-10-30): calls of vkQueueSubmit(2) and of the
+// waits (fences, timeline semaphores, queue/device idle) and the CPU time spent in them, per 5-s report. It tells a
+// GPU that idles because the CPU submits late (little time in waits) from a CPU that waits on the GPU. Present and
+// acquire never reach this layer (Arm's WSI layer above implements the swapchain); its own submits and fence waits
+// do, under its thread names. Slot QSTAT_MAX-1 takes every thread beyond the first ones.
+enum { QS_SUBMIT, QS_WAIT, QS_IDLE, QS_N };
+#define QSTAT_MAX 32
+struct QStat { char comm[16]; _Atomic uint64_t n[QS_N], ns[QS_N], cbs; };
+static struct QStat g_qstat[QSTAT_MAX];
+static _Atomic uint32_t g_qstat_n;
+static __thread struct QStat *tl_qstat;
+static struct QStat *qstat_self(void) {
+    if (tl_qstat) return tl_qstat;
+    uint32_t i = atomic_fetch_add(&g_qstat_n, 1);
+    struct QStat *q = &g_qstat[i < QSTAT_MAX - 1 ? i : QSTAT_MAX - 1];
+    if (i < QSTAT_MAX - 1) {
+        char comm[16] = "?";
+        FILE *f = fopen("/proc/thread-self/comm", "r");
+        if (f) { if (fgets(comm, sizeof comm, f)) comm[strcspn(comm, "\n")] = 0; fclose(f); }
+        memcpy(q->comm, comm, sizeof comm);
+    } else if (i == QSTAT_MAX - 1) {
+        snprintf(q->comm, sizeof q->comm, "others");
+    }
+    return tl_qstat = q;
+}
+static void qstat_add(int kind, uint64_t t0, uint32_t cbs) {
+    struct QStat *q = qstat_self();
+    atomic_fetch_add_explicit(&q->n[kind], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&q->ns[kind], now_ns() - t0, memory_order_relaxed);
+    if (cbs) atomic_fetch_add_explicit(&q->cbs, cbs, memory_order_relaxed);
+}
+
+// Wait callers (K-WC1, perf-review request (b), [keeper, Claude Opus 5.5] 2026-11-01), MALI_COMPAT_WAIT_CALLERS=1 with
+// MALI_COMPAT_GPU_TIME=1: every vkWaitForFences / vkWaitSemaphores is counted per (waiting thread, caller address,
+// kind of the waited-for fence, thread that submitted it). The caller is __builtin_return_address(0) as lib+offset
+// (dladdr at report time): winevulkan's thunk for app waits, Arm's WSI layer for its own. A fence is classified at
+// vkQueueSubmit(2): "cmd" = submitted with command buffers, "nocb-wait" = no command buffers but wait semaphores (the
+// WSI layer's present payload and the present fence that DXVK's presenter waits on: VkSwapchainPresentFenceInfo),
+// "nocb" = neither, "untracked" = never seen in a submit; vkWaitSemaphores = "timeline". "age" = wait start minus the
+// fence's submit time: how many frames back the waiter looks. Durations in 8 bins. Printed with each 5-s report.
+enum { WK_UNTRACKED, WK_CMD, WK_NOCB_WAIT, WK_NOCB, WK_TIMELINE, WK_N };
+static const char *const wk_name[WK_N] = {"untracked", "cmd", "nocb-wait", "nocb", "timeline"};
+#define WC_FENCES 2048 // open addressing, power of 2; a full table drops new tags (they wait as "untracked")
+#define WC_MAX 48
+struct WcFence { uint64_t fence, submit_ns; struct QStat *by; uint8_t kind; };
+struct WcStat { struct QStat *who, *by; uintptr_t ra; uint8_t kind; uint64_t n, ns, max_ns, age_ns, age_n, hist[8]; };
+static struct WcFence g_wc_fence[WC_FENCES];
+static struct WcStat g_wc[WC_MAX];
+static uint32_t g_wc_n, g_wc_dropped;
+static pthread_mutex_t g_wc_m = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t wc_slot(uint64_t fence) { return (uint32_t)((fence * 0x9E3779B97F4A7C15ull) >> 40) & (WC_FENCES - 1); }
+static void wc_tag(uint64_t fence, uint8_t kind) {
+    if (!fence) return;
+    struct QStat *by = qstat_self();
+    uint64_t t = now_ns();
+    pthread_mutex_lock(&g_wc_m);
+    for (uint32_t i = wc_slot(fence), k = 0; k < 64; k++, i = (i + 1) & (WC_FENCES - 1)) {
+        struct WcFence *e = &g_wc_fence[i];
+        // a slot is reused once its fence is 10 s old: fences of a destroyed swapchain/device age out
+        if (e->fence == fence || !e->fence || t - e->submit_ns > 10000000000ull) {
+            e->fence = fence; e->submit_ns = t; e->by = by; e->kind = kind;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_wc_m);
+}
+static uint8_t wc_submit_kind(uint32_t cbs, uint32_t waits) { return cbs ? WK_CMD : waits ? WK_NOCB_WAIT : WK_NOCB; }
+static int wc_bin(uint64_t ns) {
+    static const uint64_t edge[7] = {100000, 500000, 1000000, 2000000, 4000000, 8000000, 16000000};
+    int b = 0;
+    while (b < 7 && ns >= edge[b]) b++;
+    return b;
+}
+static void wc_add(uintptr_t ra, uint64_t fence, uint8_t kind, uint64_t t0) {
+    uint64_t t1 = now_ns(), dur = t1 - t0, age = 0;
+    struct QStat *who = qstat_self(), *by = NULL;
+    pthread_mutex_lock(&g_wc_m);
+    if (fence) {
+        for (uint32_t i = wc_slot(fence), k = 0; k < 64; k++, i = (i + 1) & (WC_FENCES - 1)) {
+            struct WcFence *e = &g_wc_fence[i];
+            if (!e->fence) break;
+            if (e->fence == fence) { kind = e->kind; by = e->by; age = t0 > e->submit_ns ? t0 - e->submit_ns : 0; break; }
+        }
+    }
+    struct WcStat *w = NULL;
+    for (uint32_t i = 0; i < g_wc_n; i++)
+        if (g_wc[i].who == who && g_wc[i].ra == ra && g_wc[i].kind == kind && g_wc[i].by == by) { w = &g_wc[i]; break; }
+    if (!w && g_wc_n < WC_MAX) { w = &g_wc[g_wc_n++]; memset(w, 0, sizeof *w); w->who = who; w->ra = ra; w->kind = kind; w->by = by; }
+    if (w) {
+        w->n++; w->ns += dur;
+        if (dur > w->max_ns) w->max_ns = dur;
+        if (by) { w->age_ns += age; w->age_n++; }
+        w->hist[wc_bin(dur)]++;
+    } else {
+        g_wc_dropped++;
+    }
+    pthread_mutex_unlock(&g_wc_m);
+}
+static void wc_caller(uintptr_t ra, char *out, size_t len) {
+    Dl_info di;
+    if (ra && dladdr((void *)ra, &di) && di.dli_fname) {
+        const char *b = strrchr(di.dli_fname, '/');
+        b = b ? b + 1 : di.dli_fname;
+        if (di.dli_sname && di.dli_saddr)
+            snprintf(out, len, "%s+0x%lx (%s+0x%lx)", b, (unsigned long)(ra - (uintptr_t)di.dli_fbase), di.dli_sname,
+                     (unsigned long)(ra - (uintptr_t)di.dli_saddr));
+        else
+            snprintf(out, len, "%s+0x%lx", b, (unsigned long)(ra - (uintptr_t)di.dli_fbase));
+    } else {
+        snprintf(out, len, "0x%lx", (unsigned long)ra);
+    }
+}
+// One line per (waiter, caller, kind, submitter) since the last report, then reset. Called from gt_report.
+static void wc_report(FILE *f, double interval_s) {
+    pthread_mutex_lock(&g_wc_m);
+    for (uint32_t i = 0; i < g_wc_n; i++) {
+        struct WcStat *w = &g_wc[i];
+        if (!w->n) continue;
+        char caller[192];
+        wc_caller(w->ra, caller, sizeof caller);
+        fprintf(f, "wait caller: %s <- %s kind %s", w->who && w->who->comm[0] ? w->who->comm : "?", caller, wk_name[w->kind]);
+        if (w->by) fprintf(f, " (submitted by %s, age %.2f ms)", w->by->comm[0] ? w->by->comm : "?", w->age_ns / 1e6 / w->age_n);
+        fprintf(f, ": n %llu, %.1f ms (%.1f %% of wall), mean %.3f, max %.2f ms | <0.1 %llu <0.5 %llu <1 %llu <2 %llu <4 %llu"
+                   " <8 %llu <16 %llu >=16 %llu\n", (unsigned long long)w->n, w->ns / 1e6,
+                interval_s > 0 ? 100.0 * w->ns / 1e9 / interval_s : 0, w->ns / 1e6 / w->n, w->max_ns / 1e6,
+                (unsigned long long)w->hist[0], (unsigned long long)w->hist[1], (unsigned long long)w->hist[2],
+                (unsigned long long)w->hist[3], (unsigned long long)w->hist[4], (unsigned long long)w->hist[5],
+                (unsigned long long)w->hist[6], (unsigned long long)w->hist[7]);
+    }
+    if (g_wc_dropped) fprintf(f, "wait caller: %u waits not counted (more than %d keys)\n", g_wc_dropped, WC_MAX);
+    // keep the keys (stable order between reports), zero the counters
+    for (uint32_t i = 0; i < g_wc_n; i++) {
+        struct WcStat *w = &g_wc[i];
+        w->n = w->ns = w->max_ns = w->age_ns = w->age_n = 0;
+        memset(w->hist, 0, sizeof w->hist);
+    }
+    g_wc_dropped = 0;
+    pthread_mutex_unlock(&g_wc_m);
+}
 
 // Calls per hooked entry point, printed with each report: shows which draw path the app really uses.
 enum { GTC_DRAW, GTC_DRAW_INDEXED, GTC_DRAW_INDIRECT, GTC_DRAW_INDEXED_INDIRECT, GTC_DRAW_INDIRECT_COUNT,
        GTC_DRAW_INDEXED_INDIRECT_COUNT, GTC_DRAW_MULTI, GTC_DRAW_MULTI_INDEXED, GTC_MESH, GTC_MESH_INDIRECT,
-       GTC_MESH_INDIRECT_COUNT, GTC_DISPATCH, GTC_DISPATCH_INDIRECT, GTC_DISPATCH_BASE, GTC_RENDERING, GTC_RENDERPASS, GTC_N };
+       GTC_MESH_INDIRECT_COUNT, GTC_DISPATCH, GTC_DISPATCH_INDIRECT, GTC_DISPATCH_BASE, GTC_RENDERING, GTC_RENDERPASS,
+       GTC_EXECUTE, GTC_N };
 static const char *const g_gtc_name[GTC_N] = {"Draw", "DrawIndexed", "DrawIndirect", "DrawIndexedIndirect", "DrawIndirectCount",
     "DrawIndexedIndirectCount", "DrawMultiEXT", "DrawMultiIndexedEXT", "DrawMeshTasksEXT", "DrawMeshTasksIndirectEXT",
-    "DrawMeshTasksIndirectCountEXT", "Dispatch", "DispatchIndirect", "DispatchBase", "BeginRendering", "BeginRenderPass"};
+    "DrawMeshTasksIndirectCountEXT", "Dispatch", "DispatchIndirect", "DispatchBase", "BeginRendering", "BeginRenderPass",
+    "ExecuteCommands"};
 static _Atomic uint64_t g_gtc[GTC_N];
 #define GTC(i) atomic_fetch_add_explicit(&g_gtc[i], 1, memory_order_relaxed)
 
@@ -4498,9 +6391,11 @@ static int32_t gt_begin(struct CmdBufData *c, VkCommandBuffer cmd, uint8_t kind,
     struct GtRec *r = &g->rec[i];
     if (atomic_load(&r->state)) { g->dropped++; pthread_mutex_unlock(&g->m); return -1; }
     r->kind = kind; r->w = w; r->h = h; r->colors = colors; r->draws = 0; r->pipeline = pipeline;
-    r->stuck_reported = r->inflight = false;
+    r->stuck_reported = r->inflight = r->susp_open = false;
     r->color0 = r->depth = r->src = VK_NULL_HANDLE;
     r->rlayers = r->vcount = r->icount = 0;
+    memset(&r->att, 0, sizeof r->att);
+    memset(&r->cnt, 0, sizeof r->cnt);
     r->t_ns = gt_now();
     atomic_store(&r->state, 1);
     g->recorded++;
@@ -4538,6 +6433,97 @@ static void gt_view_desc(const char *name, VkImageView v, struct ImgNode *out, c
     *out = n;
 }
 
+// Short names of the usual render-target formats for the report; the others print as their number.
+static const char *gt_fmt_name(uint32_t f, char *buf, size_t len) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: return "r8";
+    case VK_FORMAT_R8G8_UNORM: return "rg8";
+    case VK_FORMAT_R8G8B8A8_UNORM: return "rgba8";
+    case VK_FORMAT_R8G8B8A8_SRGB: return "rgba8srgb";
+    case VK_FORMAT_B8G8R8A8_UNORM: return "bgra8";
+    case VK_FORMAT_B8G8R8A8_SRGB: return "bgra8srgb";
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "rgb10a2";
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return "bgr10a2";
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return "r11g11b10f";
+    case VK_FORMAT_R16_SFLOAT: return "r16f";
+    case VK_FORMAT_R16G16_SFLOAT: return "rg16f";
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return "rgba16f";
+    case VK_FORMAT_R16G16B16A16_UNORM: return "rgba16";
+    case VK_FORMAT_R32_SFLOAT: return "r32f";
+    case VK_FORMAT_R32_UINT: return "r32ui";
+    case VK_FORMAT_R32G32_SFLOAT: return "rg32f";
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return "rgba32f";
+    case VK_FORMAT_D16_UNORM: return "d16";
+    case VK_FORMAT_X8_D24_UNORM_PACK32: return "x8d24";
+    case VK_FORMAT_D32_SFLOAT: return "d32";
+    case VK_FORMAT_D24_UNORM_S8_UINT: return "d24s8";
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return "d32s8";
+    default: snprintf(buf, len, "fmt%u", f); return buf;
+    }
+}
+
+// Bytes per pixel of a render-target format (4 for the ones not listed).
+static uint32_t gt_fmt_bytes(uint32_t f) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SNORM: return 1;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_D16_UNORM: return 2;
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return 5;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32_UINT: return 8;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_UINT: return 16;
+    default: return 4;
+    }
+}
+
+// ops: bits 0-1 load (LOAD, CLEAR, DONT_CARE, NONE), 2-3 store (STORE, DONT_CARE, NONE), 16 STORAGE, 32 slot used,
+// 64 depth/stencil.
+static void gt_att_add(struct GtAtt *a, const VkRenderingAttachmentInfo *ai, uint32_t w, uint32_t h, uint32_t layers, bool ds) {
+    if (a->n >= GT_ATT) return;
+    uint32_t k = a->n++;
+    a->fmt[k] = a->kib[k] = 0;
+    a->ops[k] = ds ? 64 : 0;
+    if (!ai || !ai->imageView) return; // unused colour slot
+    struct ImgNode v = {0}, im = {0};
+    img_get(g_view_info, (uint64_t)ai->imageView, &v);
+    if (v.image) img_get(g_img_info, (uint64_t)v.image, &im);
+    a->fmt[k] = v.format ? (uint32_t)v.format : (uint32_t)im.format;
+    uint8_t lc = ai->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 0 : ai->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1
+               : ai->loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE ? 2 : 3;
+    uint8_t sc = ai->storeOp == VK_ATTACHMENT_STORE_OP_STORE ? 0 : ai->storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE ? 1 : 2;
+    a->ops[k] |= lc | sc << 2 | ((im.usage & VK_IMAGE_USAGE_STORAGE_BIT) ? 16 : 0) | 32;
+    uint64_t bytes = (uint64_t)w * h * (layers ? layers : 1) * gt_fmt_bytes(a->fmt[k]) * (im.samples ? im.samples : 1);
+    a->kib[k] = (uint32_t)(bytes >> 10);
+}
+
+static void gt_att_sign(struct GtAtt *a) {
+    uint32_t s = 2166136261u;
+    for (uint32_t k = 0; k < a->n; k++) {
+        s = (s ^ a->fmt[k]) * 16777619u;
+        s = (s ^ a->ops[k]) * 16777619u;
+    }
+    a->sig = a->n ? s : 0;
+}
+
+// " | c0 rgba16f L/S st 4.4M c1 ... d d24s8 C/D 4.4M": per attachment format, load/store op, "st" = created with
+// STORAGE (uncompressed on this driver), the MiB the render area covers; "-" for an unused colour slot.
+static void gt_att_desc(const struct GtAtt *a, char *out, size_t len) {
+    static const char lc[] = "LCDN", sc[] = "SDN?";
+    size_t n = 0;
+    out[0] = 0;
+    if (!a->n || len < 8) return;
+    n += snprintf(out, len, "  |");
+    for (uint32_t k = 0, ci = 0; k < a->n && n < len; k++) {
+        char fb[16], name[8];
+        uint8_t o = a->ops[k];
+        if (o & 64) snprintf(name, sizeof name, "d");
+        else snprintf(name, sizeof name, "c%u", ci++);
+        if (!(o & 32)) n += snprintf(out + n, len - n, " %s -", name);
+        else n += snprintf(out + n, len - n, " %s %s %c/%c%s %.1fM", name, gt_fmt_name(a->fmt[k], fb, sizeof fb), lc[o & 3],
+                           sc[(o >> 2) & 3], (o & 16) ? " st" : "", a->kib[k] / 1024.0);
+    }
+}
+
 static void gt_line_rec(FILE *f, const char *tag, const struct GtRec *r, double age_s, double dur_ms) {
     char desc[160], c0[200], dp[200], src[200];
     struct ImgNode nc, nd, ns;
@@ -4546,10 +6532,12 @@ static void gt_line_rec(FILE *f, const char *tag, const struct GtRec *r, double 
     gt_view_desc("depth", r->depth, &nd, dp, sizeof dp);
     gt_view_desc("src", r->src, &ns, src, sizeof src);
     bool same = ns.image && (ns.image == nc.image || ns.image == nd.image);
-    fprintf(f, "%s %s %ux%u c%u draws %u (first: %u verts x %u inst) rlayers %u, %s %.1f %s, %s%s%s%s%s\n", tag,
+    char att[256];
+    gt_att_desc(&r->att, att, sizeof att);
+    fprintf(f, "%s %s %ux%u c%u draws %u (first: %u verts x %u inst) rlayers %u, %s %.1f %s, %s%s%s%s%s%s\n", tag,
             r->kind == GT_PASS ? "pass" : "dispatch", r->w, r->h, r->colors, r->draws, r->vcount, r->icount, r->rlayers,
             dur_ms >= 0 ? "took" : "recorded", dur_ms >= 0 ? dur_ms : age_s, dur_ms >= 0 ? "ms" : "s ago", desc, c0, dp, src,
-            same ? "  SAME-IMAGE" : "");
+            same ? "  SAME-IMAGE" : "", att);
 }
 
 // MALI_COMPAT_GT_TRACE: does this record's pipeline have the traced fragment/compute shader?
@@ -4590,8 +6578,9 @@ static void gt_report(struct GpuTime *g, double interval_s) {
             uint64_t c = atomic_load(&g_gtc[k]);
             if (c) fprintf(f, " %s %llu", g_gtc_name[k], (unsigned long long)c);
         }
-        fprintf(f, " | suspending passes %llu, resuming %llu", (unsigned long long)atomic_load(&g_susp_passes),
-                (unsigned long long)atomic_load(&g_resu_passes));
+        fprintf(f, " | suspending passes %llu, resuming %llu, chains across command buffers %llu (untimed), barriers before resumed parts %llu",
+                (unsigned long long)atomic_load(&g_susp_passes), (unsigned long long)atomic_load(&g_resu_passes),
+                (unsigned long long)g->chain_split, (unsigned long long)atomic_load(&g_susres_barriers));
         fprintf(f, " | firstInstance!=0 draws %llu, divisor!=1 pipelines %llu, vertex inputs %llu",
                 (unsigned long long)atomic_load(&g_div_draws), (unsigned long long)atomic_load(&g_div_pipes),
                 (unsigned long long)atomic_load(&g_div_vi));
@@ -4602,6 +6591,13 @@ static void gt_report(struct GpuTime *g, double interval_s) {
         if (g_noatt_w) fprintf(f, " | attachment-less passes clamped %llu", (unsigned long long)atomic_load(&g_noatt_clamped));
         if (g_xfb_vs) fprintf(f, " | stream-output pipelines without GS %llu", (unsigned long long)atomic_load(&g_xfb_vs_pipes));
         if (g_skip_hash) fprintf(f, " | skipped draws (%08x) %llu", g_skip_hash, (unsigned long long)atomic_load(&g_skipped_draws));
+        fprintf(f, " | draws eq %llu, dw %llu, vsw %llu, vxi %.1fM", (unsigned long long)g->tot.eq,
+                (unsigned long long)g->tot.dw, (unsigned long long)g->tot.vsw, g->tot.vxi / 1e6);
+        fprintf(f, " | pipelines depth EQUAL/no write %llu", (unsigned long long)atomic_load(&g_deq_pipes));
+        if (g_depth_equal_on)
+            fprintf(f, " (replaced by op %d: %llu, dynamic %llu)", g_depth_equal_op, (unsigned long long)atomic_load(&g_deq_replaced),
+                    (unsigned long long)atomic_load(&g_deq_dynamic));
+        fprintf(f, ", VS-stage stores %llu (%u shaders)", (unsigned long long)atomic_load(&g_vsw_pipes), atomic_load(&g_vsw_shaders));
         if (g_fake_occlusion)
             fprintf(f, " | faked occlusion copies %llu, reads %llu", (unsigned long long)atomic_load(&g_occl_copies),
                     (unsigned long long)atomic_load(&g_occl_reads));
@@ -4616,13 +6612,36 @@ static void gt_report(struct GpuTime *g, double interval_s) {
         }
         memset(g_pcstat, 0, sizeof g_pcstat);
         pthread_mutex_unlock(&g_pcstat_m);
-        for (uint32_t i = 0; i < n && i < 25; i++) {
-            char desc[160];
+        // queue-side CPU time per thread since the last report (QStat): calls and ms
+        uint32_t nq = atomic_load(&g_qstat_n);
+        bool qany = false;
+        for (uint32_t k = 0; k < nq && k < QSTAT_MAX; k++) {
+            struct QStat *q = &g_qstat[k];
+            uint64_t qn[QS_N], qns[QS_N], cbs = atomic_exchange(&q->cbs, 0);
+            for (int j = 0; j < QS_N; j++) { qn[j] = atomic_exchange(&q->n[j], 0); qns[j] = atomic_exchange(&q->ns[j], 0); }
+            if (!qn[QS_SUBMIT] && !qn[QS_WAIT] && !qn[QS_IDLE]) continue;
+            if (!qany) { fprintf(f, "queue CPU time (calls, ms):"); qany = true; }
+            fprintf(f, " %s", q->comm[0] ? q->comm : "?");
+            if (qn[QS_SUBMIT]) fprintf(f, " submit %llu (%llu cb) %.1f", (unsigned long long)qn[QS_SUBMIT], (unsigned long long)cbs,
+                                       qns[QS_SUBMIT] / 1e6);
+            if (qn[QS_WAIT]) fprintf(f, " wait %llu %.1f", (unsigned long long)qn[QS_WAIT], qns[QS_WAIT] / 1e6);
+            if (qn[QS_IDLE]) fprintf(f, " idle %llu %.1f", (unsigned long long)qn[QS_IDLE], qns[QS_IDLE] / 1e6);
+            fprintf(f, ";");
+        }
+        if (qany) fprintf(f, "\n");
+        if (g_wait_callers) wc_report(f, interval_s);
+        for (uint32_t i = 0; i < n && i < 40; i++) {
+            char desc[160], att[256];
             gt_pipe_desc(v[i].pipeline, desc, sizeof desc);
-            fprintf(f, "%5.1f%%  avg %7.3f ms  max %7.2f ms  n %5u  %-8s %4ux%-4u c%u draws %5.1f  %s\n",
+            gt_att_desc(&v[i].att, att, sizeof att);
+            char cn[96] = "";
+            if (v[i].kind == GT_PASS && v[i].draws) // per pass, like draws
+                snprintf(cn, sizeof cn, " eq %.1f dw %.1f vsw %.1f vxi %.3fM", (double)v[i].cnt.eq / v[i].count,
+                         (double)v[i].cnt.dw / v[i].count, (double)v[i].cnt.vsw / v[i].count, v[i].cnt.vxi / 1e6 / v[i].count);
+            fprintf(f, "%5.1f%%  avg %7.3f ms  max %7.2f ms  n %5u  %-8s %4ux%-4u c%u draws %5.1f%s  %s%s\n",
                     total ? 100.0 * v[i].sum_ns / total : 0, v[i].sum_ns / 1e6 / v[i].count, v[i].max_ns / 1e6, v[i].count,
                     v[i].kind == GT_PASS ? "pass" : "dispatch", v[i].w, v[i].h, v[i].colors,
-                    (double)v[i].draws / v[i].count, desc);
+                    (double)v[i].draws / v[i].count, cn, desc, att);
         }
         fclose(f);
     }
@@ -4630,25 +6649,29 @@ static void gt_report(struct GpuTime *g, double interval_s) {
     memset(g->agg, 0, sizeof g->agg);
 }
 
-// Dispatches are grouped per pipeline; passes per render area and colour target count with draws or without (a pass
-// with draws runs many pipelines, so grouping it by its first one scattered the heavy passes; "pipe" is then the
-// first draw's pipeline of the last pass seen in the group).
+// Dispatches are grouped per pipeline; passes per render area, colour target count and attachment signature (formats
+// and load/store ops), with draws or without (a pass with draws runs many pipelines, so grouping it by its first one
+// scattered the heavy passes; "pipe" is then the first draw's pipeline of the last pass seen in the group).
 static void gt_add(struct GpuTime *g, const struct GtRec *r, uint64_t ns) {
     VkPipeline kp = r->kind == GT_PASS ? (r->draws ? (VkPipeline)(uintptr_t)1 : VK_NULL_HANDLE) : r->pipeline;
-    uint64_t key = (uint64_t)(uintptr_t)kp ^ ((uint64_t)r->kind << 56) ^ ((uint64_t)r->w << 36) ^ ((uint64_t)r->h << 16) ^ r->colors;
+    uint64_t key = (uint64_t)(uintptr_t)kp ^ ((uint64_t)r->kind << 56) ^ ((uint64_t)r->w << 36) ^ ((uint64_t)r->h << 16) ^ r->colors ^
+                   ((uint64_t)r->att.sig << 8);
     uint32_t b = handle_bucket(key, GT_AGG);
     for (uint32_t probe = 0; probe < GT_AGG; probe++, b = (b + 1) % GT_AGG) {
         struct GtAgg *a = &g->agg[b];
         bool a_draws = a->kind == GT_PASS && a->draws, match_kp = r->kind == GT_PASS ? (a_draws == (r->draws != 0)) : a->pipeline == r->pipeline;
         if (!a->count) {
-            *a = (struct GtAgg){r->kind, r->w, r->h, r->colors, r->pipeline, 0, 0, 0, 0};
-        } else if (a->kind != r->kind || a->w != r->w || a->h != r->h || a->colors != r->colors || !match_kp) {
+            *a = (struct GtAgg){r->kind, r->w, r->h, r->colors, r->pipeline, 0, 0, 0, 0, r->att, {0, 0, 0, 0}};
+        } else if (a->kind != r->kind || a->w != r->w || a->h != r->h || a->colors != r->colors || !match_kp ||
+                   a->att.sig != r->att.sig) {
             continue;
         }
         if (r->kind == GT_PASS && r->pipeline) a->pipeline = r->pipeline;
         a->sum_ns += ns;
         if (ns > a->max_ns) a->max_ns = ns;
         a->draws += r->draws;
+        gt_cnt_add(&a->cnt, &r->cnt);
+        gt_cnt_add(&g->tot, &r->cnt);
         a->count++;
         return;
     }
@@ -4695,6 +6718,11 @@ static void *gt_thread(void *arg) {
                 }
                 gt_add(g, r, ns);
                 gt_free_slot(g, i);
+            } else if (v[1] && r->susp_open) {
+                // executed with the suspend/resume chain still open: it resumed in another command buffer, where
+                // neither end may be timed (K4). Not timed; freed without a STUCK line.
+                g->chain_split++;
+                gt_free_slot(g, i);
             } else if (v[1]) {
                 r->inflight = age > 0.5;
                 if (age > 2.0 && !r->stuck_reported) {
@@ -4735,6 +6763,7 @@ static void gt_init(struct DeviceData *d, PFN_vkGetDeviceProcAddr gdpa) {
     if (!(GT_LOAD(ResetQueryPool))) g->fpResetQueryPool = (PFN_vkResetQueryPool)gdpa(d->device, "vkResetQueryPoolEXT");
     GT_LOAD_KHR(CmdBeginRendering);
     GT_LOAD_KHR(CmdEndRendering);
+    GT_LOAD_KHR(CmdPipelineBarrier2);
     GT_LOAD_KHR(CmdBeginRenderPass2);
     GT_LOAD_KHR(CmdEndRenderPass2);
     GT_LOAD_KHR(CmdDrawIndirectCount);
@@ -4745,6 +6774,13 @@ static void gt_init(struct DeviceData *d, PFN_vkGetDeviceProcAddr gdpa) {
     GT_LOAD(CmdDrawMeshTasksIndirectEXT);
     GT_LOAD(CmdDrawMeshTasksIndirectCountEXT);
     GT_LOAD_KHR(CmdDispatchBase);
+    GT_LOAD(CmdExecuteCommands);
+    GT_LOAD(QueueSubmit);
+    GT_LOAD_KHR(QueueSubmit2);
+    GT_LOAD(WaitForFences);
+    GT_LOAD_KHR(WaitSemaphores);
+    GT_LOAD(QueueWaitIdle);
+    GT_LOAD(DeviceWaitIdle);
     g->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)gdpa(d->device, "vkCmdPushDescriptorSetKHR");
     if (!g->fpCmdPushDescriptorSetKHR) g->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)gdpa(d->device, "vkCmdPushDescriptorSet");
     #undef GT_LOAD
@@ -4795,21 +6831,56 @@ static void gt_destroy(struct DeviceData *d) {
     free(g);
 }
 
+// K4: the spec allows no command between a render pass instance that suspends and the one that resumes it, and a
+// timestamp write is one (all GPU_TIME runs before 2026-10-31 had them there; may explain lost draws in resumed parts).
+// A chain is one record: start timestamp before its first part, end timestamp after its final, non-suspending part.
+// A resuming part whose chain began in another command buffer is not timed. [keeper, Claude Opus 5.5] 2026-10-31
 static void gt_render_begin(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t colors, const VkRenderingInfo *ri) {
     struct CmdBufData *c = cmd_data(cmd);
     if (!c || !c->dev->gt) return;
+    bool resume = ri && (ri->flags & VK_RENDERING_RESUMING_BIT);
+    bool open = c->gt_susp && c->gt_rec >= 0; // the chain's record from the suspended part in this command buffer
+    c->gt_susp = ri && (ri->flags & VK_RENDERING_SUSPENDING_BIT);
+    if (resume) {
+        if (open) c->dev->gt->rec[c->gt_rec].susp_open = c->gt_susp;
+        else c->gt_rec = -1;
+        return;
+    }
     c->gt_rec = gt_begin(c, cmd, GT_PASS, w, h, colors, VK_NULL_HANDLE);
     if (c->gt_rec >= 0 && ri) {
         struct GtRec *r = &c->dev->gt->rec[c->gt_rec];
         r->rlayers = ri->layerCount;
         if (ri->colorAttachmentCount && ri->pColorAttachments) r->color0 = ri->pColorAttachments[0].imageView;
         if (ri->pDepthAttachment) r->depth = ri->pDepthAttachment->imageView;
+        uint32_t layers = ri->viewMask ? (uint32_t)__builtin_popcount(ri->viewMask) : ri->layerCount;
+        for (uint32_t i = 0; ri->pColorAttachments && i < ri->colorAttachmentCount && i < GT_ATT - 1; i++)
+            gt_att_add(&r->att, &ri->pColorAttachments[i], w, h, layers, false);
+        const VkRenderingAttachmentInfo *ds = ri->pDepthAttachment && ri->pDepthAttachment->imageView ? ri->pDepthAttachment
+                                                                                                      : ri->pStencilAttachment;
+        if (ds && ds->imageView) gt_att_add(&r->att, ds, w, h, layers, true);
+        gt_att_sign(&r->att);
     }
 }
 
 static void gt_render_end(VkCommandBuffer cmd) {
     struct CmdBufData *c = cmd_data(cmd);
-    if (c && c->dev->gt && c->gt_rec >= 0) { gt_end(c, cmd, c->gt_rec); c->gt_rec = -1; }
+    if (!c || !c->dev->gt || c->gt_rec < 0) return;
+    if (c->gt_susp) { c->dev->gt->rec[c->gt_rec].susp_open = true; return; } // the resuming part ends it (K4)
+    gt_end(c, cmd, c->gt_rec);
+    c->gt_rec = -1;
+}
+
+// K-DW: the bound pipeline's PF_* flags with PF_EQ / PF_DW for the depth state in effect at this draw (dynamic values
+// where the pipeline declares them dynamic, else its static ones). Unchanged for a pipeline without dynamic depth.
+static uint16_t gt_depth_flags(const struct CmdBufData *c) {
+    uint16_t f = c->gfx_flags;
+    if (!(f & (PF_DYN_DT | PF_DYN_DW | PF_DYN_OP))) return f;
+    bool dt = f & PF_DYN_DT ? c->dyn_depth & DD_DT : f & PF_S_DT;
+    bool dw = f & PF_DYN_DW ? c->dyn_depth & DD_DW : f & PF_S_DW;
+    bool eq = f & PF_DYN_OP ? c->dyn_depth & DD_EQ : f & PF_S_EQ;
+    f &= ~(PF_EQ | PF_DW);
+    if (dt) f |= dw ? PF_DW : eq ? PF_EQ : 0;
+    return f;
 }
 
 // MALI_COMPAT_SKIP_HASH=<hex>: draws whose bound graphics pipeline has a shader with this hash are dropped (finds the
@@ -4826,10 +6897,112 @@ static bool gt_skip(struct CmdBufData *c) {
 static bool gt_draw(struct CmdBufData *c, uint32_t vcount, uint32_t icount) {
     if (c && c->async_skip) { atomic_fetch_add(&g_async_skipped, 1); return true; }
     if (gt_skip(c)) return true;
-    if (!c || c->gt_rec < 0 || !c->dev->gt) return false;
+    if (!c || !c->dev->gt) return false;
+    if (!g_gpu_time) return false; // the async compiles and the pass clamp share the hooks; no records without the switch
+    uint16_t pf = gt_depth_flags(c);
+    struct GtCnt one = {pf & PF_EQ ? 1 : 0, pf & PF_DW ? 1 : 0, pf & PF_VSW ? 1 : 0,
+                        (uint64_t)vcount * icount};
+    if (c->gt_rec < 0) {
+        // no pass record in this command buffer: a secondary one (DXVK's tiler mode), see compat_CmdExecuteCommands
+        if (!c->gt_sdraws++) {
+            c->gt_spipe = c->gfx_pipeline; c->gt_svcount = vcount; c->gt_sicount = icount; c->gt_ssrc = c->gt_src;
+        }
+        gt_cnt_add(&c->gt_scnt, &one);
+        return false;
+    }
     struct GtRec *r = &c->dev->gt->rec[c->gt_rec];
     if (!r->draws++) { r->pipeline = c->gfx_pipeline; r->vcount = vcount; r->icount = icount; r->src = c->gt_src; }
+    gt_cnt_add(&r->cnt, &one);
     return false;
+}
+
+// GPU timing: DXVK's tiler mode records each pass's draws into secondary command buffers and executes them inside the
+// pass it begins in the primary, so the pass saw no draws ("draws 0.0 pipe (nil)"). The secondaries' draw counts and
+// first draw join the open pass here. [Claude Opus 5.5] 2026-10-30
+static VKAPI_ATTR void VKAPI_CALL compat_CmdExecuteCommands(VkCommandBuffer cmd, uint32_t count, const VkCommandBuffer *secs) {
+    GTC(GTC_EXECUTE);
+    struct CmdBufData *c = cmd_data(cmd);
+    struct DeviceData *d = c ? c->dev : get_device_data_by_cmd(cmd);
+    if (c && c->gt_rec >= 0 && d->gt) {
+        struct GtRec *r = &d->gt->rec[c->gt_rec];
+        for (uint32_t i = 0; secs && i < count; i++) {
+            struct CmdBufData *s = cmd_data(secs[i]);
+            if (!s || !s->gt_sdraws) continue;
+            if (!r->draws) { r->pipeline = s->gt_spipe; r->vcount = s->gt_svcount; r->icount = s->gt_sicount; r->src = s->gt_ssrc; }
+            r->draws += s->gt_sdraws;
+            gt_cnt_add(&r->cnt, &s->gt_scnt);
+        }
+    }
+    d->gt->fpCmdExecuteCommands(cmd, count, secs);
+}
+
+// Queue-side CPU time (QStat, GPU timing only). A queue carries its device's dispatch key, so the command buffer
+// lookup finds its device too.
+static VKAPI_ATTR VkResult VKAPI_CALL compat_QueueSubmit(VkQueue queue, uint32_t n, const VkSubmitInfo *si, VkFence fence) {
+    struct DeviceData *d = get_device_data_by_cmd((VkCommandBuffer)queue);
+    uint32_t cbs = 0;
+    for (uint32_t i = 0; si && i < n; i++) cbs += si[i].commandBufferCount;
+    if (g_wait_callers && fence) {
+        uint32_t waits = 0;
+        for (uint32_t i = 0; si && i < n; i++) waits += si[i].waitSemaphoreCount;
+        wc_tag((uint64_t)fence, wc_submit_kind(cbs, waits));
+    }
+    if (g_dc_on) dc_submit(queue, n, si, fence);
+    uint64_t t0 = now_ns();
+    VkResult r = d->gt->fpQueueSubmit(queue, n, si, fence);
+    qstat_add(QS_SUBMIT, t0, cbs);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_QueueSubmit2(VkQueue queue, uint32_t n, const VkSubmitInfo2 *si, VkFence fence) {
+    struct DeviceData *d = get_device_data_by_cmd((VkCommandBuffer)queue);
+    uint32_t cbs = 0;
+    for (uint32_t i = 0; si && i < n; i++) cbs += si[i].commandBufferInfoCount;
+    if (g_wait_callers && fence) {
+        uint32_t waits = 0;
+        for (uint32_t i = 0; si && i < n; i++) waits += si[i].waitSemaphoreInfoCount;
+        wc_tag((uint64_t)fence, wc_submit_kind(cbs, waits));
+    }
+    if (g_dc_on) dc_submit2(queue, n, si, fence);
+    uint64_t t0 = now_ns();
+    VkResult r = d->gt->fpQueueSubmit2(queue, n, si, fence);
+    qstat_add(QS_SUBMIT, t0, cbs);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_WaitForFences(VkDevice device, uint32_t n, const VkFence *fences, VkBool32 all,
+                                                           uint64_t timeout) {
+    struct DeviceData *d = get_device_data(device);
+    uint64_t t0 = now_ns();
+    VkResult r = d->gt->fpWaitForFences(device, n, fences, all, timeout);
+    qstat_add(QS_WAIT, t0, 0);
+    for (uint32_t i = 0; g_dc_on && r == VK_SUCCESS && fences && (all || n == 1) && i < n; i++)
+        if (fences[i]) dc_done(true, (uint64_t)fences[i], 0);
+    if (g_wait_callers) wc_add((uintptr_t)__builtin_return_address(0), n && fences ? (uint64_t)fences[0] : 0, WK_UNTRACKED, t0);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_WaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo *wi, uint64_t timeout) {
+    struct DeviceData *d = get_device_data(device);
+    uint64_t t0 = now_ns();
+    VkResult r = d->gt->fpWaitSemaphores(device, wi, timeout);
+    qstat_add(QS_WAIT, t0, 0);
+    for (uint32_t i = 0; g_dc_on && r == VK_SUCCESS && wi && wi->pSemaphores && wi->pValues &&
+                         (!(wi->flags & VK_SEMAPHORE_WAIT_ANY_BIT) || wi->semaphoreCount == 1) && i < wi->semaphoreCount; i++)
+        dc_done(false, (uint64_t)wi->pSemaphores[i], wi->pValues[i]);
+    if (g_wait_callers) wc_add((uintptr_t)__builtin_return_address(0), 0, WK_TIMELINE, t0);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_QueueWaitIdle(VkQueue queue) {
+    struct DeviceData *d = get_device_data_by_cmd((VkCommandBuffer)queue);
+    uint64_t t0 = now_ns();
+    VkResult r = d->gt->fpQueueWaitIdle(queue);
+    qstat_add(QS_IDLE, t0, 0);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_DeviceWaitIdle(VkDevice device) {
+    struct DeviceData *d = get_device_data(device);
+    uint64_t t0 = now_ns();
+    VkResult r = d->gt->fpDeviceWaitIdle(device);
+    qstat_add(QS_IDLE, t0, 0);
+    return r;
 }
 
 static void pushdesc_record(struct PushDescRec *r, VkPipelineLayout layout, uint32_t set, uint32_t count,
@@ -4851,10 +7024,15 @@ static void pushdesc_record(struct PushDescRec *r, VkPipelineLayout layout, uint
 
 // The image a meta pass reads: vkd3d binds its copy source with a push descriptor (GPU timing details). Compute
 // pushes are also recorded for the restore after a BC decode (struct PushDescRec).
+// The graphics merge forward below (2026-10-28 test). Always on for now; D5 makes it a MALI_COMPAT_PUSHDESC_MERGE switch.
+static bool g_pushdesc_merge = true;
+
+// D2 (perf review P1a/P1c), [keeper, Claude Opus 5.5] 2026-10-31: gt_src is only read by gt_draw under GPU_TIME, so
+// the scan runs only with it; the graphics record (gpd) is only kept for the merge forward.
 static VKAPI_ATTR void VKAPI_CALL compat_CmdPushDescriptorSetKHR(VkCommandBuffer cmd, VkPipelineBindPoint bp, VkPipelineLayout layout,
                                                                  uint32_t set, uint32_t count, const VkWriteDescriptorSet *w) {
     struct CmdBufData *c = cmd_data(cmd);
-    for (uint32_t i = 0; c && i < count; i++)
+    for (uint32_t i = 0; c && g_gpu_time && i < count; i++)
         if ((w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
              w[i].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || w[i].descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) &&
             w[i].pImageInfo && w[i].descriptorCount) {
@@ -4862,11 +7040,12 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushDescriptorSetKHR(VkCommandBuffer
             break;
         }
     struct PushDescRec *r = !c ? NULL : bp == VK_PIPELINE_BIND_POINT_COMPUTE ? &c->cpd
-                          : bp == VK_PIPELINE_BIND_POINT_GRAPHICS ? &c->gpd : NULL;
+                          : bp == VK_PIPELINE_BIND_POINT_GRAPHICS && g_pushdesc_merge ? &c->gpd : NULL;
+    if (g_dc_on) dc_push_writes(c, bp, layout, set, count, w, false);
     if (r && g_vendor_id) pushdesc_record(r, layout, set, count, w);
     // With MALI_COMPAT_VENDOR_ID, vkd3d pushes only the root descriptors that changed and expects the others to stay.
     // Test (2026-10-28): forward the whole merged set every time, in case this driver drops bindings a push leaves out.
-    if (g_vendor_id && r && !r->bad && r->count) { count = r->count; w = r->w; }
+    if (g_vendor_id && g_pushdesc_merge && r && !r->bad && r->count) { count = r->count; w = r->w; }
     (c ? c->dev : get_device_data_by_cmd(cmd))->fpCmdPushDescriptorSetKHR(cmd, bp, layout, set, count, w);
 }
 
@@ -4892,6 +7071,48 @@ static void susres_attachment(VkRenderingAttachmentInfo *a, bool resume, bool su
     }
 }
 
+// SUSRES_BARRIER: called from CmdBeginRendering, so always outside a render pass instance. Masks only for the
+// attachment kinds this part has: color write -> color load/draw (read/write); depth/stencil write (draws and STORE) ->
+// depth/stencil LOAD/tests (read/write) and fragment shader sampling (read-only depth layouts). Global memory barrier,
+// no layout change (resumed parts keep the same views and layouts). The dynamic-rendering local-read rules
+// (VK_KHR_dynamic_rendering_local_read) are for barriers inside a pass and do not apply here. Falls back to
+// vkCmdPipelineBarrier when synchronization2 is missing. Works across command buffers too (submission order).
+static void susres_barrier(struct DeviceData *d, VkCommandBuffer cmd, const VkRenderingInfo *ri) {
+    VkPipelineStageFlags2 src = 0, dst = 0;
+    VkAccessFlags2 sa = 0, da = 0;
+    for (uint32_t i = 0; i < ri->colorAttachmentCount; i++)
+        if (ri->pColorAttachments[i].imageView != VK_NULL_HANDLE) {
+            src |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            sa |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+            dst |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            da |= VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+            break;
+        }
+    if ((ri->pDepthAttachment && ri->pDepthAttachment->imageView != VK_NULL_HANDLE) ||
+        (ri->pStencilAttachment && ri->pStencilAttachment->imageView != VK_NULL_HANDLE)) {
+        src |= VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        sa |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dst |= VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+               VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        da |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+              VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    }
+    if (!src) return;
+    atomic_fetch_add(&g_susres_barriers, 1);
+    if (d->gt && d->gt->fpCmdPipelineBarrier2) {
+        VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, src, sa, dst, da};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1;
+        di.pMemoryBarriers = &mb;
+        d->gt->fpCmdPipelineBarrier2(cmd, &di);
+    } else if (d->fpCmdPipelineBarrier) { // the used stage/access bits fit the 32-bit flags; SAMPLED_READ -> SHADER_READ
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, (VkAccessFlags)sa,
+                              (VkAccessFlags)(da & ~VK_ACCESS_2_SHADER_SAMPLED_READ_BIT) |
+                              ((da & VK_ACCESS_2_SHADER_SAMPLED_READ_BIT) ? VK_ACCESS_SHADER_READ_BIT : 0)};
+        d->fpCmdPipelineBarrier(cmd, (VkPipelineStageFlags)src, (VkPipelineStageFlags)dst, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+}
+
 static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRendering(VkCommandBuffer cmd, const VkRenderingInfo *ri) {
     GTC(GTC_RENDERING);
     if (ri->flags & VK_RENDERING_SUSPENDING_BIT) atomic_fetch_add(&g_susp_passes, 1);
@@ -4906,6 +7127,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRendering(VkCommandBuffer cmd, 
         plain.pColorAttachments = col;
         if (ri->pDepthAttachment) { dep = *ri->pDepthAttachment; susres_attachment(&dep, resume, suspend, 1); plain.pDepthAttachment = &dep; }
         if (ri->pStencilAttachment) { ste = *ri->pStencilAttachment; susres_attachment(&ste, resume, suspend, 2); plain.pStencilAttachment = &ste; }
+        if (resume && g_susres_barrier) susres_barrier(get_device_data_by_cmd(cmd), cmd, ri); // K-CS1
         ri = &plain;
     }
     // Attachment-less passes (MALI_COMPAT_NOATT_AREA=<W>x<H>): DXVK opens them for draws without render targets
@@ -4952,6 +7174,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatch(VkCommandBuffer cmd, uint32
     GTC(GTC_DISPATCH);
     struct CmdBufData *c = cmd_data(cmd);
     if (!c) { get_device_data_by_cmd(cmd)->fpCmdDispatch(cmd, x, y, z); return; }
+    if (g_dc_on) dc_dispatch(c, cmd, x, y, z);
     int32_t i = gt_begin(c, cmd, GT_DISPATCH, x, y, z, c->compute_pipeline); // "WxH cZ" = the group counts
     c->dev->fpCmdDispatch(cmd, x, y, z);
     gt_end(c, cmd, i);
@@ -4960,6 +7183,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatchIndirect(VkCommandBuffer cmd
     GTC(GTC_DISPATCH_INDIRECT);
     struct CmdBufData *c = cmd_data(cmd);
     if (!c) { get_device_data_by_cmd(cmd)->gt->fpCmdDispatchIndirect(cmd, buf, off); return; }
+    if (g_dc_on) dc_dispatch(c, cmd, 0, 0, 0); // indirect: group counts 0 0 0
     int32_t i = gt_begin(c, cmd, GT_DISPATCH, 0, 0, 0, c->compute_pipeline); // indirect: group counts unknown (0x0)
     c->dev->gt->fpCmdDispatchIndirect(cmd, buf, off);
     gt_end(c, cmd, i);
@@ -5044,6 +7268,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatchBase(VkCommandBuffer cmd, ui
                                                          uint32_t y, uint32_t z) {
     GTC(GTC_DISPATCH_BASE);
     struct CmdBufData *c = cmd_data(cmd);
+    if (g_dc_on) dc_dispatch(c, cmd, x, y, z);
     int32_t i = gt_begin(c, cmd, GT_DISPATCH, x, y, z, c ? c->compute_pipeline : VK_NULL_HANDLE);
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDispatchBase(cmd, bx, by, bz, x, y, z);
     if (c) gt_end(c, cmd, i);
@@ -5067,9 +7292,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     if (rt && !g_rt_compress) rt_keep_load(); // once per process: DXVK creates several instances
     g_rt_compress = rt;
     g_gpu_time = getenv("MALI_COMPAT_GPU_TIME") && strcmp(getenv("MALI_COMPAT_GPU_TIME"), "0") != 0;
+    g_wait_callers = g_gpu_time && getenv("MALI_COMPAT_WAIT_CALLERS") && strcmp(getenv("MALI_COMPAT_WAIT_CALLERS"), "0") != 0;
     g_depth_nocomp = getenv("MALI_COMPAT_DEPTH_NOCOMP") && strcmp(getenv("MALI_COMPAT_DEPTH_NOCOMP"), "0") != 0;
     g_force_comp = getenv("MALI_COMPAT_FORCE_COMP") && strcmp(getenv("MALI_COMPAT_FORCE_COMP"), "0") != 0;
     g_no_susres = getenv("MALI_COMPAT_NO_SUSPEND_RESUME") && strcmp(getenv("MALI_COMPAT_NO_SUSPEND_RESUME"), "0") != 0;
+    g_susres_barrier = g_no_susres && getenv("MALI_COMPAT_SUSRES_BARRIER") && strcmp(getenv("MALI_COMPAT_SUSRES_BARRIER"), "0") != 0;
     g_pcache_on = getenv("MALI_COMPAT_PIPELINE_CACHE") && strcmp(getenv("MALI_COMPAT_PIPELINE_CACHE"), "0") != 0;
     g_pcache_mem_only = g_pcache_on && !strcmp(getenv("MALI_COMPAT_PIPELINE_CACHE"), "2");
     if (getenv("MALI_COMPAT_PIPELINE_CACHE_THREADS")) g_pc_threads = getenv("MALI_COMPAT_PIPELINE_CACHE_THREADS");
@@ -5087,7 +7314,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     if (getenv("MALI_COMPAT_ASYNC_THREADS") && atoi(getenv("MALI_COMPAT_ASYNC_THREADS")) > 0)
         g_async_threads = (uint32_t)atoi(getenv("MALI_COMPAT_ASYNC_THREADS"));
     g_spv_dontunroll = getenv("MALI_COMPAT_SPV_DONTUNROLL") && strcmp(getenv("MALI_COMPAT_SPV_DONTUNROLL"), "0") != 0;
+    wls_clamp_init(); // MALI_COMPAT_WLS_CLAMP (wls-clamp-1)
     g_xfb_vs = getenv("MALI_COMPAT_XFB_VS") && strcmp(getenv("MALI_COMPAT_XFB_VS"), "0") != 0;
+    const char *deq = getenv("MALI_COMPAT_DEPTH_EQUAL");
+    g_depth_equal_on = deq && (!strcmp(deq, "always") || !strcmp(deq, "lequal") || !strcmp(deq, "gequal"));
+    g_depth_equal_op = !g_depth_equal_on ? VK_COMPARE_OP_EQUAL : !strcmp(deq, "always") ? VK_COMPARE_OP_ALWAYS
+                     : !strcmp(deq, "lequal") ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_GREATER_OR_EQUAL;
+    if (deq && *deq && strcmp(deq, "0") && !g_depth_equal_on)
+        fprintf(stderr, "mali-compat: MALI_COMPAT_DEPTH_EQUAL=%s ignored (always, lequal or gequal)\n", deq);
+    g_gt_dyndepth = g_gpu_time && getenv("MALI_COMPAT_GT_DYNDEPTH") && strcmp(getenv("MALI_COMPAT_GT_DYNDEPTH"), "0") != 0;
+    g_vs_scan = g_gpu_time || (getenv("MALI_COMPAT_VS_STORES") && strcmp(getenv("MALI_COMPAT_VS_STORES"), "0") != 0);
     g_noatt_w = g_noatt_h = 0;
     if (getenv("MALI_COMPAT_NOATT_AREA") && sscanf(getenv("MALI_COMPAT_NOATT_AREA"), "%ux%u", &g_noatt_w, &g_noatt_h) != 2)
         g_noatt_w = g_noatt_h = 0;
@@ -5099,6 +7335,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
         if (end == h) break;
         g_dump_hashes[g_dump_hash_count++] = (uint32_t)v;
         h = *end == ',' ? end + 1 : end;
+    }
+    dc_init(); // MALI_COMPAT_DESC_CAPTURE (desc-capture-1)
+    {
+        const char *bmb = getenv("MALI_COMPAT_BUDGET_MB");
+        unsigned long long mb = bmb ? strtoull(bmb, NULL, 10) : 0;
+        g_budget_cap = mb ? (uint64_t)mb << 20 : 5ULL << 30;
+        // K-CF2 budget log, only with MALI_COMPAT_GPU_TIME or MALI_COMPAT_DEBUG; MALI_COMPAT_BUDGET_LOG_S = interval
+        const char *bls = getenv("MALI_COMPAT_BUDGET_LOG_S");
+        unsigned long ls = bls ? strtoul(bls, NULL, 10) : 30;
+        g_budget_log_s = (g_gpu_time || g_debug) && ls ? (uint32_t)(ls > 3600 ? 3600 : ls) : 0;
+        static bool budget_logged;
+        if (!budget_logged) {
+            budget_logged = true;
+            fprintf(stderr, "mali-compat: heapBudget cap %llu MiB%s, accounted usage, budget log %s\n",
+                    (unsigned long long)(g_budget_cap >> 20), mb ? " (MALI_COMPAT_BUDGET_MB)" : " (default)",
+                    g_budget_log_s ? "on" : "off");
+        }
     }
 
     VkLayerInstanceCreateInfo *chain_info = (VkLayerInstanceCreateInfo *)pCreateInfo->pNext;
@@ -5185,6 +7438,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkDevice *pDevice) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
+    dc_init(); // also here: a device created without this layer's vkCreateInstance (checks) still parses the key
+    wls_clamp_init(); // same for MALI_COMPAT_WLS_CLAMP (pthread_once)
 
     VkLayerDeviceCreateInfo *chain_info = (VkLayerDeviceCreateInfo *)pCreateInfo->pNext;
     while (chain_info &&
@@ -5402,6 +7657,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             d->fpGetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress)fpGetDeviceProcAddr(*pDevice, "vkGetBufferDeviceAddressKHR");
         LOAD_DEV(CmdBindPipeline);
         LOAD_DEV(CmdPushConstants);
+        LOAD_DEV(CmdPushConstants2);
+        LOAD_DEV(CmdPushConstants2KHR);
         LOAD_DEV(CmdDispatch);
         LOAD_DEV(CmdPipelineBarrier);
         LOAD_DEV(CmdCopyBufferToImage);
@@ -5430,6 +7687,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         if (!d->fpCmdPushDescriptorSetKHR)
             d->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdPushDescriptorSet");
         d->fpCmdSetVertexInputEXT = (PFN_vkCmdSetVertexInputEXT)fpGetDeviceProcAddr(*pDevice, "vkCmdSetVertexInputEXT");
+        d->fpCmdSetDepthCompareOp = (PFN_vkCmdSetDepthCompareOp)fpGetDeviceProcAddr(*pDevice, "vkCmdSetDepthCompareOp");
+        if (!d->fpCmdSetDepthCompareOp)
+            d->fpCmdSetDepthCompareOp = (PFN_vkCmdSetDepthCompareOp)fpGetDeviceProcAddr(*pDevice, "vkCmdSetDepthCompareOpEXT");
+        d->fpCmdSetDepthTestEnable = (PFN_vkCmdSetDepthTestEnable)fpGetDeviceProcAddr(*pDevice, "vkCmdSetDepthTestEnable");
+        if (!d->fpCmdSetDepthTestEnable)
+            d->fpCmdSetDepthTestEnable = (PFN_vkCmdSetDepthTestEnable)fpGetDeviceProcAddr(*pDevice, "vkCmdSetDepthTestEnableEXT");
+        d->fpCmdSetDepthWriteEnable = (PFN_vkCmdSetDepthWriteEnable)fpGetDeviceProcAddr(*pDevice, "vkCmdSetDepthWriteEnable");
+        if (!d->fpCmdSetDepthWriteEnable)
+            d->fpCmdSetDepthWriteEnable = (PFN_vkCmdSetDepthWriteEnable)fpGetDeviceProcAddr(*pDevice, "vkCmdSetDepthWriteEnableEXT");
         if (g_log_images && want_icc) {
             d->fpGetImageSubresourceLayout2KHR = (PFN_vkGetImageSubresourceLayout2KHR)fpGetDeviceProcAddr(*pDevice, "vkGetImageSubresourceLayout2KHR");
             if (!d->fpGetImageSubresourceLayout2KHR)
@@ -5437,11 +7703,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         }
         d->fpCreateComputePipelinesReal = (PFN_vkCreateComputePipelines)fpGetDeviceProcAddr(*pDevice, "vkCreateComputePipelines");
         #undef LOAD_DEV
-        if (g_gpu_time || g_async_ms || g_noatt_w) gt_init(d, fpGetDeviceProcAddr);
+        if (g_gpu_time || g_async_ms || g_noatt_w || g_no_susres || g_dc_on) gt_init(d, fpGetDeviceProcAddr); // without GPU_TIME: pointers only, no pool
+        if (d->gt) { // SUSRES_BARRIER: vkCmdPipelineBarrier2 only when synchronization2 is enabled, else the v1 fallback
+            const VkPhysicalDeviceVulkan13Features *v13 = find_struct(mod_ci.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
+            const VkPhysicalDeviceSynchronization2Features *s2 = find_struct(mod_ci.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES);
+            if (!(v13 && v13->synchronization2) && !(s2 && s2->synchronization2)) d->gt->fpCmdPipelineBarrier2 = NULL;
+        }
         pc_init(d);
         if (inst && inst->fpGetPhysicalDeviceMemoryProperties) {
             VkPhysicalDeviceMemoryProperties mp;
             inst->fpGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
+            memset(d->type_heap, BUDGET_NO_HEAP, sizeof d->type_heap);
+            for (uint32_t i = 0; i < mp.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; i++)
+                if (mp.memoryTypes[i].heapIndex < VK_MAX_MEMORY_HEAPS) d->type_heap[i] = (uint8_t)mp.memoryTypes[i].heapIndex;
+            for (uint32_t i = 0; i < mp.memoryHeapCount && i < VK_MAX_MEMORY_HEAPS; i++)
+                g_heap_budget[i] = mp.memoryHeaps[i].size > g_budget_cap ? g_budget_cap : mp.memoryHeaps[i].size;
+            atomic_store(&g_heap_count, mp.memoryHeapCount);
+            static _Atomic bool budget_log_started;
+            if (g_budget_log_s && !atomic_exchange(&budget_log_started, true)) {
+                pthread_t t;
+                if (pthread_create(&t, NULL, budget_log_thread, NULL) == 0) pthread_detach(t);
+            }
             for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
                 if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) d->coherent_types |= 1u << i;
             const VkMemoryPropertyFlags hc = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -5454,7 +7736,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
                         }
         }
         d->bc_init_done = false;
+        if (g_dc_on) dc_device_init(d, fpGetDeviceProcAddr, *pDevice);
+        if (g_wls_clamp) {
+            char hl[16 * 9 + 1] = "";
+            for (uint32_t i = 0; i < g_wls_hash_count; i++)
+                snprintf(hl + strlen(hl), sizeof hl - strlen(hl), "%s%08x", i ? "," : "", g_wls_hashes[i]);
+            fprintf(stderr, "mali-compat: wls-clamp-1 active: VkDevice %p, modules %s, so far %llu modules / %llu chains\n",
+                    (void *)*pDevice, g_wls_clamp == 1 ? "all" : hl, (unsigned long long)atomic_load(&g_wls_modules),
+                    (unsigned long long)atomic_load(&g_wls_chains));
+        }
+        fprintf(stderr, "mali-compat: pc2-restore-1 active: VkDevice %p, driver vkCmdPushConstants2 %s, "
+                "vkCmdPushConstants2KHR %s\n", (void *)*pDevice, d->fpCmdPushConstants2 ? "yes" : "no",
+                d->fpCmdPushConstants2KHR ? "yes" : "no");
+        static _Atomic bool pc2_log_started;
+        if (!atomic_exchange(&pc2_log_started, true)) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, pc2_log_thread, NULL) == 0) pthread_detach(t);
+        }
     }
+    atomic_fetch_add_explicit(&g_device_gen, 1, memory_order_release); // g_devices[] changed: drop the D1 caches
     pthread_mutex_unlock(&g_table_mutex);
 
     LOG("created VkDevice %p (key=%p)", (void *)*pDevice, *pDevice ? *(void **)*pDevice : NULL);
@@ -5490,6 +7790,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
                 break;
             }
         }
+        atomic_fetch_add_explicit(&g_device_gen, 1, memory_order_release); // entries moved: drop the D1 caches
         pthread_mutex_unlock(&g_table_mutex);
     }
 }
@@ -5546,11 +7847,24 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         struct DeviceData *dd = get_device_data(device);
         if (!dd || !dd->fpMapMemory2KHR) return dd ? dd->get_device_proc_addr(device, pName) : NULL;
     }
+    if (g_dc_on) { PFN_vkVoidFunction dh = dc_proc(device, pName); if (dh) return dh; } // desc-capture-1
     #define MATCH_DEV(fn) if (!strcmp(pName, "vk" #fn)) return (PFN_vkVoidFunction)compat_##fn
     // GPU timing hooks: only while the switch is on, so the normal path calls the driver directly.
     #define MATCH_DEV_KHR(fn) if (!strcmp(pName, "vk" #fn) || !strcmp(pName, "vk" #fn "KHR")) return (PFN_vkVoidFunction)compat_##fn
     if (g_async_ms) MATCH_DEV(DestroyPipeline);
-    if (g_gpu_time || g_async_ms || g_noatt_w) { // GPU timing, async compiles and the pass clamp share these hooks
+    if ((g_depth_equal_on || g_gt_dyndepth) && (!strcmp(pName, "vkCmdSetDepthCompareOp") || !strcmp(pName, "vkCmdSetDepthCompareOpEXT"))) {
+        struct DeviceData *dd = get_device_data(device);
+        if (dd && dd->fpCmdSetDepthCompareOp) return (PFN_vkVoidFunction)compat_CmdSetDepthCompareOp;
+    }
+    if (g_gt_dyndepth && (!strcmp(pName, "vkCmdSetDepthTestEnable") || !strcmp(pName, "vkCmdSetDepthTestEnableEXT"))) {
+        struct DeviceData *dd = get_device_data(device);
+        if (dd && dd->fpCmdSetDepthTestEnable) return (PFN_vkVoidFunction)compat_CmdSetDepthTestEnable;
+    }
+    if (g_gt_dyndepth && (!strcmp(pName, "vkCmdSetDepthWriteEnable") || !strcmp(pName, "vkCmdSetDepthWriteEnableEXT"))) {
+        struct DeviceData *dd = get_device_data(device);
+        if (dd && dd->fpCmdSetDepthWriteEnable) return (PFN_vkVoidFunction)compat_CmdSetDepthWriteEnable;
+    }
+    if (g_gpu_time || g_async_ms || g_noatt_w || g_no_susres || g_dc_on) { // GPU timing, async compiles, pass clamp, NO_SUSPEND_RESUME and desc-capture-1 share these hooks
         MATCH_DEV_KHR(CmdBeginRendering);
         MATCH_DEV_KHR(CmdEndRendering);
         MATCH_DEV(CmdBeginRenderPass);
@@ -5575,14 +7889,26 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
             MATCH_GT_OPT(CmdDrawMeshTasksIndirectCountEXT);
             if ((!strcmp(pName, "vkCmdDispatchBase") || !strcmp(pName, "vkCmdDispatchBaseKHR")) && gd->gt->fpCmdDispatchBase)
                 return (PFN_vkVoidFunction)compat_CmdDispatchBase;
+            // GPU timing only: secondary command buffers into their pass, queue-side CPU time
+            #define MATCH_GT_NAME(fn, name) if ((g_gpu_time || g_dc_on) && !strcmp(pName, name) && gd->gt->fp##fn) return (PFN_vkVoidFunction)compat_##fn
+            MATCH_GT_NAME(CmdExecuteCommands, "vkCmdExecuteCommands");
+            MATCH_GT_NAME(QueueSubmit, "vkQueueSubmit");
+            MATCH_GT_NAME(QueueSubmit2, "vkQueueSubmit2");
+            MATCH_GT_NAME(QueueSubmit2, "vkQueueSubmit2KHR");
+            MATCH_GT_NAME(WaitForFences, "vkWaitForFences");
+            MATCH_GT_NAME(WaitSemaphores, "vkWaitSemaphores");
+            MATCH_GT_NAME(WaitSemaphores, "vkWaitSemaphoresKHR");
+            MATCH_GT_NAME(QueueWaitIdle, "vkQueueWaitIdle");
+            MATCH_GT_NAME(DeviceWaitIdle, "vkDeviceWaitIdle");
+            #undef MATCH_GT_NAME
             #undef MATCH_GT_OPT
         }
     }
     if (!strcmp(pName, "vkCmdPushDescriptorSetKHR") || !strcmp(pName, "vkCmdPushDescriptorSet")) {
         struct DeviceData *dd = get_device_data(device);
-        if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
+        if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id || g_dc_on)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
     }
-    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight) MATCH_DEV(CreateComputePipelines);
+    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
         MATCH_DEV(CreateQueryPool);
         MATCH_DEV(DestroyQueryPool);
@@ -5614,6 +7940,14 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     if (!strcmp(pName, "vkCmdCopyBufferToImage2KHR")) return (PFN_vkVoidFunction)compat_CmdCopyBufferToImage2;
     MATCH_DEV(CmdBindPipeline);
     MATCH_DEV(CmdPushConstants);
+    // pc2-restore-1: only names the driver has (a hook for a missing one would call through NULL)
+    if (!strcmp(pName, "vkCmdPushConstants2") || !strcmp(pName, "vkCmdPushConstants2KHR")) {
+        struct DeviceData *dd = get_device_data(device);
+        bool khr = pName[19] == 'K';
+        if (dd && (khr ? dd->fpCmdPushConstants2KHR != NULL : dd->fpCmdPushConstants2 != NULL))
+            return khr ? (PFN_vkVoidFunction)compat_CmdPushConstants2KHR : (PFN_vkVoidFunction)compat_CmdPushConstants2;
+        return dd ? dd->get_device_proc_addr(device, pName) : NULL;
+    }
     MATCH_DEV(ResetCommandBuffer);
     MATCH_DEV(BeginCommandBuffer);
     MATCH_DEV(AllocateCommandBuffers);
