@@ -72,7 +72,7 @@ In short (2026-10-30):
 | The Witcher 3 (current release) | DX11 → DXVK | in game, ~18-22 FPS at low settings; with `NOATT_AREA` (GPU hang otherwise), `PIPELINE_CACHE` and `ASYNC_PSO` (compile stalls) |
 | The Witcher 3 (current release) | DX12 → vkd3d-proton | in game, ~17-22 FPS; the prologue runs, one GPU hang left later in the game |
 | Horizon Zero Dawn | DX12 → vkd3d-proton | benchmark completes (avg 14-16 FPS); the static world geometry (buildings, props, cliffs) is missing |
-| Control | DX12 → vkd3d-proton | starts, intro and 3D visible, plays at ~12-13 FPS (autoplay 3 min, exit 0). Recipe: `MALI_COMPAT_NO_SUSPEND_RESUME=1` with one of `GPU_TIME`/`ASYNC_PSO`/`NOATT_AREA`/`GT_TRACE` on (its hooks do the work), plus `FEX_DISKCACHE=0` in the guest; the compute shader that aborted the vendor compiler is replaced through `VKD3D_SHADER_OVERRIDE` |
+| Control | DX12 → vkd3d-proton | starts, intro and 3D visible, plays at ~12-13 FPS (autoplay 3 min, exit 0). Recipe: `MALI_COMPAT_NO_SUSPEND_RESUME=1` (needs no other switch since 2026-10-31), plus `FEX_DISKCACHE=0` in the guest; the compute shader that aborted the vendor compiler is replaced through `VKD3D_SHADER_OVERRIDE` |
 
 ## Session on the vendor driver
 
@@ -132,11 +132,14 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 | `MALI_COMPAT_VENDOR_ID=<hex>` | report another PCI vendor ID (driverID stays Arm); `5143` makes vkd3d-proton use push descriptors for root CBVs |
 | `MALI_COMPAT_SPV_FIX=1` | two SPIR-V rewrites against vendor-compiler aborts (u32→u64→float conversions, uniform `BroadcastFirst`); for Control, not enough yet |
 | `MALI_COMPAT_SPV_DONTUNROLL=1` | mark every loop DontUnroll (experiment against slow compiles) |
-| `MALI_COMPAT_NO_SUSPEND_RESUME=1` | turn vkd3d-proton's suspended/resumed render passes into plain passes (fixed HZD's blocky sky); uses the hooks of `GPU_TIME`, `ASYNC_PSO` or `NOATT_AREA`, so one of those must be on |
+| `MALI_COMPAT_NO_SUSPEND_RESUME=1` | turn vkd3d-proton's suspended/resumed render passes into plain passes (fixed HZD's blocky sky, needed by Control); installs the render-pass hooks itself, no `GPU_TIME` needed and no timing work without it |
+| `MALI_COMPAT_SUSRES_BARRIER=1` | with `NO_SUSPEND_RESUME` only: one memory barrier (attachment write → load/test/sample) before each converted resuming part, so the split parts are ordered as the spec requires (K-CS1, test for Control's shadow flicker; not deployed yet, build `bridge/build/stage-old+decouple+kcs1/`) |
 | `MALI_COMPAT_FORCE_COMP=1` | give attachments without STORAGE their compression back when vkd3d-proton asks for none (experiment) |
 | `MALI_COMPAT_DEPTH_NOCOMP=1` | create sampled depth/stencil images uncompressed (experiment) |
 | `MALI_COMPAT_FORCE_COHERENT=1` | allocations from the non-coherent cached host memory type go to the coherent one of the same heap (experiment) |
 | `MALI_COMPAT_FAKE_OCCLUSION=1` | every occlusion query reads as visible (experiment) |
+| `MALI_COMPAT_BUDGET_MB=<MiB>` | cap each heap's `VK_EXT_memory_budget` `heapBudget` at this size instead of 5 GiB (0 or unset = 5 GiB; logged once at init). Since K-CF2 heapUsage is the live per-heap usage (subtracted on free), see `docs/common_fixes.md` § "7.8 GB ceiling (cross-game)" |
+| `MALI_COMPAT_BUDGET_LOG_S=<s>` | interval of the budget log line `mali-compat: budget heap0 <used>/<budget> MiB (peak) ..., <n> allocs, <q> queries` (default 30 s); the line is printed only with `MALI_COMPAT_GPU_TIME=1` or `MALI_COMPAT_DEBUG` (K-CF2) |
 
 **Session** (see [Session on the vendor driver](#session-on-the-vendor-driver)):
 
