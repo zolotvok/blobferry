@@ -14,6 +14,7 @@ third_party/vulkan-wsi-layer submodule. build-wsi.sh applies this patch when it 
 - MALI_WSI_PROBE_PIXELS=1 (debug) logs pixel samples of the first presented images.
 - MALI_WSI_FPS=1 appends the present rate every 5 s to /root/mali-wsi-fps.txt (frame rate without a HUD, for scripts).
 
+- A platform surface extension (wayland/xcb/...) requested without VK_KHR_surface enables VK_KHR_surface instead of failing with VK_ERROR_EXTENSION_NOT_PRESENT (Steam's GPU query under gamescope's WSI layer).
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index b43b1ad..8f7c824 100644
 --- a/CMakeLists.txt
@@ -31,6 +32,23 @@ index b43b1ad..8f7c824 100644
     message(STATUS "Using wayland protocols dir : ${WAYLAND_PROTOCOLS_DIR}")
  
     add_custom_target(wayland_generated_files
+diff --git a/layer/layer.cpp b/layer/layer.cpp
+index d06bd7b..ad85764 100644
+--- a/layer/layer.cpp
++++ b/layer/layer.cpp
+@@ -537,9 +537,11 @@ VKAPI_ATTR VkResult create_instance(const VkInstanceCreateInfo *pCreateInfo, con
+ 
+    if (!layer_platforms_to_enable.empty())
+    {
++      /* Blobferry: a platform surface extension without VK_KHR_surface (Steam's GPU query under gamescope's WSI
++       * layer does this) is not an error; the layer implements VK_KHR_surface itself, so enable it. */
+       if (!extensions.contains(VK_KHR_SURFACE_EXTENSION_NAME))
+       {
+-         return VK_ERROR_EXTENSION_NOT_PRESENT;
++         TRY_LOG_CALL(extensions.add(VK_KHR_SURFACE_EXTENSION_NAME));
+       }
+       TRY_LOG_CALL(wsi::add_instance_extensions_required_by_layer(layer_platforms_to_enable, extensions, api_version));
+    }
 diff --git a/util/wsialloc/wsialloc_dma_buf_heaps.c b/util/wsialloc/wsialloc_dma_buf_heaps.c
 index 5339166..cfa86ff 100644
 --- a/util/wsialloc/wsialloc_dma_buf_heaps.c

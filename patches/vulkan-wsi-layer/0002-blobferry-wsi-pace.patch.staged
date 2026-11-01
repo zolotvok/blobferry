@@ -1,0 +1,430 @@
+diff --git a/wsi/mali_pace.hpp b/wsi/mali_pace.hpp
+new file mode 100644
+index 0000000..f7a1612
+--- /dev/null
++++ b/wsi/mali_pace.hpp
+@@ -0,0 +1,269 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * DroidDeck/Mali bridge [keeper, Claude Opus 5.5] 2026-11-01 (K-WP1, perf-review request (a)): MALI_WSI_PACE=1 logs
++ * the per-frame present pacing, every 5 s, into /root/mali-wsi-pace.txt (MALI_WSI_PACE_FILE overrides the path).
++ * Log only; nothing changes when the variable is unset. It answers where the ~4 ms per frame with no GPU work in
++ * flight come from: the app's present cadence (FIFO quantisation at the display period?), the app blocked in
++ * vkAcquireNextImageKHR (no free image), the page-flip thread waiting for the GPU, or the compositor's frame callback.
++ *
++ * Per 5-s window, for each metric: n, mean, p50, p90, p99, max (ms); for the two intervals also a 1-ms histogram and
++ * the share of intervals within +-1.5 ms of k x the display period (MALI_WSI_PACE_HZ, default 90).
++ *   present_interval  app thread: vkQueuePresentKHR to the next vkQueuePresentKHR (all swapchains of the process)
++ *   commit_interval   page-flip thread: wl_surface_commit to the next one (what the compositor receives)
++ *   acquire_block     app thread: time inside vkAcquireNextImageKHR (waiting for a free image)
++ *   acq_to_present    app thread: acquire returned -> vkQueuePresentKHR of that image (app CPU + submit per frame)
++ *   queue_to_gpu_done vkQueuePresentKHR -> the page-flip thread sees the image's present fence signalled
++ *   flip_gpu_wait     page-flip thread blocked on that present fence
++ *   flip_frame_cb     page-flip thread blocked on the compositor's frame callback (FIFO pacing by the compositor)
++ *   pending_depth     presents queued to the page-flip thread when a new one arrives (frames in flight on our side)
++ * The window formatter is pure (pace_window::format) so the PC unit test (bridge/test/wsi-pace/) checks it.
++ */
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace wsi
++{
++namespace mali_pace
++{
++
++enum metric
++{
++   M_PRESENT_INTERVAL,
++   M_COMMIT_INTERVAL,
++   M_ACQUIRE_BLOCK,
++   M_ACQ_TO_PRESENT,
++   M_QUEUE_TO_GPU_DONE,
++   M_FLIP_GPU_WAIT,
++   M_FLIP_FRAME_CB,
++   M_PENDING_DEPTH, /* a count, stored as "ns" = count * 1e6 so the ms columns read as the count */
++   M_COUNT
++};
++
++static constexpr const char *metric_name[M_COUNT] = { "present_interval", "commit_interval", "acquire_block",
++                                                      "acq_to_present",   "queue_to_gpu_done", "flip_gpu_wait",
++                                                      "flip_frame_cb",    "pending_depth" };
++
++static constexpr int HIST_BINS = 51; /* 1-ms bins 0..49, bin 50 = >= 50 ms */
++static constexpr size_t MAX_SAMPLES = 4096; /* per metric and window; more are counted in n/mean/max only */
++
++struct pace_window
++{
++   std::vector<int64_t> samples[M_COUNT];
++   uint64_t n[M_COUNT] = {};
++   double sum_ns[M_COUNT] = {};
++   int64_t max_ns[M_COUNT] = {};
++   uint32_t hist[2][HIST_BINS] = {}; /* present_interval, commit_interval */
++
++   void add(metric m, int64_t ns)
++   {
++      if (ns < 0)
++         ns = 0;
++      n[m]++;
++      sum_ns[m] += static_cast<double>(ns);
++      max_ns[m] = std::max(max_ns[m], ns);
++      if (samples[m].size() < MAX_SAMPLES)
++         samples[m].push_back(ns);
++      if (m == M_PRESENT_INTERVAL || m == M_COMMIT_INTERVAL)
++      {
++         int64_t b = ns / 1000000;
++         hist[m == M_COMMIT_INTERVAL][b >= HIST_BINS - 1 ? HIST_BINS - 1 : b]++;
++      }
++   }
++
++   void clear()
++   {
++      for (auto &s : samples)
++         s.clear();
++      std::fill(std::begin(n), std::end(n), 0);
++      std::fill(std::begin(sum_ns), std::end(sum_ns), 0.0);
++      std::fill(std::begin(max_ns), std::end(max_ns), 0);
++      std::memset(hist, 0, sizeof hist);
++   }
++
++   /* nearest-rank percentile of the kept samples, in ms */
++   static double pct(std::vector<int64_t> &v, double p)
++   {
++      if (v.empty())
++         return 0.0;
++      size_t k = static_cast<size_t>(std::ceil(p / 100.0 * static_cast<double>(v.size())));
++      k = k == 0 ? 0 : k - 1;
++      if (k >= v.size())
++         k = v.size() - 1;
++      std::nth_element(v.begin(), v.begin() + static_cast<long>(k), v.end());
++      return static_cast<double>(v[k]) / 1e6;
++   }
++
++   /* share of intervals within +-1.5 ms of k x period (k = 1..4), the rest "off" */
++   static std::string vsync_split(const std::vector<int64_t> &v, double period_ms)
++   {
++      uint32_t k_cnt[5] = {};
++      uint32_t off = 0;
++      for (int64_t ns : v)
++      {
++         double ms = static_cast<double>(ns) / 1e6;
++         double k = std::round(ms / period_ms);
++         if (k >= 1 && k <= 4 && std::fabs(ms - k * period_ms) <= 1.5)
++            k_cnt[static_cast<int>(k)]++;
++         else
++            off++;
++      }
++      char buf[160];
++      double tot = v.empty() ? 1.0 : static_cast<double>(v.size());
++      snprintf(buf, sizeof buf, " | vsync %.2fms 1x %.0f%% 2x %.0f%% 3x %.0f%% 4x %.0f%% off %.0f%%", period_ms,
++               100.0 * k_cnt[1] / tot, 100.0 * k_cnt[2] / tot, 100.0 * k_cnt[3] / tot, 100.0 * k_cnt[4] / tot,
++               100.0 * off / tot);
++      return buf;
++   }
++
++   /* The whole window as text; `stamp` = "HH:MM:SS". Leaves the samples reordered (not cleared). */
++   std::string format(const char *stamp, double window_s, double period_ms)
++   {
++      std::string out;
++      char buf[512];
++      double fps = window_s > 0 ? static_cast<double>(n[M_PRESENT_INTERVAL]) / window_s : 0.0;
++      snprintf(buf, sizeof buf, "=== %s %.1f s: presents %llu (%.1f fps)\n", stamp, window_s,
++               static_cast<unsigned long long>(n[M_PRESENT_INTERVAL]), fps);
++      out += buf;
++      for (int m = 0; m < M_COUNT; m++)
++      {
++         if (!n[m])
++            continue;
++         double mean = sum_ns[m] / static_cast<double>(n[m]) / 1e6;
++         snprintf(buf, sizeof buf, "%-17s n %5llu mean %7.2f p50 %7.2f p90 %7.2f p99 %7.2f max %7.2f", metric_name[m],
++                  static_cast<unsigned long long>(n[m]), mean, pct(samples[m], 50), pct(samples[m], 90),
++                  pct(samples[m], 99), static_cast<double>(max_ns[m]) / 1e6);
++         out += buf;
++         if (m == M_PRESENT_INTERVAL || m == M_COMMIT_INTERVAL)
++         {
++            out += vsync_split(samples[m], period_ms);
++            out += " | hist_ms";
++            const uint32_t *h = hist[m == M_COMMIT_INTERVAL];
++            for (int b = 0; b < HIST_BINS; b++)
++            {
++               if (!h[b])
++                  continue;
++               if (b == HIST_BINS - 1)
++                  snprintf(buf, sizeof buf, " >=%d:%u", b, h[b]);
++               else
++                  snprintf(buf, sizeof buf, " %d:%u", b, h[b]);
++               out += buf;
++            }
++         }
++         out += "\n";
++      }
++      return out;
++   }
++};
++
++inline int64_t now_ns()
++{
++   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++inline bool enabled()
++{
++   static const bool on = [] {
++      const char *e = getenv("MALI_WSI_PACE");
++      return e && e[0] && e[0] != '0';
++   }();
++   return on;
++}
++
++struct pace_state
++{
++   std::mutex m;
++   pace_window w;
++   int64_t window_start = 0;
++   int64_t last_present = 0;
++   int64_t last_commit = 0;
++   double period_ms = 1000.0 / 90.0;
++   std::string path = "/root/mali-wsi-pace.txt";
++   pace_state()
++   {
++      const char *hz = getenv("MALI_WSI_PACE_HZ");
++      if (hz && atof(hz) > 1.0)
++         period_ms = 1000.0 / atof(hz);
++      const char *p = getenv("MALI_WSI_PACE_FILE");
++      if (p && p[0])
++         path = p;
++   }
++};
++
++inline pace_state &state()
++{
++   static pace_state *s = new pace_state(); /* never destroyed: the page-flip thread may outlive static teardown */
++   return *s;
++}
++
++/* Writes the window if 5 s are over; called with s.m held. */
++inline void maybe_flush_locked(pace_state &s, int64_t now)
++{
++   if (s.window_start == 0)
++   {
++      s.window_start = now;
++      return;
++   }
++   if (now - s.window_start < 5000000000LL)
++      return;
++   time_t t = time(nullptr);
++   struct tm tm;
++   localtime_r(&t, &tm);
++   char stamp[16];
++   snprintf(stamp, sizeof stamp, "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
++   std::string text = s.w.format(stamp, static_cast<double>(now - s.window_start) / 1e9, s.period_ms);
++   s.w.clear();
++   s.window_start = now;
++   FILE *f = fopen(s.path.c_str(), "a");
++   if (f)
++   {
++      fputs(text.c_str(), f);
++      fclose(f);
++   }
++}
++
++inline void add(metric m, int64_t ns)
++{
++   if (!enabled())
++      return;
++   pace_state &s = state();
++   std::lock_guard<std::mutex> lock(s.m);
++   s.w.add(m, ns);
++}
++
++/* app thread, at vkQueuePresentKHR entry */
++inline void on_present(int64_t now, uint32_t pending_depth)
++{
++   pace_state &s = state();
++   std::lock_guard<std::mutex> lock(s.m);
++   if (s.last_present)
++      s.w.add(M_PRESENT_INTERVAL, now - s.last_present);
++   s.last_present = now;
++   s.w.add(M_PENDING_DEPTH, static_cast<int64_t>(pending_depth) * 1000000);
++   maybe_flush_locked(s, now);
++}
++
++/* page-flip thread (or app thread without it), right after wl_surface_commit */
++inline void on_commit(int64_t now)
++{
++   pace_state &s = state();
++   std::lock_guard<std::mutex> lock(s.m);
++   if (s.last_commit)
++      s.w.add(M_COMMIT_INTERVAL, now - s.last_commit);
++   s.last_commit = now;
++}
++
++} /* namespace mali_pace */
++} /* namespace wsi */
+diff --git a/wsi/swapchain_base.cpp b/wsi/swapchain_base.cpp
+index 44ce4f9..8e8accd 100644
+--- a/wsi/swapchain_base.cpp
++++ b/wsi/swapchain_base.cpp
+@@ -50,6 +50,7 @@
+ #include "util/helpers.hpp"
+ 
+ #include "swapchain_base.hpp"
++#include "mali_pace.hpp"
+ #include "wsi_factory.hpp"
+ 
+ #include "extensions/present_timing.hpp"
+@@ -109,6 +110,7 @@ void swapchain_base::page_flip_thread()
+        * work takes longer at the default log level (after 2, 10, 60 s, then every 5 min, and when it finishes). A GPU
+        * hang otherwise shows only as 0 FPS: the page-flip thread waited here forever without a word. */
+       uint64_t present_wait_s = 0;
++      const int64_t pace_wait_t0 = mali_pace::enabled() ? mali_pace::now_ns() : 0;
+       while ((vk_res = sc_images[submit_info.image_index].wait_present(2000000000ull)) == VK_TIMEOUT)
+       {
+          present_wait_s += 2;
+@@ -118,6 +120,16 @@ void swapchain_base::page_flip_thread()
+                           submit_info.image_index, static_cast<unsigned long long>(present_wait_s));
+          }
+       }
++      if (pace_wait_t0 && vk_res == VK_SUCCESS)
++      {
++         /* K-WP1: how long this thread waited for the frame's GPU work, and present call -> GPU done */
++         const int64_t pace_now = mali_pace::now_ns();
++         mali_pace::add(mali_pace::M_FLIP_GPU_WAIT, pace_now - pace_wait_t0);
++         if (submit_info.queued_ns)
++         {
++            mali_pace::add(mali_pace::M_QUEUE_TO_GPU_DONE, pace_now - submit_info.queued_ns);
++         }
++      }
+       if (present_wait_s > 0)
+       {
+          WSI_LOG_ERROR("mali-wsi: present fence of image %u finished after ~%llu s, result %d", submit_info.image_index,
+@@ -442,6 +454,7 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
+     * return VK_TIMEOUT or VK_NOT_READY (the spec allows neither); vkd3d-proton treats any positive result other than
+     * SUBOPTIMAL as success without an image index and asserts "swapchain_index != UINT32_MAX". Wait again instead,
+     * and say once per swapchain that it happened. */
++   const int64_t pace_acq_t0 = mali_pace::enabled() ? mali_pace::now_ns() : 0;
+    VkResult wait_res = wait_and_get_free_buffer(timeout);
+    while (timeout == UINT64_MAX && (wait_res == VK_TIMEOUT || wait_res == VK_NOT_READY))
+    {
+@@ -496,6 +509,14 @@ VkResult swapchain_base::acquire_next_image(uint64_t timeout, VkSemaphore semaph
+ 
+    image_status_lock.unlock();
+ 
++   if (pace_acq_t0)
++   {
++      /* K-WP1: time the app was blocked in acquire (free-image wait), and when this image left acquire */
++      const int64_t pace_now = mali_pace::now_ns();
++      mali_pace::add(mali_pace::M_ACQUIRE_BLOCK, pace_now - pace_acq_t0);
++      m_pace_acquired_ns[*image_index & 15u] = pace_now;
++   }
++
+    if (!external_sync_supported(m_device_data))
+    {
+       /* Fallback for when importing fence/semaphore sync FDs is unsupported by the ICD. */
+@@ -688,6 +709,20 @@ VkResult swapchain_base::queue_present(VkQueue queue, const VkPresentInfoKHR *pr
+       return VK_ERROR_VALIDATION_FAILED;
+    }
+ 
++   /* K-WP1 (MALI_WSI_PACE): present cadence, frames queued on our side, acquire -> present of this image */
++   pending_present_request pending_present = submit_info.pending_present;
++   if (mali_pace::enabled())
++   {
++      pending_present.queued_ns = mali_pace::now_ns();
++      mali_pace::on_present(pending_present.queued_ns, m_pending_present_count);
++      int64_t &acquired = m_pace_acquired_ns[pending_present.image_index & 15u];
++      if (acquired)
++      {
++         mali_pace::add(mali_pace::M_ACQ_TO_PRESENT, pending_present.queued_ns - acquired);
++      }
++      acquired = 0;
++   }
++
+    if (m_present_mode == VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR)
+    {
+       const util::unique_lock<util::recursive_mutex> image_status_lock(m_image_status_mutex);
+@@ -796,7 +831,7 @@ VkResult swapchain_base::queue_present(VkQueue queue, const VkPresentInfoKHR *pr
+       TRY_LOG_CALL(ext_present_timing->add_presentation_entry(
+          queue, submit_info.pending_present.present_id, submit_info.pending_present.image_index, *present_timing_info));
+    }
+-   TRY(notify_presentation_engine(submit_info.pending_present));
++   TRY(notify_presentation_engine(pending_present));
+ 
+    return VK_SUCCESS;
+ }
+diff --git a/wsi/swapchain_base.hpp b/wsi/swapchain_base.hpp
+index 5af772d..441a984 100644
+--- a/wsi/swapchain_base.hpp
++++ b/wsi/swapchain_base.hpp
+@@ -71,6 +71,9 @@ struct pending_present_request
+     * If 0, no present ID has been assigned to this request.
+     */
+    uint64_t present_id;
++
++   /* MALI_WSI_PACE (K-WP1): steady-clock ns of the vkQueuePresentKHR that queued this request, 0 = not timed. */
++   int64_t queued_ns{ 0 };
+ };
+ 
+ struct swapchain_presentation_parameters
+@@ -364,6 +367,11 @@ protected:
+     */
+    bool m_infinite_acquire_retry_logged = false;
+ 
++   /**
++    * @brief MALI_WSI_PACE (K-WP1): when each image index (mod 16) was last returned by acquire. DroidDeck/Mali bridge.
++    */
++   std::array<int64_t, 16> m_pace_acquired_ns{};
++
+    /**
+     * @brief A semaphore to be signalled once a page flip event occurs.
+     */
+diff --git a/wsi/wayland/swapchain.cpp b/wsi/wayland/swapchain.cpp
+index 68b963d..906a135 100644
+--- a/wsi/wayland/swapchain.cpp
++++ b/wsi/wayland/swapchain.cpp
+@@ -39,6 +39,7 @@
+ #include <linux/dma-buf.h>
+ 
+ #include "swapchain.hpp"
++#include "wsi/mali_pace.hpp"
+ #include "util/drm/drm_utils.hpp"
+ #include "util/format_modifiers.hpp"
+ #include "util/helpers.hpp"
+@@ -459,10 +460,15 @@ void swapchain::present_image(const pending_present_request &pending_present)
+    auto image_data = image.get_data<wayland_image_data>();
+ 
+    /* if a frame is already pending, wait for a hint to present again */
++   const int64_t pace_cb_t0 = mali_pace::enabled() ? mali_pace::now_ns() : 0;
+    if (!m_wsi_surface->wait_next_frame_event())
+    {
+       set_error_state(VK_ERROR_SURFACE_LOST_KHR);
+    }
++   if (pace_cb_t0)
++   {
++      mali_pace::add(mali_pace::M_FLIP_FRAME_CB, mali_pace::now_ns() - pace_cb_t0); /* K-WP1: compositor pacing */
++   }
+ 
+    wl_surface_attach(m_surface, image_data->get_buffer(), 0, 0);
+ 
+@@ -546,6 +552,10 @@ void swapchain::present_image(const pending_present_request &pending_present)
+ 
+    wl_surface_commit(m_surface);
+    int res = wl_display_flush(m_display);
++   if (pace_cb_t0)
++   {
++      mali_pace::on_commit(mali_pace::now_ns()); /* K-WP1: cadence the compositor receives */
++   }
+    if (res < 0)
+    {
+       WSI_LOG_ERROR("error flushing the display");

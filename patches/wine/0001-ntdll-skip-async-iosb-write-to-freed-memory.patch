@@ -1,0 +1,119 @@
+From: zolotvok <zolotvok@gmail.com>
+Subject: [PATCH] ntdll: Don't fault when an async completion writes a freed IO_STATUS_BLOCK.
+
+When a thread terminates with async I/O still pending, wineserver cancels
+it (cancel_terminating_thread_asyncs) and queue_apc() redirects the
+resulting APC_ASYNC_IO to another thread of the process, because the
+issuing thread is TERMINATED. invoke_system_apc() on that other thread
+then stores STATUS_CANCELLED into the IO_STATUS_BLOCK (usually the
+caller's OVERLAPPED), whose memory may already be gone. If the APC was
+delivered by SIGUSR1 into a wait, the store faults on the signal stack,
+virtual_setup_exception() reports "nested exception on signal stack"
+and abort_thread() kills the thread; for the main thread that ends the
+process.
+
+The NT kernel writes the user I/O status block under an exception
+handler and silently ignores a fault there. Do the equivalent: before
+storing the result of a deferred async completion, check that the
+status block is still writable memory and drop the store otherwise.
+Memory that Wine does not manage (no view) is only refused when it is
+not mapped at all, so every case that did not crash before behaves as
+before.
+
+Seen with Watch Dogs 2 (Proton experimental-11.0 arm64, ARM64EC + FEX):
+an IOCTL_NSIPROXY_WINE_CHANGE_NOTIFICATION (IPv4 unicast table, i.e.
+NotifyAddrChange) issued with an OVERLAPPED at a high address; the
+issuing thread exits, the cancel is delivered to the main thread, the
+store hits an unmapped page, the game dies.
+
+NOTE (Droid-Deck_Mali_Support): written without the Wine source tree at
+hand (none is local); hunk context follows upstream Wine 10/11 and the
+symbols present in the dist's ntdll.so (invoke_system_apc,
+check_write_access, virtual_uninterrupted_write_memory). If a hunk does
+not apply, apply it by hand: the change is one call in server.c, one
+prototype, one function in virtual.c next to
+virtual_uninterrupted_write_memory(). Use host_page_mask/page_mask,
+whichever the tree has.
+
+Assisted-by: Claude Opus 5.5 (keeper agent)
+---
+ dlls/ntdll/unix/server.c       |  2 +-
+ dlls/ntdll/unix/unix_private.h |  1 +
+ dlls/ntdll/unix/virtual.c      | 41 +++++++++++++++++++++++++++++++
+ 3 files changed, 43 insertions(+), 1 deletion(-)
+
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -380,8 +380,8 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *result, BOOL self )
+         {
+             result->async_io.status = status;
+             result->async_io.total = info;
+             /* the server will pass us NULL if a call failed synchronously */
+-            set_async_iosb( call->async_io.sb, result->async_io.status, info );
++            virtual_set_async_iosb( call->async_io.sb, result->async_io.status, info );
+         }
+         else result->async_io.status = STATUS_PENDING; /* restart it */
+         break;
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -290,5 +290,6 @@ extern BOOL virtual_check_buffer_for_write( void *ptr, SIZE_T size );
+ extern SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T size );
+ extern NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZE_T size );
++extern void virtual_set_async_iosb( client_ptr_t iosb, NTSTATUS status, ULONG_PTR info );
+ extern void virtual_set_force_exec( BOOL enable );
+ extern void virtual_set_large_address_space(void);
+ extern void virtual_fill_image_information( const struct pe_image_info *pe_info,
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4210,8 +4210,49 @@ NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZE_T size )
+     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+     return ret;
+ }
+ 
+ 
++/***********************************************************************
++ *           virtual_set_async_iosb
++ *
++ * Store the final status of a deferred async I/O completion (APC_ASYNC_IO).
++ *
++ * The completion may run long after the request was issued and on another
++ * thread: when the issuing thread terminates, the server cancels its asyncs
++ * and redirects the APC to any other thread of the process. The status block
++ * may be freed by then. Windows writes it under an exception handler and
++ * ignores a fault; skip the store instead of faulting (a fault here is often
++ * on the signal stack and kills the thread).
++ */
++void virtual_set_async_iosb( client_ptr_t iosb, NTSTATUS status, ULONG_PTR info )
++{
++    char *addr = wine_server_get_ptr( iosb );
++    size_t size = in_wow64_call() ? sizeof(IO_STATUS_BLOCK32) : sizeof(IO_STATUS_BLOCK);
++    char *start = ROUND_ADDR( addr, host_page_mask );
++    unsigned char vec[2];
++    BOOL has_write_watch = FALSE, writable;
++    sigset_t sigset;
++
++    if (!iosb) return;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    if (find_view( addr, size ))
++        writable = !check_write_access( addr, size, &has_write_watch );
++    else  /* not Wine-managed memory: refuse only if nothing is mapped there */
++        writable = !mincore( start, addr + size - start, vec );
++    if (writable)
++    {
++        set_async_iosb( iosb, status, info );
++        if (has_write_watch) update_write_watches( addr, size, size );
++    }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++
++    if (!writable)
++        WARN( "status block %p is no longer writable, dropping status %#x info %#lx\n",
++              addr, (int)status, (long)info );
++}
++
++
+ /***********************************************************************
+  *           virtual_set_force_exec
+  *
+-- 
+2.47.0

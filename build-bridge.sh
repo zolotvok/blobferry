@@ -33,6 +33,8 @@ case ${1:-build} in
     clang $T -O2 -Wall "$B/test/session-probe.c" -o "$STAGE/session-probe" -lvulkan   # what gamescope / Steam need from the bridge
     clang $T -O2 -Wall "$B/test/export-probe.c" -o "$STAGE/export-probe" -lvulkan   # does a GPU write reach an exported dma-buf
     clang $T -O2 -Wall -I"$B/../panvk-kbase-android/work/mesa/include" "$B/test/afrc-probe.c" -o "$STAGE/afrc-probe" -lvulkan   # AFRC rates for the BC shadow formats
+    clang $T -O2 -Wall "$B/test/spv-compile-probe.c" -o "$STAGE/spv-compile-probe" -lvulkan   # does the vendor compiler take a compute .spv (abort in a forked child)
+    "$B/test/robust-probe-build.sh" >/dev/null   # WD2 vendor robustness probe (builds into build/robust-probe/, shaders via glslangValidator)
     # vkprobe.exe: an x86-64 Windows program for Proton (llvm-mingw in tools-llvm-mingw; Vulkan headers from the sysroot)
     MINGW=$(ls "$B"/../tools-llvm-mingw/llvm-mingw-*/bin/x86_64-w64-mingw32-clang 2>/dev/null | head -1)
     if [ -n "$MINGW" ]; then

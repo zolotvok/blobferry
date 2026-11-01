@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// robust-probe shader: ONE out-of-range-capable read per dispatch, result into an output SSBO. Variants by -D:
+//   UTB (R32_UINT uniform texel buffer), STB (R32_UINT storage texel buffer, read), UBO (64 KiB array, small range),
+//   SSBO (runtime array), WILD (read through a buffer_reference pointer from a push constant: a guaranteed-unmapped
+//   address = positive control for the GPU fault print). [tests, Claude Sonnet 5.5] 2026-11-01
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#ifdef WILD
+#extension GL_EXT_buffer_reference : require
+#endif
+layout(local_size_x = 1) in;
+layout(std430, binding = 1) buffer Out { uint v[8]; } o;
+#ifdef WILD
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Ptr { uint v; };
+layout(push_constant) uniform PC { int idx; int pad; Ptr ptr; } pc;
+#else
+layout(push_constant) uniform PC { int idx; } pc;
+#endif
+#if defined(UTB)
+layout(binding = 0) uniform utextureBuffer res;
+#elif defined(STB)
+layout(binding = 0, r32ui) uniform readonly uimageBuffer res;
+#elif defined(UBO)
+layout(std140, binding = 0) uniform U { uvec4 a[4096]; } res;
+#elif defined(SSBO)
+layout(std430, binding = 0) readonly buffer S { uint d[]; } res;
+#endif
+void main() {
+#if defined(UTB)
+    uint x = texelFetch(res, pc.idx).x;
+#elif defined(STB)
+    uint x = imageLoad(res, pc.idx).x;
+#elif defined(UBO)
+    uint x = res.a[pc.idx].x;
+#elif defined(SSBO)
+    uint x = res.d[pc.idx];
+#else
+    uint x = pc.ptr.v;
+#endif
+    o.v[0] = x;
+    o.v[1] = 0x600DF00Du;   // reached the end of the shader
+    o.v[2] = uint(pc.idx);  // push constant seen by the shader
+}

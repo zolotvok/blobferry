@@ -17,6 +17,11 @@ export CC="clang $T -Wl,--no-as-needed" CXX="clang++ $T -Wl,--no-as-needed"
 export AR=$NDK/llvm-ar RANLIB=$NDK/llvm-ranlib STRIP=$NDK/llvm-strip NM=$NDK/llvm-nm
 export CFLAGS="-O2 -D_FORTIFY_SOURCE=2 -Wno-error" CXXFLAGS="-O2 -D_FORTIFY_SOURCE=2 -Wno-error -Wno-non-pod-varargs"
 step=${1:-configure}
+# Our changes live in patches/libhybris; the submodule stays at the upstream commit. Apply what is not applied yet.
+for p in "$B"/patches/libhybris/*.patch; do
+  [ -e "$p" ] || continue
+  git -C "$SRC" apply --reverse --check "$p" 2>/dev/null || git -C "$SRC" apply "$p"
+done
 cd "$SRC"
 case $step in
   configure)

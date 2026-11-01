@@ -1,0 +1,67 @@
+diff --git a/wsi/swapchain_base.cpp b/wsi/swapchain_base.cpp
+index 8e8accd..3dbee05 100644
+--- a/wsi/swapchain_base.cpp
++++ b/wsi/swapchain_base.cpp
+@@ -44,6 +44,7 @@
+ #include <thread>
+ 
+ #include <unistd.h>
++#include <pthread.h>
+ #include <vulkan/vulkan.h>
+ 
+ #include "util/log.hpp"
+@@ -71,6 +72,14 @@ void swapchain_base::page_flip_thread()
+    VkResult vk_res = VK_SUCCESS;
+    constexpr uint64_t SEMAPHORE_TIMEOUT = 250000000; /* 250 ms. */
+ 
++   /* DroidDeck/Mali bridge [keeper, Claude Opus 5.5] 2026-11-01 K-AP1: with MALI_WSI_ASYNC_PRESENT set (0 or 1) the
++    * thread is named "mali-wsi-flip", so wait-caller and per-thread CPU logs tell its fence waits apart from the app
++    * thread it would otherwise inherit its name from (DXVK: dxvk-submit). */
++   if (std::getenv("MALI_WSI_ASYNC_PRESENT") != nullptr)
++   {
++      pthread_setname_np(pthread_self(), "mali-wsi-flip");
++   }
++
+    /* No mutex is needed for the accesses to m_page_flip_thread_run variable as after the variable is
+     * initialized it is only ever changed to false. The while loop will make the thread read the
+     * value repeatedly, and the combination of semaphores and thread joins will force any changes to
+diff --git a/wsi/wayland/swapchain.cpp b/wsi/wayland/swapchain.cpp
+index 906a135..8134613 100644
+--- a/wsi/wayland/swapchain.cpp
++++ b/wsi/wayland/swapchain.cpp
+@@ -233,6 +233,35 @@ VkResult swapchain::init_platform(VkDevice device, const VkSwapchainCreateInfoKH
+                              (m_present_mode != VK_PRESENT_MODE_FIFO_LATEST_READY_EXT) &&
+                              (m_present_mode != VK_PRESENT_MODE_MAILBOX_KHR);
+ 
++   /* DroidDeck/Mali bridge [keeper, Claude Opus 5.5] 2026-11-01 K-AP1: MALI_WSI_ASYNC_PRESENT=1 also uses the
++    * presentation thread for MAILBOX and FIFO_LATEST_READY when the compositor offers no explicit sync (gamescope).
++    * Upstream skips the thread for these modes because with explicit sync present_image() only attaches the acquire
++    * fence. Without it, present_image() waits on the CPU for the frame's GPU work (present fence) before
++    * wl_surface_commit, and that wait then runs on the app's vkQueuePresentKHR thread (DXVK's dxvk-submit): the next
++    * frame cannot be submitted until the GPU is idle, so only one frame is ever on the GPU (gpu-clock.md § 5.3/§ 6).
++    * With the thread, vkQueuePresentKHR returns after the fence submit; the thread does the same wait and commit in
++    * order. The queue is bounded by the swapchain images (acquire blocks when none is free). No frame callback is set
++    * for these modes, so the thread does not pace to vsync; the compositor still only gets finished frames.
++    * MALI_WSI_ASYNC_PRESENT set (0 or 1) also prints one line per swapchain with the mode and the decision. */
++   {
++      static const char *async_env = std::getenv("MALI_WSI_ASYNC_PRESENT");
++      const bool async_on = async_env != nullptr && async_env[0] != '\0' && async_env[0] != '0';
++      const bool explicit_sync = m_wsi_surface->get_surface_sync_interface() != nullptr;
++      const bool upstream_thread = use_presentation_thread;
++      if (async_on && !explicit_sync && !use_presentation_thread && !is_using_shared_present_mode())
++      {
++         use_presentation_thread = true;
++      }
++      if (async_env != nullptr)
++      {
++         fprintf(stderr,
++                 "mali-wsi: async present: swapchain present mode %d, explicit sync %s, presentation thread %s "
++                 "(upstream %s, MALI_WSI_ASYNC_PRESENT=%s)\n",
++                 static_cast<int>(m_present_mode), explicit_sync ? "yes" : "no", use_presentation_thread ? "on" : "off",
++                 upstream_thread ? "on" : "off", async_env);
++      }
++   }
++
+    auto present_wait = get_swapchain_extension<wsi_ext_present_wait_wayland>();
+    if (present_wait)
+    {
