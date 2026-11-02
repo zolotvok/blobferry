@@ -17,15 +17,36 @@ few lines per shader (4-15). `gen_spv.sh` regenerates the `*_spv.h` headers with
 
 ## Arm vulkan-wsi-layer (`third_party/vulkan-wsi-layer`, git submodule)
 
-Copyright (c) Arm Limited, MIT, from <https://gitlab.freedesktop.org/mesa/vulkan-wsi-layer>. The submodule stays
-at the upstream commit; Blobferry's changes are in `patches/vulkan-wsi-layer/` (a patch of an MIT-licensed project, so
-it stays MIT, like the layer; the patched layer is combined with GPL code only at run time, in separate libraries).
+Copyright (c) Arm Limited, MIT (`SPDX-License-Identifier: MIT` in the files and `LICENSE` in the submodule), from
+<https://gitlab.freedesktop.org/mesa/vulkan-wsi-layer>. The submodule stays at the upstream commit; Blobferry's changes
+are in `patches/vulkan-wsi-layer/`, each a patch of MIT-licensed files, so they stay MIT, like the layer (the patched
+layer is combined with GPL code only at run time, in separate libraries):
+
+- `0001-blobferry-wsi-changes.patch`: gamescope/Mali fixes; applied by `build-wsi.sh`. The `.k-wsi1-staged` copy is a
+  variant with bounded swapchain teardown, not applied.
+- `0002-blobferry-wsi-pace.patch.staged`: present-pacing log (`MALI_WSI_PACE`); adds `wsi/mali_pace.hpp` (tagged
+  `SPDX-License-Identifier: MIT`). Staged, not applied by the build.
+- `0003-blobferry-wsi-async-present.patch.staged`: `MALI_WSI_ASYNC_PRESENT`; changes upstream files only
+  (`swapchain_base.cpp`, `wayland/swapchain.cpp`). Staged, not applied by the build, untested.
 
 ## libhybris (`third_party/libhybris`, git submodule)
 
-The [wmww fork](https://github.com/wmww/libhybris), used unchanged. Mixed licenses (Apache-2.0, LGPL-2.1 and
-others, see the `LICENSE.*` files in the submodule). Binaries built from it must come with its source or a pointer to
-the exact commit.
+The [wmww fork](https://github.com/wmww/libhybris). The submodule stays at the fork's commit, but Blobferry builds it
+patched: `patches/libhybris/0001-hooks-race-free-lazy-init-of-static-bionic-locks.patch` changes
+`hybris/common/hooks.c` (race-free lazy initialisation of statically initialised bionic mutexes, condition variables
+and rwlocks). The patch is under the same license as the file it changes (`hooks.c` carries the Apache-2.0 header), and
+libhybris as a whole has mixed licenses (Apache-2.0, LGPL-2.1 and others, see the `LICENSE.*` files in the submodule).
+Binaries built from it must come with its source, including this patch, or a pointer to the exact commit and the patch.
+
+## Wine ntdll patch (`patches/wine/`)
+
+`0001-ntdll-skip-async-iosb-write-to-freed-memory.patch` is a source patch for Wine's `dlls/ntdll/unix` (`server.c`,
+`unix_private.h`, `virtual.c`): it skips the store of a deferred async I/O result into a status block whose memory is
+gone (seen with Watch Dogs 2). Wine is licensed under the GNU LGPL, version 2.1 or (at your option) any later version
+(`COPYING.LIB` in the Wine tree; Wine's files carry that notice), and the patch, a modification of those files, is
+offered under the same license (LGPL-2.1-or-later), not under the GPL of Blobferry's own code. Wine itself is not
+included here; the patch is for a Wine/Proton build made elsewhere. Written without a Wine source tree at hand and
+not built or tested yet.
 
 ## android-headers (`third_party/android-headers`, git submodule)
 

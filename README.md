@@ -134,12 +134,14 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 | `MALI_COMPAT_SPV_DONTUNROLL=1` | mark every loop DontUnroll (experiment against slow compiles) |
 | `MALI_COMPAT_NO_SUSPEND_RESUME=1` | turn vkd3d-proton's suspended/resumed render passes into plain passes (fixed HZD's blocky sky, needed by Control); installs the render-pass hooks itself, no `GPU_TIME` needed and no timing work without it |
 | `MALI_COMPAT_SUSRES_BARRIER=1` | with `NO_SUSPEND_RESUME` only: one memory barrier (attachment write → load/test/sample) before each converted resuming part, so the split parts are ordered as the spec requires (K-CS1, test for Control's shadow flicker; not deployed yet, build `bridge/build/stage-old+decouple+kcs1/`) |
+| `MALI_COMPAT_WLS_CLAMP=<hashes>\|all` | clamp every dynamic index into a Workgroup-storage array (DXVK's TGSM) with `UMin(index, length-1)` before the access chain; in-range indices are unchanged, an out-of-range one (undefined behaviour in D3D11/Vulkan) stays inside the array. On Mali, workgroup memory is ordinary GPU address space, so such an index walked into neighbouring memory and caused the vendor driver's GPU MMU translation faults. `all` or `1`: every shader module; else a comma list of hex hashes (FNV-1a of the SPIR-V as the app passed it, the `GPU_TIME` / `DUMP_HASH` hash). Prints `wls-clamp-1 active` once per device and one `wls-clamp: module <hash>` line per clamped module. **Watch Dogs 2:** `MALI_COMPAT_WLS_CLAMP=e0ff8b4d,46aad60b,653351e8,ae9a9376,92ae90c3,25785cbd` (the compute shaders that faulted); the protagonist's head is back (user report), ~40 FPS at the start falling to ~15, ~8 in firefights (user, no meter). **Watch Dogs:** `MALI_COMPAT_WLS_CLAMP=all` (with the current Ubisoft Connect in the prefix); starts and reaches gameplay, 23.7-31.9 FPS (mean 26.8) in the prologue over 60 s on the DXVK HUD; without it GPU translation faults from the first frame, flashing stale frames and a load hang |
 | `MALI_COMPAT_FORCE_COMP=1` | give attachments without STORAGE their compression back when vkd3d-proton asks for none (experiment) |
 | `MALI_COMPAT_DEPTH_NOCOMP=1` | create sampled depth/stencil images uncompressed (experiment) |
 | `MALI_COMPAT_FORCE_COHERENT=1` | allocations from the non-coherent cached host memory type go to the coherent one of the same heap (experiment) |
 | `MALI_COMPAT_FAKE_OCCLUSION=1` | every occlusion query reads as visible (experiment) |
 | `MALI_COMPAT_BUDGET_MB=<MiB>` | cap each heap's `VK_EXT_memory_budget` `heapBudget` at this size instead of 5 GiB (0 or unset = 5 GiB; logged once at init). Since K-CF2 heapUsage is the live per-heap usage (subtracted on free), see `docs/common_fixes.md` § "7.8 GB ceiling (cross-game)" |
 | `MALI_COMPAT_BUDGET_LOG_S=<s>` | interval of the budget log line `mali-compat: budget heap0 <used>/<budget> MiB (peak) ..., <n> allocs, <q> queries` (default 30 s); the line is printed only with `MALI_COMPAT_GPU_TIME=1` or `MALI_COMPAT_DEBUG` (K-CF2) |
+| `MALI_WSI_ASYNC_PRESENT=1` | **experimental, untested**: WSI layer only, from `patches/vulkan-wsi-layer/0003-*.patch.staged` (staged, `build-wsi.sh` does not apply it). Also uses the presentation thread for swapchains without explicit sync, so `vkQueuePresentKHR` returns after the fence submit instead of waiting for the frame's GPU work on the app's present thread; set (0 or 1) it prints one `mali-wsi: async present:` line per swapchain |
 
 **Session** (see [Session on the vendor driver](#session-on-the-vendor-driver)):
 
@@ -164,12 +166,15 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 | `MALI_COMPAT_GT_TRACE=<hash>` | with the profiler: log every pass that uses the shader with this hash (`all`: every pass and dispatch) |
 | `MALI_COMPAT_SKIP_HASH=<hash>` | with the profiler: drop the draws of pipelines with this shader (finds the draw that makes a pass slow) |
 | `MALI_COMPAT_DUMP_HASH=<hash>[,..]` | write shaders with these hashes to `/root/mali-spv-<hash>.spv` |
+| `MALI_COMPAT_DESC_CAPTURE=<cs hashes>` | debug only: for every dispatch of the compute pipelines with these shader hashes (hex, comma list, the `GPU_TIME` `cs:` hash), write the resolved set-0 bindings (buffer device address, view range/format, buffer size, memory) and the object lifetimes (destroy/free/reset, submit, fence wait) as TSV rows to `MALI_COMPAT_DESC_CAPTURE_FILE` (default `/root/mali-desc-<pid>.tsv`), capped at `MALI_COMPAT_DESC_CAPTURE_MB` (default 512); counters every 10 s on stderr. Costs time and disk, off by default |
 
 ## Repository layout
 
 - `src/icd/`: ICD shim
 - `src/compat/`: compat layer; `bc/` holds the BC decode shaders and their generated SPIR-V headers
-- `patches/vulkan-wsi-layer/`: changes to the Arm WSI layer
+- `patches/vulkan-wsi-layer/`: changes to the Arm WSI layer (`*.patch` are applied by `build-wsi.sh`, `*.staged` are held back)
+- `patches/libhybris/`: change to libhybris (race-free lazy init of static bionic locks), see [NOTICE.md](NOTICE.md)
+- `patches/wine/`: a source patch for Wine's ntdll (async I/O status block written after its memory was freed, seen with Watch Dogs 2); written without a Wine tree at hand, not built or tested, not applied by anything here
 - `test/`: small Vulkan probes (incl. `rt-comp-probe.c` for render-target compression, `xfb-probe.c` for stream
   output, `session-probe.c` and `export-probe.c` for the session) and SPIR-V patch tests (`spirv-patch-check.sh`,
   `fragdepth-host.c`, `xfb-vs-host.c`)
