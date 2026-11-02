@@ -29,7 +29,16 @@ export PKG_CONFIG_SYSROOT_DIR="$SR"
 FLAGS="--target=aarch64-linux-gnu --sysroot=$SR --gcc-install-dir=$GCCDIR -Wno-error=unused-command-line-argument"
 LINK_FLAGS="--target=aarch64-linux-gnu --sysroot=$SR --gcc-install-dir=$GCCDIR --ld-path=$NDK/ld.lld -Wl,-rpath,/usr/lib/aarch64-linux-gnu:/usr/local/lib -Wl,-z,nodelete"
 
+# Build type: an empty CMAKE_BUILD_TYPE gives NO -O flag at all (-O0 code in the per-frame acquire/present path).
+# Release = optimised; but CMake's Release default is "-O3 -DNDEBUG", and NDEBUG would (a) drop every assert() and
+# (b) compile out WSI_LOG_* (util/log.hpp: wsi_log_enable = false), including our own K-WSI1 hang diagnostics in
+# patch 0001 ("mali-wsi: present fence of image N not signalled ..."). RelWithDebInfo has NDEBUG as well and also adds
+# util/debug.cpp, i.e. one more exported symbol. So Release with the flags set to plain -O2: same asserts, same logs,
+# same exported symbols as the old -O0 build; only the optimisation level changes. [keeper, Claude Sonnet 5.5] 2026-11-02
 cmake -S "$SRC" -B "$BUILDDIR" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_FLAGS_RELEASE="-O2" \
+  -DCMAKE_CXX_FLAGS_RELEASE="-O2" \
   -DCMAKE_SYSTEM_NAME=Linux \
   -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
   -DCMAKE_C_COMPILER=clang \
