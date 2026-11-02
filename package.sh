@@ -27,7 +27,8 @@ rm -f "$OUT/rootfs/usr/lib/hybris/"*.la
 (cd "$S/usr/lib/mali_bridge" && zip -q -j "$OUT/Mali_Bridge.zip" libvulkan_mali_bridge.so meta.json)
 cp "$B/LICENSE" "$B/NOTICE.md" "$OUT/"
 cp "$B"/third_party/libhybris/LICENSE.* "$OUT/licenses/libhybris/"
-echo "libhybris source: https://github.com/wmww/libhybris commit $(git -C "$B/third_party/libhybris" rev-parse HEAD)" > "$OUT/licenses/libhybris/SOURCE.txt"
+cp "$B"/patches/libhybris/*.patch "$OUT/licenses/libhybris/"
+echo "libhybris source: https://github.com/wmww/libhybris commit $(git -C "$B/third_party/libhybris" rev-parse HEAD), plus the patches in this folder (applied by build-libhybris.sh); full build source: https://github.com/zolotvok/blobferry commit $(git -C "$B" rev-parse HEAD)" > "$OUT/licenses/libhybris/SOURCE.txt"
 
 cat > "$OUT/install-adb.sh" <<'EOF'
 #!/usr/bin/env bash

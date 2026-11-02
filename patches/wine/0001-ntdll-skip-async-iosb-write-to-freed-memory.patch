@@ -35,6 +35,7 @@ prototype, one function in virtual.c next to
 virtual_uninterrupted_write_memory(). Use host_page_mask/page_mask,
 whichever the tree has.
 
+SPDX-License-Identifier: LGPL-2.1-or-later
 Assisted-by: Claude Opus 5.5 (keeper agent)
 ---
  dlls/ntdll/unix/server.c       |  2 +-
