@@ -48,6 +48,18 @@ offered under the same license (LGPL-2.1-or-later), not under the GPL of Blobfer
 included here; the patch is for a Wine/Proton build made elsewhere. Written without a Wine source tree at hand and
 not built or tested yet.
 
+## FEX patch (`patches/fex/`)
+
+`0001-arm64ec-recompile-blocks-that-keep-trapping-on-unaligned-atomics.patch` is a source patch for
+[FEX](https://github.com/FEX-Emu/FEX) at commit 1c4f04b71a4d (FEX-2610-101-g1c4f04b, the arm64ec FEX in Proton
+Experimental (ARM64)); it changes FEXCore's JIT, dispatcher and context and the ARM64EC frontend so that JIT blocks that
+keep trapping on unaligned atomics are recompiled with an out-of-line fallback. FEX is licensed under the MIT license,
+Copyright (c) 2019 Ryan Houdek and the FEX contributors (`patches/fex/LICENSE`, a copy of FEX's `LICENSE`; FEX's files
+carry `SPDX-License-Identifier: MIT`), and the patch, a modification of those files, is offered under the same MIT
+license, not under the GPL of Blobferry's own code. FEX itself is not included here; a `libarm64ecfex.dll` built from
+FEX with this patch must keep FEX's copyright and license notice. Not for upstream submission (FEX does not accept
+AI-generated code, see FEX's `AGENTS.md`).
+
 ## android-headers (`third_party/android-headers`, git submodule)
 
 From [Halium](https://github.com/Halium/android-headers): AOSP headers, mostly Apache-2.0 (see each file's header),

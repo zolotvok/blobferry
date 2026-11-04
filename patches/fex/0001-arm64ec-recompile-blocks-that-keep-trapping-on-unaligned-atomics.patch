@@ -1,0 +1,819 @@
+From 5648a1439181d9163a0ddd92622391ff63c4b57f Mon Sep 17 00:00:00 2001
+From: zolotvok <zolotvok@gmail.com>
+Date: Wed, 4 Nov 2026 08:06:22 +0100
+Subject: [PATCH] arm64ec: recompile blocks that keep trapping on unaligned
+ atomics
+
+On hosts without PR_ARM64_SET_UNALIGN_ATOMIC (stock 6.12 kernels), a guest
+lock-prefixed op whose access crosses a 16-byte boundary makes the JIT's LSE
+atomic (CASAL, CASPAL, LD<op>AL, SWPAL) raise an alignment fault.
+HandleUnalignedAccess emulates these on every trap and never backpatches
+them, so a hot loop pays a full exception round trip per access (under proot
+on Android: a ptrace stop, about 50 us). Watch Dogs 2 took 5.44 M such traps
+in one launch.
+
+This extends the existing per-block recompile mechanism (as used for the mono
+backpatcher block) instead of patching code in place:
+
+- The ARM64EC exception handler counts handled JIT traps of the emulated
+  atomic RMW class (IsEmulatedAtomicRMW) per guest block entry. At 16 traps it
+  marks the entry (Context::MarkUnalignedAtomicBlock, under the unique code
+  invalidation lock) and invalidates the page, like the mono detection does.
+- CompileCode sets CPUBackend::UnalignedAtomicFallback for a marked entry.
+  The JIT then emits each LSE atomic op as a flag-free 16-byte-crossing check
+  (and/add/tbnz on TMP1) in front of two copies of the op: the unchanged fast
+  copy, and a slow copy in which the atomic instruction is replaced by a call
+  to the new dispatcher stub UnalignedAtomicStub, with the original
+  instruction word left in place as data.
+- The stub saves x0-x30, sp, NZCV and all vector registers (SVE256-aware via
+  PushVectorRegisters), issues dmb ish, calls
+  ContextImpl::UnalignedAtomicFallback, which runs
+  HandleUnalignedAccess(IsJIT = false) on that exact instruction word, issues
+  dmb ish, restores everything except the registers the instruction writes,
+  and returns past the word.
+
+Semantics: the slow path runs the same emulation code as the trap path
+(HandleCASPAL/HandleCASAL/HandleAtomicMemOp with the same
+StrictInProcessSplitLocks mutex), so atomicity is exactly what the stock trap
+path gives: a single 128-bit CAS inside a 16-byte granule, the dual-CAS loop
+across granules (serialised by the split-lock mutex when
+StrictInProcessSplitLocks is set). Threads still running the old copy of a
+block keep trapping into the same emulation, so both paths stay consistent.
+Blocks that never reach the threshold are compiled exactly as before
+(InstructionCountCI: 108/108 suites unchanged). Marked blocks bypass the disk
+cache. FEX_UNALIGNED_ATOMIC_FALLBACK=0 disables the recompile,
+FEX_UNALIGNED_ATOMIC_STATS=1 prints trap/recompile counts through
+__wine_dbg_output even with FEX_SILENTLOG.
+
+Also fixes the non-arm64 HandleUnalignedAccess stub signature so x86 CI
+builds (InstructionCountCI) link.
+
+Local Blobferry/DroidDeck patch, not for upstream submission (FEX does not
+accept AI-generated code, see AGENTS.md).
+
+SPDX-License-Identifier: MIT
+Written with AI coding agents, directed and tested by zolotvok: Claude Opus 5.5, Claude Sonnet 5.5, Gemini 3.8 Flash, Gemini 4 Argon (reviews)
+---
+ FEXCore/Source/Interface/Context/Context.h    |  13 ++
+ FEXCore/Source/Interface/Core/CPUBackend.h    |   4 +
+ FEXCore/Source/Interface/Core/Core.cpp        |  31 ++++-
+ .../Interface/Core/Dispatcher/Dispatcher.cpp  |  96 +++++++++++++
+ .../Interface/Core/Dispatcher/Dispatcher.h    |   1 +
+ .../Source/Interface/Core/JIT/AtomicOps.cpp   | 128 ++++++++++--------
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     |   1 +
+ FEXCore/Source/Interface/Core/JIT/JITClass.h  |  47 +++++++
+ FEXCore/Source/Utils/ArchHelpers/Arm64.cpp    |  13 ++
+ .../Source/Utils/ArchHelpers/Arm64_stubs.cpp  |   8 +-
+ FEXCore/include/FEXCore/Core/Context.h        |  12 ++
+ FEXCore/include/FEXCore/Core/CoreState.h      |   5 +
+ .../include/FEXCore/Utils/ArchHelpers/Arm64.h |  10 ++
+ Source/Windows/ARM64EC/Module.cpp             |  83 ++++++++++++
+ 14 files changed, 396 insertions(+), 56 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 9b91055bd..02198afd3 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -248,6 +248,12 @@ public:
+   }
+ 
+   void MarkMonoBackpatcherBlock(uint64_t BlockEntry) override;
++
++  void MarkUnalignedAtomicBlock(uint64_t BlockEntry) override;
++  // Must be called with CodeInvalidationMutex held (shared is enough).
++  bool IsUnalignedAtomicBlock(uint64_t BlockEntry) const {
++    return HasUnalignedAtomicBlocks.load(std::memory_order_relaxed) && UnalignedAtomicBlocks.contains(BlockEntry);
++  }
+   std::atomic<uint64_t>& GetMonoBackPatcherBlock() {
+     return MonoBackpatcherBlock;
+   }
+@@ -404,6 +410,8 @@ public:
+   // (safe as the invalidation mutex is locked) and manually invalidates the modified range. Allowing SMC to be detected
+   // even if faulting is disabled.
+   static void MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value);
++  // Called from the dispatcher's UnalignedAtomicStub with the saved host GPRs and the address of the atomic instruction word.
++  static void UnalignedAtomicFallback(uint64_t* GPRs, uint64_t InstructionAddress, FEXCore::Core::CpuStateFrame* Frame);
+ 
+   void RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint);
+ 
+@@ -516,6 +524,11 @@ private:
+   bool MonoDetected = false;
+   std::atomic<uint64_t> MonoBackpatcherBlock;
+ 
++  // Guest block entries compiled with the out-of-line unaligned atomic fallback.
++  // Written with CodeInvalidationMutex held uniquely, read with it held shared.
++  fextl::set<uint64_t> UnalignedAtomicBlocks;
++  std::atomic<bool> HasUnalignedAtomicBlocks {};
++
+   std::mutex CodeBufferListLock;
+   fextl::vector<std::weak_ptr<CPU::CodeBuffer>> CodeBufferList;
+ };
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
+index 0183694cd..62e28ed73 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.h
++++ b/FEXCore/Source/Interface/Core/CPUBackend.h
+@@ -138,6 +138,10 @@ namespace CPU {
+     [[nodiscard]]
+     fextl::shared_ptr<CodeBuffer> CheckCodeBufferUpdate();
+ 
++    // Set by ContextImpl::CompileCode for the duration of one compile: emit atomic RMW instructions with an alignment
++    // check and an out-of-line call to the unaligned atomic emulation for accesses that cross a 16-byte boundary.
++    bool UnalignedAtomicFallback {};
++
+   protected:
+     // Max spill slot size in bytes. We need at most 32 bytes
+     // to be able to handle a 256-bit vector store to a slot.
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 63280a42a..e07a7da1b 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -44,6 +44,7 @@ $end_info$
+ #include <FEXCore/HLE/SyscallHandler.h>
+ #include <FEXCore/HLE/SourcecodeResolver.h>
+ #include <FEXCore/Utils/Allocator.h>
++#include <FEXCore/Utils/ArchHelpers/Arm64.h>
+ #include <FEXCore/Utils/Event.h>
+ #include <FEXCore/Utils/File.h>
+ #include <FEXCore/Utils/LogManager.h>
+@@ -832,7 +833,15 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
+   // If the trap flag is set we generate single instruction blocks that each check to generate a single step exception.
+   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
+ 
++  // Blocks that kept trapping on unaligned atomics get the out-of-line fallback (see MarkUnalignedAtomicBlock).
++  // The caller holds CodeInvalidationMutex shared, which protects UnalignedAtomicBlocks.
++  Thread->CPUBackend->UnalignedAtomicFallback = IsUnalignedAtomicBlock(GuestRIP);
++#ifdef FEX_TEST_FORCE_UNALIGNED_ATOMIC_FALLBACK
++  // Test builds only (InstructionCountCI codegen inspection): every block gets the fallback.
++  Thread->CPUBackend->UnalignedAtomicFallback = true;
++#endif
+   auto CompiledCode = Thread->CPUBackend->CompileCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
++  Thread->CPUBackend->UnalignedAtomicFallback = false;
+ 
+   // Release the IR
+   Thread->OpDispatcher->DelayedDisownBuffer();
+@@ -882,7 +891,10 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   std::optional<uint64_t> DiskCacheGuestCodeKey;
+   {
+     FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheLookupTime);
+-    Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
++    // A cached copy would be the code without the unaligned atomic fallback, so such blocks bypass the disk cache.
++    if (!IsUnalignedAtomicBlock(GuestRIP)) {
++      Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
++    }
+     if (Hit && !DiskCache.IsValidating()) {
+       auto LoadedCode = Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
+       if (LoadedCode.BlockBegin) {
+@@ -1158,6 +1170,23 @@ void ContextImpl::MarkMonoBackpatcherBlock(uint64_t BlockEntry) {
+   MonoBackpatcherBlock.store(BlockEntry, std::memory_order_relaxed);
+ }
+ 
++void ContextImpl::MarkUnalignedAtomicBlock(uint64_t BlockEntry) {
++  LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++  UnalignedAtomicBlocks.insert(BlockEntry);
++  HasUnalignedAtomicBlocks.store(true, std::memory_order_relaxed);
++}
++
++void ContextImpl::UnalignedAtomicFallback(uint64_t* GPRs, uint64_t InstructionAddress, FEXCore::Core::CpuStateFrame* Frame) {
++  // The word at InstructionAddress is the atomic instruction that the JIT would otherwise have executed (and trapped on).
++  // Emulate it with exactly the code the SIGBUS handler runs for it, including the StrictInProcessSplitLocks mutex.
++  // IsJIT = false selects the decode-and-emulate path, which never backpatches.
++  const auto Result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
++    Frame->Thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::NonAtomic, InstructionAddress, GPRs, false);
++  if (!Result.has_value()) [[unlikely]] {
++    ERROR_AND_DIE_FMT("Unaligned atomic fallback: unhandled instruction 0x{:08x}", *reinterpret_cast<const uint32_t*>(InstructionAddress));
++  }
++}
++
+ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* Thread, uintptr_t Entrypoint) {
+   LOGMAN_THROW_A_FMT(Config.Is64BitMode || !(Entrypoint >> 32), "64-bit Entrypoint in 32-bit mode {:x}", Entrypoint);
+ 
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 5637b8cef..d7dd1278a 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -607,6 +607,101 @@ void Dispatcher::EmitDispatcher() {
+     (void)b(&LoopTop);
+   }
+ 
++  {
++    // Unaligned atomic fallback stub, used by blocks compiled with CPUBackend::UnalignedAtomicFallback.
++    //
++    // JIT call site (see Arm64JITCore::EmitAtomicInst):
++    //   str x30, [sp, #-16]!
++    //   ldr x30, [STATE, Pointers.UnalignedAtomicStub]
++    //   blr x30
++    //   <atomic instruction word, never executed>
++    //   ldr x30, [sp], #16
++    //
++    // On entry x30 points at the atomic instruction word and [sp] holds the call site's x30.
++    // Every GPR, NZCV and every vector register is preserved, except for the registers the emulated instruction writes,
++    // which are updated in the saved GPR array by ContextImpl::UnalignedAtomicFallback.
++    UnalignedAtomicStubAddress = GetCursorAddress<uint64_t>();
++
++    // GPR array layout, indexed like a host context: [0..30] = x0-x30, [31] = sp, [32] = NZCV, [33] = instruction address.
++    constexpr uint32_t GPRFrameSize = 34 * 8; // 272, keeps sp 16-byte aligned.
++    constexpr uint32_t SlotSP = 31 * 8;
++    constexpr uint32_t SlotNZCV = 32 * 8;
++    constexpr uint32_t SlotInst = 33 * 8;
++    const bool SVE256Regs = EmitterCTX->HostFeatures.SupportsSVE256;
++    const uint32_t VectorFrameSize = 32 * (SVE256Regs ? 32 : 16);
++
++    static constexpr std::array<ARMEmitter::VRegister, 32> AllVectorRegisters {
++      ARMEmitter::VReg::v0,  ARMEmitter::VReg::v1,  ARMEmitter::VReg::v2,  ARMEmitter::VReg::v3,  ARMEmitter::VReg::v4,
++      ARMEmitter::VReg::v5,  ARMEmitter::VReg::v6,  ARMEmitter::VReg::v7,  ARMEmitter::VReg::v8,  ARMEmitter::VReg::v9,
++      ARMEmitter::VReg::v10, ARMEmitter::VReg::v11, ARMEmitter::VReg::v12, ARMEmitter::VReg::v13, ARMEmitter::VReg::v14,
++      ARMEmitter::VReg::v15, ARMEmitter::VReg::v16, ARMEmitter::VReg::v17, ARMEmitter::VReg::v18, ARMEmitter::VReg::v19,
++      ARMEmitter::VReg::v20, ARMEmitter::VReg::v21, ARMEmitter::VReg::v22, ARMEmitter::VReg::v23, ARMEmitter::VReg::v24,
++      ARMEmitter::VReg::v25, ARMEmitter::VReg::v26, ARMEmitter::VReg::v27, ARMEmitter::VReg::v28, ARMEmitter::VReg::v29,
++      ARMEmitter::VReg::v30, ARMEmitter::VReg::v31,
++    };
++
++    sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, GPRFrameSize);
++    for (uint32_t i = 0; i < 30; i += 2) {
++      stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XRegister(i), ARMEmitter::XRegister(i + 1), ARMEmitter::Reg::rsp, i * 8);
++    }
++    // x30 as it was at the call site.
++    ldr(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, GPRFrameSize);
++    str(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, 30 * 8);
++    // sp as it was at the call site.
++    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, ARMEmitter::Reg::rsp, GPRFrameSize + 16);
++    str(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, SlotSP);
++    mrs(ARMEmitter::XReg::x0, ARMEmitter::SystemRegister::NZCV);
++    str(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, SlotNZCV);
++    str(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, SlotInst);
++
++    sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, VectorFrameSize);
++    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, ARMEmitter::Reg::rsp, 0);
++    PushVectorRegisters(ARMEmitter::Reg::r1, SVE256Regs, AllVectorRegisters);
++
++    // A guest lock-prefixed instruction is a full barrier.
++    dmb(ARMEmitter::BarrierScope::ISH);
++
++#ifdef ARCHITECTURE_arm64ec
++    // Same as MonoBackpatcherWrite: the emulation may take the split-lock mutex, mark this as a callback.
++    ldr(ARMEmitter::XReg::x2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
++    LoadConstant(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r3, 1);
++    strb(ARMEmitter::WReg::w3, ARMEmitter::Reg::r2, CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET);
++#endif
++
++    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, ARMEmitter::Reg::rsp, VectorFrameSize);
++    ldr(ARMEmitter::XReg::x1, ARMEmitter::Reg::r0, SlotInst);
++    mov(ARMEmitter::XReg::x2, STATE);
++    ldr(ARMEmitter::XReg::x3, STATE_PTR(CpuStateFrame, Pointers.UnalignedAtomicFallback));
++    if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
++      GenerateIndirectRuntimeCall<void, uint64_t*, uint64_t, void*>(ARMEmitter::Reg::r3);
++    } else {
++      blr(ARMEmitter::Reg::r3);
++    }
++
++#ifdef ARCHITECTURE_arm64ec
++    ldr(ARMEmitter::XReg::x2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
++    strb(ARMEmitter::WReg::zr, ARMEmitter::Reg::r2, CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET);
++#endif
++
++    dmb(ARMEmitter::BarrierScope::ISH);
++
++    PopVectorRegisters(SVE256Regs, AllVectorRegisters);
++
++    ldr(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, SlotNZCV);
++    msr(ARMEmitter::SystemRegister::NZCV, ARMEmitter::XReg::x0);
++    // x30 (possibly written by the emulated instruction) goes back to the call site's slot, which the call site reloads.
++    ldr(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, 30 * 8);
++    str(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, GPRFrameSize);
++    // Return past the instruction word.
++    ldr(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, SlotInst);
++    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r30, ARMEmitter::Reg::r30, 4);
++    for (uint32_t i = 0; i < 30; i += 2) {
++      ldp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XRegister(i), ARMEmitter::XRegister(i + 1), ARMEmitter::Reg::rsp, i * 8);
++    }
++    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, GPRFrameSize);
++    ret();
++  }
++
+   EmitF64Sin();
+   EmitF64Cos();
+   EmitF64Tan();
+@@ -2700,6 +2795,7 @@ void Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thread)
+     Ptrs.F64FYL2XP1Handler = F64FYL2XP1HandlerAddress;
+     Ptrs.F64FPREMHandler = F64FPREMHandlerAddress;
+     Ptrs.F64FPREM1Handler = F64FPREM1HandlerAddress;
++    Ptrs.UnalignedAtomicStub = UnalignedAtomicStubAddress;
+ 
+     // Fill in the fallback handlers
+     InterpreterOps::FillFallbackIndexPointers(Ptrs.FallbackHandlerPointers, &ABIPointers[0]);
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
+index 6f460fc42..dd083713e 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
+@@ -109,6 +109,7 @@ private:
+   uint64_t F64FYL2XP1HandlerAddress {};
+   uint64_t F64FPREMHandlerAddress {};
+   uint64_t F64FPREM1HandlerAddress {};
++  uint64_t UnalignedAtomicStubAddress {};
+ 
+   void EmitDispatcher();
+   uint64_t GenerateABICall(FallbackABI ABI);
+diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+index 014a8c690..e05e2b8b0 100644
+--- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+@@ -24,33 +24,37 @@ DEF_OP(CASPair) {
+ 
+   const auto EmitSize = IROp->ElementSize == IR::OpSize::i64Bit ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    // RA has heuristics to try to pair sources, but we need to handle the cases
+-    // where they fail. We do so by moving to temporaries. Note we use 64-bit
+-    // moves here even for 32-bit cmpxchg, for the Firestorm register renamer.
+-    if (Desired1.Idx() != (Desired0.Idx() + 1) || Desired0.Idx() & 1) {
+-      mov(ARMEmitter::Size::i64Bit, TMP1, Desired0);
+-      mov(ARMEmitter::Size::i64Bit, TMP2, Desired1);
+-      Desired0 = TMP1;
+-      Desired1 = TMP2;
+-    }
+-
+-    auto CaspalDst0 = Dst0;
+-    auto CaspalDst1 = Dst1;
+-    if (CaspalDst1.Idx() != (CaspalDst0.Idx() + 1) || CaspalDst0.Idx() & 1) {
+-      CaspalDst0 = TMP3;
+-      CaspalDst1 = TMP4;
+-    }
+-
+-    // We can't clobber the source, these moves are inherently required due to
+-    // ISA limitations. But by making them 64-bit, Firestorm can rename.
+-    mov(ARMEmitter::Size::i64Bit, CaspalDst0, Expected0);
+-    mov(ARMEmitter::Size::i64Bit, CaspalDst1, Expected1);
+-    caspal(EmitSize, CaspalDst0, CaspalDst1, Desired0, Desired1, MemSrc);
+-
+-    if (CaspalDst0 != Dst0) {
+-      mov(ARMEmitter::Size::i64Bit, Dst0, CaspalDst0);
+-      mov(ARMEmitter::Size::i64Bit, Dst1, CaspalDst1);
+-    }
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(IROp->ElementSize) * 2, [&] {
++      auto PairDesired0 = Desired0;
++      auto PairDesired1 = Desired1;
++      // RA has heuristics to try to pair sources, but we need to handle the cases
++      // where they fail. We do so by moving to temporaries. Note we use 64-bit
++      // moves here even for 32-bit cmpxchg, for the Firestorm register renamer.
++      if (PairDesired1.Idx() != (PairDesired0.Idx() + 1) || PairDesired0.Idx() & 1) {
++        mov(ARMEmitter::Size::i64Bit, TMP1, PairDesired0);
++        mov(ARMEmitter::Size::i64Bit, TMP2, PairDesired1);
++        PairDesired0 = TMP1;
++        PairDesired1 = TMP2;
++      }
++
++      auto CaspalDst0 = Dst0;
++      auto CaspalDst1 = Dst1;
++      if (CaspalDst1.Idx() != (CaspalDst0.Idx() + 1) || CaspalDst0.Idx() & 1) {
++        CaspalDst0 = TMP3;
++        CaspalDst1 = TMP4;
++      }
++
++      // We can't clobber the source, these moves are inherently required due to
++      // ISA limitations. But by making them 64-bit, Firestorm can rename.
++      mov(ARMEmitter::Size::i64Bit, CaspalDst0, Expected0);
++      mov(ARMEmitter::Size::i64Bit, CaspalDst1, Expected1);
++      EmitAtomicInst([&] { caspal(EmitSize, CaspalDst0, CaspalDst1, PairDesired0, PairDesired1, MemSrc); });
++
++      if (CaspalDst0 != Dst0) {
++        mov(ARMEmitter::Size::i64Bit, Dst0, CaspalDst0);
++        mov(ARMEmitter::Size::i64Bit, Dst1, CaspalDst1);
++      }
++    });
+   } else {
+     // Save NZCV so we don't have to mark this op as clobbering NZCV (the
+     // SupportsAtomics does not clobber atomics and this !SupportsAtomics path
+@@ -103,13 +107,15 @@ DEF_OP(CAS) {
+   auto Dst = GetReg(Node);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    if (Expected == Dst && Dst != MemSrc && Dst != Desired) {
+-      casal(SubEmitSize, Dst, Desired, MemSrc);
+-    } else {
+-      mov(EmitSize, TMP2, Expected);
+-      casal(SubEmitSize, TMP2, Desired, MemSrc);
+-      mov(EmitSize, Dst, TMP2.R());
+-    }
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(IROp->Size), [&] {
++      if (Expected == Dst && Dst != MemSrc && Dst != Desired) {
++        EmitAtomicInst([&] { casal(SubEmitSize, Dst, Desired, MemSrc); });
++      } else {
++        mov(EmitSize, TMP2, Expected);
++        EmitAtomicInst([&] { casal(SubEmitSize, TMP2, Desired, MemSrc); });
++        mov(EmitSize, Dst, TMP2.R());
++      }
++    });
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     ARMEmitter::ForwardLabel LoopNotExpected;
+@@ -156,7 +162,9 @@ DEF_OP(AtomicSwap) {
+                                                           ARMEmitter::SubRegSize::i8Bit;
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldswpal(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(OpSize), [&] {
++      EmitAtomicInst([&] { ldswpal(SubEmitSize, Src, GetReg(Node), MemSrc); });
++    });
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -176,7 +184,9 @@ DEF_OP(AtomicFetchAdd) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldaddal(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(IROp->Size), [&] {
++      EmitAtomicInst([&] { ldaddal(SubEmitSize, Src, GetReg(Node), MemSrc); });
++    });
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -197,8 +207,10 @@ DEF_OP(AtomicFetchSub) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    neg(EmitSize, TMP2, Src);
+-    ldaddal(SubEmitSize, TMP2, GetReg(Node), MemSrc);
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(IROp->Size), [&] {
++      neg(EmitSize, TMP2, Src);
++      EmitAtomicInst([&] { ldaddal(SubEmitSize, TMP2, GetReg(Node), MemSrc); });
++    });
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -219,8 +231,10 @@ DEF_OP(AtomicFetchAnd) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    mvn(EmitSize, TMP2, Src);
+-    ldclral(SubEmitSize, TMP2, GetReg(Node), MemSrc);
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(IROp->Size), [&] {
++      mvn(EmitSize, TMP2, Src);
++      EmitAtomicInst([&] { ldclral(SubEmitSize, TMP2, GetReg(Node), MemSrc); });
++    });
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -241,7 +255,9 @@ DEF_OP(AtomicFetchCLR) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldclral(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(IROp->Size), [&] {
++      EmitAtomicInst([&] { ldclral(SubEmitSize, Src, GetReg(Node), MemSrc); });
++    });
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -262,7 +278,9 @@ DEF_OP(AtomicFetchOr) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldsetal(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(IROp->Size), [&] {
++      EmitAtomicInst([&] { ldsetal(SubEmitSize, Src, GetReg(Node), MemSrc); });
++    });
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -283,7 +301,9 @@ DEF_OP(AtomicFetchXor) {
+   auto Src = GetReg(Op->Value);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    ldeoral(SubEmitSize, Src, GetReg(Node), MemSrc);
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(IROp->Size), [&] {
++      EmitAtomicInst([&] { ldeoral(SubEmitSize, Src, GetReg(Node), MemSrc); });
++    });
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+@@ -303,16 +323,18 @@ DEF_OP(AtomicFetchNeg) {
+   auto MemSrc = GetReg(Op->Addr);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
+-    // Use a CAS loop to avoid needing to emulate unaligned LLSC atomics
+-    ldr(SubEmitSize, TMP2, MemSrc);
+-    ARMEmitter::BackwardLabel LoopTop;
+-    (void)Bind(&LoopTop);
+-    mov(EmitSize, TMP4, TMP2);
+-    neg(EmitSize, TMP3, TMP2);
+-    casal(SubEmitSize, TMP2, TMP3, MemSrc);
+-    sub(EmitSize, TMP3, TMP2, TMP4);
+-    (void)cbnz(EmitSize, TMP3, &LoopTop);
+-    mov(EmitSize, GetReg(Node), TMP2.R());
++    EmitWithUnalignedAtomicFallback(MemSrc, IR::OpSizeToSize(IROp->Size), [&] {
++      // Use a CAS loop to avoid needing to emulate unaligned LLSC atomics
++      ldr(SubEmitSize, TMP2, MemSrc);
++      ARMEmitter::BackwardLabel LoopTop;
++      (void)Bind(&LoopTop);
++      mov(EmitSize, TMP4, TMP2);
++      neg(EmitSize, TMP3, TMP2);
++      EmitAtomicInst([&] { casal(SubEmitSize, TMP2, TMP3, MemSrc); });
++      sub(EmitSize, TMP3, TMP2, TMP4);
++      (void)cbnz(EmitSize, TMP3, &LoopTop);
++      mov(EmitSize, GetReg(Node), TMP2.R());
++    });
+   } else {
+     ARMEmitter::BackwardLabel LoopTop;
+     (void)Bind(&LoopTop);
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 2a7e575d0..b4b48cac3 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -653,6 +653,7 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
+ 
+     Ptrs.ThreadRemoveCodeEntryFromJIT = reinterpret_cast<uintptr_t>(&Context::ContextImpl::ThreadRemoveCodeEntryFromJit);
+     Ptrs.MonoBackpatcherWrite = reinterpret_cast<uint64_t>(&Context::ContextImpl::MonoBackpatcherWrite);
++    Ptrs.UnalignedAtomicFallback = reinterpret_cast<uint64_t>(&Context::ContextImpl::UnalignedAtomicFallback);
+     Ptrs.CPUIDObj = reinterpret_cast<uint64_t>(&CTX->CPUID);
+ 
+     {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index d0b4c5ca6..af2e3af96 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -114,6 +114,53 @@ private:
+ 
+   static uint64_t ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record);
+ 
++  // Unaligned atomic fallback (CPUBackend::UnalignedAtomicFallback).
++  // An LSE atomic only faults when its access crosses a 16-byte boundary (FEAT_LSE2), so the check below sends only
++  // those accesses to the slow copy of the op. The slow copy is the same instruction sequence, with the atomic
++  // instruction replaced by a call to the dispatcher's UnalignedAtomicStub, which emulates that exact instruction word
++  // with the SIGBUS handler's code. Aligned accesses run the unchanged fast copy.
++  bool InUnalignedAtomicSlowPath {};
++
++  // Only for the LSE (HostFeatures.SupportsAtomics) code paths: LL/SC sequences are handled differently by the SIGBUS handler.
++  template<typename F>
++  void EmitWithUnalignedAtomicFallback(ARMEmitter::Register Addr, uint32_t AccessBytes, F&& Body) {
++    if (!UnalignedAtomicFallback || AccessBytes <= 1) {
++      Body();
++      return;
++    }
++
++    ARMEmitter::ForwardLabel SlowPath;
++    ARMEmitter::ForwardLabel Done;
++
++    // Flag-free: crosses 16 bytes iff ((Addr & 15) + AccessBytes - 1) >= 16. TMP1 is free at the start of every atomic op.
++    and_(ARMEmitter::Size::i64Bit, TMP1, Addr, 0xF);
++    add(ARMEmitter::Size::i64Bit, TMP1, TMP1, AccessBytes - 1);
++    (void)tbnz(TMP1, 4, &SlowPath);
++    Body();
++    (void)b(&Done);
++
++    (void)Bind(&SlowPath);
++    InUnalignedAtomicSlowPath = true;
++    Body();
++    InUnalignedAtomicSlowPath = false;
++    (void)Bind(&Done);
++  }
++
++  template<typename F>
++  void EmitAtomicInst(F&& Inst) {
++    if (!InUnalignedAtomicSlowPath) {
++      Inst();
++      return;
++    }
++
++    str<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, -16);
++    ldr(ARMEmitter::XReg::lr, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.UnalignedAtomicStub));
++    blr(ARMEmitter::Reg::r30);
++    // Data for the stub: the stub decodes this instruction word, emulates it and returns past it.
++    Inst();
++    ldr<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 16);
++  }
++
+   [[nodiscard]]
+   ARMEmitter::Register GetReg(IR::PhysicalRegister Reg) const {
+     const auto RegClass = Reg.AsRegClass();
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+index 01e5bb22e..1a3f93986 100644
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -1928,6 +1928,19 @@ static uint64_t HandleAtomicLoadstoreExclusive(uintptr_t ProgramCounter, uint64_
+   return NumInstructionsToSkip * 4;
+ }
+ 
++bool IsEmulatedAtomicRMW(uint32_t Instr) {
++  if ((Instr & CASPAL_MASK) == CASPAL_INST || (Instr & CASAL_MASK) == CASAL_INST) {
++    return true;
++  }
++
++  // LDAR/LDAPR/STLR partially overlap ATOMIC_MEM_MASK, and are backpatched instead.
++  if ((Instr & LDAXR_MASK) == LDAR_INST || (Instr & LDAXR_MASK) == LDAPR_INST || (Instr & LDAXR_MASK) == STLR_INST) {
++    return false;
++  }
++
++  return (Instr & ATOMIC_MEM_MASK) == ATOMIC_MEM_INST;
++}
++
+ [[nodiscard]]
+ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
+                                              uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT) {
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64_stubs.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64_stubs.cpp
+index adda8a26b..5759bd13d 100644
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64_stubs.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64_stubs.cpp
+@@ -11,11 +11,15 @@ namespace FEXCore::ArchHelpers::Arm64 {
+ 
+ // Obvously such a configuration can't do the actual arm64-specific stuff
+ 
+-std::optional<int32_t>
+-HandleUnalignedAccess(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType, uintptr_t ProgramCounter, uint64_t* GPRs) {
++std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType,
++                                             uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT) {
+   ERROR_AND_DIE_FMT("HandleAtomicMemOp Not Implemented");
+ }
+ 
++bool IsEmulatedAtomicRMW(uint32_t Instr) {
++  return false;
++}
++
+ #endif
+ 
+ } // namespace FEXCore::ArchHelpers::Arm64
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 8aa448e2e..223fda1a7 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -195,6 +195,18 @@ public:
+   FEX_DEFAULT_VISIBILITY virtual void MarkMonoDetected() = 0;
+ 
+   FEX_DEFAULT_VISIBILITY virtual void MarkMonoBackpatcherBlock(uint64_t BlockEntry) = 0;
++
++  /**
++   * @brief Marks a guest block entry whose JIT code keeps trapping on unaligned atomic read-modify-write instructions.
++   *
++   * The next compile of a block starting at this entry emits an alignment check in front of every atomic RMW
++   * instruction, and accesses that cross a 16-byte boundary call the same emulation that the SIGBUS handler uses
++   * (HandleUnalignedAccess), without taking the trap. The caller must hold the code invalidation mutex uniquely and
++   * must invalidate the block afterwards so it gets recompiled.
++   *
++   * @param BlockEntry The guest RIP of the block entry, as returned by GetGuestBlockEntry.
++   */
++  FEX_DEFAULT_VISIBILITY virtual void MarkUnalignedAtomicBlock(uint64_t BlockEntry) = 0;
+ private:
+ };
+ } // namespace FEXCore::Context
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 1e0cfb25d..2739aa469 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -395,8 +395,13 @@ struct JITPointers {
+   uint64_t F64FYL2XP1Handler {};
+   uint64_t F64FPREMHandler {};
+   uint64_t F64FPREM1Handler {};
++  // Dispatcher stub that saves all host state and calls UnalignedAtomicFallback (see Dispatcher::EmitDispatcher).
++  uint64_t UnalignedAtomicStub {};
+   /**  @} */
+ 
++  // C++ emulation entry for UnalignedAtomicStub: ContextImpl::UnalignedAtomicFallback.
++  uint64_t UnalignedAtomicFallback {};
++
+   // Copy of process-wide named vector constants data.
+   alignas(16) uint64_t NamedVectorConstants[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX][2];
+ };
+diff --git a/FEXCore/include/FEXCore/Utils/ArchHelpers/Arm64.h b/FEXCore/include/FEXCore/Utils/ArchHelpers/Arm64.h
+index 93141425a..671b27d78 100644
+--- a/FEXCore/include/FEXCore/Utils/ArchHelpers/Arm64.h
++++ b/FEXCore/include/FEXCore/Utils/ArchHelpers/Arm64.h
+@@ -34,4 +34,14 @@ enum class UnalignedHandlerType {
+ [[nodiscard]]
+ FEX_DEFAULT_VISIBILITY std::optional<int32_t> HandleUnalignedAccess(
+   FEXCore::Core::InternalThreadState* Thread, UnalignedHandlerType HandleType, uintptr_t ProgramCounter, uint64_t* GPRs, bool IsJIT = true);
++
++/**
++ * @brief Checks if an instruction is one of the atomic read-modify-write instructions (CASAL, CASPAL, LD<op>AL, SWPAL)
++ * that HandleUnalignedAccess emulates on every trap instead of backpatching.
++ *
++ * Frontends use this to count repeated traps of such instructions per JIT block, so that the block can be recompiled
++ * with the out-of-line unaligned atomic fallback (see ContextImpl::MarkUnalignedAtomicBlock).
++ */
++[[nodiscard]]
++FEX_DEFAULT_VISIBILITY bool IsEmulatedAtomicRMW(uint32_t Instr);
+ } // namespace FEXCore::ArchHelpers::Arm64
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 80752f1b8..3725172ea 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -7,6 +7,7 @@ $end_info$
+ */
+ 
+ #include <FEXCore/fextl/fmt.h>
++#include <FEXCore/fextl/unordered_map.h>
+ #include <FEXCore/Core/X86Enums.h>
+ #include <FEXCore/Core/SignalDelegator.h>
+ #include <FEXCore/Core/Context.h>
+@@ -50,8 +51,10 @@ $end_info$
+ #include "BTInterface.h"
+ #include "Windows/Common/SHMStats.h"
+ 
++#include <bit>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <type_traits>
+ #include <mutex>
+ #include <optional>
+@@ -371,12 +374,85 @@ struct alignas(16) KiUserExceptionDispatcherStackLayout {
+   uint64_t Redzone[2];
+ };
+ 
++namespace UnalignedAtomic {
++// Atomic RMW instructions (CASAL, CASPAL, LD<op>AL, SWPAL) are emulated on every trap and never backpatched. Each trap is a
++// full exception round trip (a ptrace stop under proot). After this many such traps in one JIT block, the block is
++// recompiled with the out-of-line fallback (ContextImpl::MarkUnalignedAtomicBlock), which emulates the same instruction
++// with the same code but without the exception.
++constexpr uint32_t RecompileThreshold = 16;
++// FEX_UNALIGNED_ATOMIC_FALLBACK=0 turns the recompile off (stock behaviour). FEX_UNALIGNED_ATOMIC_STATS=1 prints a
++// short count line via __wine_dbg_output at every power of two of traps and of recompiled blocks, even with FEX_SILENTLOG.
++bool Enabled = true;
++void (*StatsOut)(const char* Message) = nullptr;
++
++std::mutex Mutex;
++fextl::unordered_map<uint64_t, uint32_t> TrapCounts;
++uint64_t TotalTraps {};
++uint64_t MarkedBlocks {};
++
++static void PrintStats(uint64_t Traps, uint64_t Blocks) {
++  if (StatsOut) {
++    const auto Message = fextl::fmt::format("fex-uafb: pid {} rmw_traps {} recompiled_blocks {} enabled {}\n", GetCurrentProcessId(),
++                                            Traps, Blocks, Enabled ? 1 : 0);
++    StatsOut(Message.c_str());
++  }
++}
++
++static void NoteTrap(FEXCore::Core::InternalThreadState* Thread) {
++  const uint64_t BlockEntry = CTX->GetGuestBlockEntry(Thread);
++  uint32_t Count {};
++  uint64_t Traps {};
++  uint64_t Blocks {};
++  {
++    std::scoped_lock Lock(Mutex);
++    Traps = ++TotalTraps;
++    Blocks = MarkedBlocks;
++    if (BlockEntry && Enabled) {
++      Count = ++TrapCounts[BlockEntry];
++      if (Count == RecompileThreshold) {
++        Blocks = ++MarkedBlocks;
++      }
++    }
++  }
++
++  if (std::has_single_bit(Traps)) {
++    PrintStats(Traps, Blocks);
++  }
++
++  if (Count != RecompileThreshold) {
++    return;
++  }
++
++  {
++    // Same locking as the mono backpatcher detection: ThreadCreationMutex for the thread list walked by the
++    // invalidation, then CodeInvalidationMutex uniquely for the mark.
++    std::scoped_lock Lock(ThreadCreationMutex);
++    {
++      std::scoped_lock CodeLock(CTX->GetCodeInvalidationMutex());
++      CTX->MarkUnalignedAtomicBlock(BlockEntry);
++    }
++    // Drops every block on this guest page from the caches. This thread keeps running the old copy of the block until it
++    // leaves it (code memory stays valid, as with SMC invalidation), the next entry compiles the block with the fallback.
++    InvalidationTracker->InvalidateAlignedInterval(BlockEntry, 1, false);
++  }
++
++  LogMan::Msg::DFmt("Unaligned atomic fallback for block {:X} after {} traps", BlockEntry, Count);
++  if (std::has_single_bit(Blocks)) {
++    PrintStats(Traps, Blocks);
++  }
++}
++} // namespace UnalignedAtomic
++
+ static bool HandleUnalignedAccess(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT& Context, bool IsJIT) {
+   auto Thread = CPUArea.ThreadState();
+   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
++  const uint32_t Instr = *reinterpret_cast<const uint32_t*>(Context.Pc);
+   const auto Result =
+     FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(Thread, HandlerConfig->GetUnalignedHandlerType(), Context.Pc, &Context.X0, IsJIT);
+   Context.Pc += Result.value_or(0);
++  if (Result.has_value() && IsJIT && FEXCore::ArchHelpers::Arm64::IsEmulatedAtomicRMW(Instr)) {
++    UnalignedAtomic::NoteTrap(Thread);
++  }
+   return Result.has_value();
+ }
+ 
+@@ -676,6 +752,13 @@ NTSTATUS ProcessInit() {
+   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
+   FEXCore::Config::ReloadMetaLayer();
+   FEX::Windows::Logging::Init();
++  if (const char* Env = getenv("FEX_UNALIGNED_ATOMIC_FALLBACK"); Env && Env[0] == '0') {
++    Exception::UnalignedAtomic::Enabled = false;
++  }
++  if (const char* Env = getenv("FEX_UNALIGNED_ATOMIC_STATS"); Env && Env[0] == '1') {
++    Exception::UnalignedAtomic::StatsOut =
++      reinterpret_cast<decltype(Exception::UnalignedAtomic::StatsOut)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_dbg_output"));
++  }
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
+ 
+-- 
+2.56.0
+
