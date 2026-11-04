@@ -228,6 +228,7 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 |---|---|
 | `MALI_BRIDGE_DEBUG=1` | ICD shim logs to stderr |
 | `MALI_BRIDGE_HAL=<path>` | load another HAL instead of `/vendor/lib64/hw/vulkan.mali.so` |
+| `MALI_BRIDGE_EXCLUDE_COMM=<exe,exe>` | experimental, off by default (unset = unchanged behaviour): processes with a listed Windows exe base name (e.g. `UplayWebCore.exe`) get no ICD, so the HAL never loads there. The shipped package ICD does not contain it yet; tested only on a separate ICD build |
 | `MALI_COMPAT_DEBUG=1`, `MALI_COMPAT_STATS=1` | compat layer logging and counters (`STATS=every`: report on every BC upload instead of every 5 s) |
 | `MALI_WSI_NO_10BIT=1` | hide 10-bit surface formats |
 | `MALI_COMPAT_GPU_TIME=1` | GPU profiler: top passes/dispatches every 5 s, compile times, and STUCK lines for hangs in `/root/mali-gputime-<thread>.txt` |
