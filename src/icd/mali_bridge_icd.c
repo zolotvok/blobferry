@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <vulkan/vulkan.h>
 
 void *hybris_dlopen(const char *filename, int flag);
@@ -209,64 +208,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL shim_EnumerateDeviceExtensionProperties(Vk
     return ret;
 }
 
-// MALI_BRIDGE_EXCLUDE_COMM=a.exe,b.exe: processes (Windows exe base name from /proc/self/cmdline, as Wine sets it;
-// /proc/self/comm as fallback; case-insensitive) that must never open the vendor HAL. The bridge then declines at
-// negotiation, so the loader sees no bridge driver there and hal_init/libhybris never run. Use: Ubisoft Connect's
-// CEF children (UplayWebCore.exe) inherit the game's VK_ICD_FILENAMES and opened the Mali blob for their UI; every
-// loader-lock deadlock seen in Connect so far sat in such a child at its graphics init (docs/games/watch_dogs_2.md
-// "Connect loader-lock stall"). Unset = no change. [keeper, Claude Opus 5.5] 2026-11-04
-static int name_in_list(const char *name, const char *list) {
-    size_t n = strlen(name);
-    if (!n) return 0;
-    for (const char *p = list; *p;) {
-        const char *e = strchr(p, ',');
-        size_t len = e ? (size_t)(e - p) : strlen(p);
-        if (len == n && !strncasecmp(p, name, n)) return 1;
-        // the kernel cuts comm at 15 bytes ("UplayWebCore.ex")
-        if (n == 15 && len > 15 && !strncasecmp(p, name, 15)) return 1;
-        if (!e) break;
-        p = e + 1;
-    }
-    return 0;
-}
-
-static int read_first(const char *path, char *buf, size_t size) {
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    size_t r = fread(buf, 1, size - 1, f);
-    fclose(f);
-    buf[r] = 0;
-    buf[strcspn(buf, "\n")] = 0; // comm ends in a newline; cmdline's first NUL already ends the string
-    return r > 0;
-}
-
-static int g_excluded = -1;
-static int excluded(void) {
-    int ex = __atomic_load_n(&g_excluded, __ATOMIC_ACQUIRE);
-    if (ex >= 0) return ex;
-    ex = 0;
-    const char *list = getenv("MALI_BRIDGE_EXCLUDE_COMM");
-    if (list && *list) {
-        char buf[4096], comm[64];
-        const char *base = "";
-        if (read_first("/proc/self/cmdline", buf, sizeof buf)) {
-            base = buf;
-            for (const char *q = buf; *q; q++)
-                if (*q == '\\' || *q == '/') base = q + 1;
-        }
-        ex = name_in_list(base, list);
-        if (!ex && read_first("/proc/self/comm", comm, sizeof comm)) {
-            ex = name_in_list(comm, list);
-            if (ex) base = comm;
-        }
-        if (ex) fprintf(stderr, "mali-bridge: %s excluded by MALI_BRIDGE_EXCLUDE_COMM, no Vulkan driver from the bridge here\n", base);
-    }
-    __atomic_store_n(&g_excluded, ex, __ATOMIC_RELEASE);
-    return ex;
-}
-
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pSupportedVersion) {
-    if (excluded()) return VK_ERROR_INCOMPATIBLE_DRIVER;
     if (*pSupportedVersion > 5) *pSupportedVersion = 5;
     return VK_SUCCESS;
 }
@@ -274,7 +216,6 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vk_icdNegotiateLoaderICDInterfaceVersion(u
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL shim_GetDeviceProcAddr(VkDevice device, const char *name);
 
 EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
-    if (excluded()) return NULL; // before dev(): an excluded process never opens the HAL
     hwvulkan_device_t *d = dev();
     if (!d || !name) return NULL;
     if (!instance) {
