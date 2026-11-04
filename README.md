@@ -165,7 +165,7 @@ came from:
 ```sh
 git submodule update --init
 ./build-libhybris.sh configure && ./build-libhybris.sh make && ./build-libhybris.sh install
-./build-wsi.sh          # applies patches/vulkan-wsi-layer, builds the WSI layer
+./build-wsi.sh          # exports the submodule, applies patches/vulkan-wsi-layer, builds the WSI layer
 ./build-bridge.sh build # ICD shim, compat layer, test probes
 ./build-bridge.sh zip   # build/mali_bridge/Mali_Bridge.zip for DroidDeck's driver import page
 ```
@@ -174,7 +174,11 @@ git submodule update --init
 marker so that a DroidDeck build that bundles Blobferry keeps the deployed files; delete
 `usr/lib/mali_bridge/.dev` (runtime) and `linux_vulkan_drivers/Mali_Bridge/.dev` (app files) to go back to the bundled
 build. `./package.sh` packs the built files into `build/dist/blobferry-<commit>.zip` with an adb install script
-(`install-adb.sh`) and the licenses. DroidDeck's `tools/build_local.sh` bundles that package
+(`install-adb.sh`), the licenses, `SOURCE.txt` (the commit, the submodule commits and the patches) and `MD5SUMS`;
+`BLOBFERRY_VERSION=<name> ./package.sh` names a release and refuses a dirty tree. The build scripts never change the
+submodules: `build-libhybris.sh configure` and `build-wsi.sh` build an export of the submodule commit with the
+`patches/` applied, so a clean checkout rebuilds the released binaries bit for bit (the WSI build maps its source
+paths with `-ffile-prefix-map`, see `build-wsi.sh`). DroidDeck's `tools/build_local.sh` bundles that package
 (`DROIDDECK_BLOBFERRY=<zip or folder>`).
 
 ## Switches
@@ -209,7 +213,7 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 | `MALI_COMPAT_BUDGET_LOG_S=<s>` | with `BUDGET_MB` only: interval of the budget log line `mali-compat: budget heap0 <used>/<budget> MiB (peak) ..., <n> allocs, <q> queries` (default 30 s); printed only with `MALI_COMPAT_GPU_TIME=1` or `MALI_COMPAT_DEBUG` |
 | `MALI_COMPAT_MEMLOG=1` | memory event log `/root/mali-memlog-<comm>.tsv`, one TSV line per allocate / map / unmap / free / failed allocate and every 100th queue submit (`=2`: without the opaque-capture-address query); buffered, written once per second (diagnostic) |
 | `MALI_COMPAT_MEMLOG_MB=<MiB>` | size cap of that log per process (default 64 MiB), then one `TRUNC` line and the log stops |
-| `MALI_WSI_ASYNC_PRESENT=1` | **experimental, untested**: WSI layer only, from `patches/vulkan-wsi-layer/0003-*.patch.staged` (staged, `build-wsi.sh` does not apply it). Also uses the presentation thread for swapchains without explicit sync, so `vkQueuePresentKHR` returns after the fence submit instead of waiting for the frame's GPU work on the app's present thread; set (0 or 1) it prints one `mali-wsi: async present:` line per swapchain |
+| `MALI_WSI_ASYNC_PRESENT=1` | WSI layer only, from `patches/vulkan-wsi-layer/0003-*.patch` (in the shipped layer since 2026-11-02, off by default; measured on Control: +8 % fps, +22 % fps per GPU GHz, plan control-0410 r2). Also uses the presentation thread for swapchains without explicit sync, so `vkQueuePresentKHR` returns after the fence submit instead of waiting for the frame's GPU work on the app's present thread; set (0 or 1) it prints one `mali-wsi: async present:` line per swapchain |
 
 **Session** (see [Session on the vendor driver](#session-on-the-vendor-driver)):
 
@@ -240,7 +244,7 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 
 - `src/icd/`: ICD shim
 - `src/compat/`: compat layer; `bc/` holds the BC decode shaders and their generated SPIR-V headers
-- `patches/vulkan-wsi-layer/`: changes to the Arm WSI layer (`*.patch` are applied by `build-wsi.sh`, `*.staged` are held back)
+- `patches/vulkan-wsi-layer/`: changes to the Arm WSI layer (`*.patch` are applied by `build-wsi.sh` in name order, `*-staged` variants are held back)
 - `patches/libhybris/`: change to libhybris (race-free lazy init of static bionic locks), see [NOTICE.md](NOTICE.md)
 - `patches/wine/`: a source patch for Wine's ntdll (async I/O status block written after its memory was freed, seen with Watch Dogs 2); written without a Wine tree at hand, not built or tested, not applied by anything here
 - `test/`: small Vulkan probes (incl. `rt-comp-probe.c` for render-target compression, `xfb-probe.c` for stream

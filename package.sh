@@ -5,17 +5,28 @@
 #   rootfs/            files for the DroidDeck guest rootfs (shim, compat + WSI layers and their manifests, libhybris)
 #   Mali_Bridge.zip    the driver zip for DroidDeck's Runtime driver page ("Import Turnip zip...")
 #   install-adb.sh     installs both on a phone over adb (needs a debuggable DroidDeck build: run-as)
-#   INSTALL.txt, LICENSE, NOTICE.md, licenses/libhybris/
+#   INSTALL.txt, SOURCE.txt (commit, submodules, patches), MD5SUMS, LICENSE, NOTICE.md, licenses/{libhybris,vulkan-wsi-layer}/
 # The vendor Vulkan driver is not in it: the bridge loads the phone's own. [Claude Opus 5.5] 2026-10-28
 set -eu
 B=$(cd "$(dirname "$0")" && pwd)
-S=$B/build/mali_bridge/stage
+# BLOBFERRY_STAGE=<dir> packs another stage dir with the same layout (usr/lib/mali_bridge + usr/share/vulkan/...), e.g. a
+# stage-* build that is on the phone; BLOBFERRY_VERSION=<name> then names the package. [keeper, Claude Opus 5.5] 2026-11-02
+S=${BLOBFERRY_STAGE:-$B/build/mali_bridge/stage}
 H=$B/build/libhybris-install/usr/lib/hybris
+C=$(git -C "$B" rev-parse HEAD)
 V=$(git -C "$B" rev-parse --short HEAD)
-[ -n "$(git -C "$B" status --porcelain -- src)" ] && V=$V-dirty
+# Dirty = any change to a tracked file or a submodule (the build scripts export the submodules' committed HEADs, but a
+# dirty tree means the package may not match the commit it names). A named release (BLOBFERRY_VERSION) must be clean.
+# [keeper, Claude Opus 5.5] 2026-11-04
+DIRTY=$(git -C "$B" status --porcelain --untracked-files=no --ignore-submodules=none)
+[ -n "$DIRTY" ] && V=$V-dirty
+if [ -n "${BLOBFERRY_VERSION:-}" ]; then
+    [ -z "$DIRTY" ] || [ "${BLOBFERRY_ALLOW_DIRTY:-0}" = 1 ] || { echo "package.sh: tree is dirty, a named release needs a clean commit:" >&2; echo "$DIRTY" >&2; exit 1; }
+    V=$BLOBFERRY_VERSION
+fi
 OUT=$B/build/dist/blobferry-$V
 rm -rf "$OUT" && mkdir -p "$OUT/rootfs/usr/lib/mali_bridge" "$OUT/rootfs/usr/share/vulkan/implicit_layer.d" "$OUT/rootfs/usr/lib/hybris" \
-                           "$OUT/licenses/libhybris"
+                           "$OUT/licenses/libhybris" "$OUT/licenses/vulkan-wsi-layer"
 for f in libvulkan_mali_bridge.so libVkLayer_droiddeck_mali_compat.so libVkLayer_window_system_integration.so \
          mali_bridge_icd.json VkLayer_droiddeck_mali_compat.json VkLayer_window_system_integration.json; do
     cp "$S/usr/lib/mali_bridge/$f" "$OUT/rootfs/usr/lib/mali_bridge/"
@@ -24,14 +35,30 @@ cp "$S"/usr/share/vulkan/implicit_layer.d/*.json "$OUT/rootfs/usr/share/vulkan/i
 cp -P "$H"/libhybris-common.so* "$OUT/rootfs/usr/lib/hybris/"
 mkdir -p "$OUT/rootfs/usr/lib/hybris/libhybris/linker" && cp "$H/libhybris/linker/q.so" "$OUT/rootfs/usr/lib/hybris/libhybris/linker/"
 rm -f "$OUT/rootfs/usr/lib/hybris/"*.la
-(cd "$S/usr/lib/mali_bridge" && zip -q -j "$OUT/Mali_Bridge.zip" libvulkan_mali_bridge.so meta.json)
+# Inner driver zip: fixed file times (the commit time) and no extra attributes, so the same files give the same bytes
+T=$(git -C "$B" log -1 --format=%ct HEAD)
+MZ=$OUT.mz; rm -rf "$MZ"; mkdir -p "$MZ"; cp "$S/usr/lib/mali_bridge/libvulkan_mali_bridge.so" "$S/usr/lib/mali_bridge/meta.json" "$MZ/"; touch -d "@$T" "$MZ"/*
+(cd "$MZ" && TZ=UTC zip -q -X -j "$OUT/Mali_Bridge.zip" libvulkan_mali_bridge.so meta.json); rm -rf "$MZ"
 cp "$B/LICENSE" "$B/NOTICE.md" "$OUT/"
 cp "$B"/third_party/libhybris/LICENSE.* "$OUT/licenses/libhybris/"
 cp "$B"/patches/libhybris/*.patch "$OUT/licenses/libhybris/"
-echo "libhybris source: https://github.com/wmww/libhybris commit $(git -C "$B/third_party/libhybris" rev-parse HEAD), plus the patches in this folder (applied by build-libhybris.sh); full build source: https://github.com/zolotvok/blobferry commit $(git -C "$B" rev-parse HEAD)" > "$OUT/licenses/libhybris/SOURCE.txt"
+echo "libhybris source: https://github.com/wmww/libhybris commit $(git -C "$B/third_party/libhybris" rev-parse HEAD), plus the patches in this folder (applied by build-libhybris.sh); full build source: https://github.com/zolotvok/blobferry commit $C" > "$OUT/licenses/libhybris/SOURCE.txt"
+cp "$B/third_party/vulkan-wsi-layer/LICENSE" "$OUT/licenses/vulkan-wsi-layer/"
+cp "$B"/patches/vulkan-wsi-layer/*.patch "$OUT/licenses/vulkan-wsi-layer/"
+echo "vulkan-wsi-layer source: https://gitlab.freedesktop.org/mesa/vulkan-wsi-layer commit $(git -C "$B/third_party/vulkan-wsi-layer" rev-parse HEAD), plus the patches in this folder (applied in name order by build-wsi.sh; MIT, like the layer); full build source: https://github.com/zolotvok/blobferry commit $C" > "$OUT/licenses/vulkan-wsi-layer/SOURCE.txt"
+{
+    echo "Blobferry $V"
+    echo "Source: https://github.com/zolotvok/blobferry commit $C${DIRTY:+ (built from a dirty tree)}"
+    echo "Submodules (build-libhybris.sh and build-wsi.sh build an export of these commits plus patches/<name>/*.patch):"
+    git -C "$B" submodule status | sed 's/^/  /'
+    echo "Patches applied at build time:"
+    (cd "$B" && md5sum patches/libhybris/*.patch patches/vulkan-wsi-layer/*.patch | sed 's/^/  /')
+    echo "Build: build-libhybris.sh configure, make, install; build-wsi.sh; build-bridge.sh build, zip; package.sh"
+} > "$OUT/SOURCE.txt"
 
 cat > "$OUT/install-adb.sh" <<'EOF'
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # install-adb.sh: install Blobferry into DroidDeck on the phone connected over adb. Needs a debuggable DroidDeck build
 # with the bridge support (github.com/zolotvok/DroidDeck, branch mali-panvk); stop the DroidDeck session first.
 set -eu
@@ -55,6 +82,7 @@ chmod +x "$OUT/install-adb.sh"
 
 cat > "$OUT/INSTALL.txt" <<EOF
 Blobferry $V: run Windows games on the phone's own Mali Vulkan driver in DroidDeck (experimental)
+Source: https://github.com/zolotvok/blobferry commit $C (SOURCE.txt); checksums in MD5SUMS.
 
 Tested on one phone only (vivo X300 Pro, Mali-G1-Ultra MC12, vendor driver v1.r54p1).
 
@@ -78,6 +106,10 @@ driver through libhybris inside DroidDeck's rootfs, and the layers are installed
 
 License: GPL-3.0-or-later (LICENSE); third-party parts and credits in NOTICE.md and licenses/.
 EOF
-(cd "$B/build/dist" && rm -f "blobferry-$V.zip" && zip -q -r -y "blobferry-$V.zip" "blobferry-$V")
-ls -l "$B/build/dist/blobferry-$V.zip"
+(cd "$OUT" && find . -type f ! -name MD5SUMS | LC_ALL=C sort | xargs md5sum > MD5SUMS)
+# Same zip bytes for the same files: file times set to the commit time, no extra attributes, sorted order.
+find "$OUT" -exec touch -h -d "@$T" {} +
+(cd "$B/build/dist" && rm -f "blobferry-$V.zip" && find "blobferry-$V" | LC_ALL=C sort | TZ=UTC zip -q -X -y "blobferry-$V.zip" -@)
+(cd "$B/build/dist" && md5sum "blobferry-$V.zip" > "blobferry-$V.zip.md5")
+ls -l "$B/build/dist/blobferry-$V.zip"; cat "$B/build/dist/blobferry-$V.zip.md5"
 unzip -l "$B/build/dist/blobferry-$V.zip"

@@ -22,12 +22,15 @@ Copyright (c) Arm Limited, MIT (`SPDX-License-Identifier: MIT` in the files and 
 are in `patches/vulkan-wsi-layer/`, each a patch of MIT-licensed files, so they stay MIT, like the layer (the patched
 layer is combined with GPL code only at run time, in separate libraries):
 
-- `0001-blobferry-wsi-changes.patch`: gamescope/Mali fixes; applied by `build-wsi.sh`. The `.k-wsi1-staged` copy is a
-  variant with bounded swapchain teardown, not applied.
-- `0002-blobferry-wsi-pace.patch.staged`: present-pacing log (`MALI_WSI_PACE`); adds `wsi/mali_pace.hpp` (tagged
-  `SPDX-License-Identifier: MIT`). Staged, not applied by the build.
-- `0003-blobferry-wsi-async-present.patch.staged`: `MALI_WSI_ASYNC_PRESENT`; changes upstream files only
-  (`swapchain_base.cpp`, `wayland/swapchain.cpp`). Staged, not applied by the build, untested.
+- `0001-blobferry-wsi-changes.patch`: gamescope/Mali fixes. The `.k-wsi1-staged` copy is a variant with bounded
+  swapchain teardown, not applied.
+- `0002-blobferry-wsi-pace.patch`: present-pacing log (`MALI_WSI_PACE`); adds `wsi/mali_pace.hpp` (tagged
+  `SPDX-License-Identifier: MIT`).
+- `0003-blobferry-wsi-async-present.patch`: `MALI_WSI_ASYNC_PRESENT`; changes upstream files only
+  (`swapchain_base.cpp`, `wayland/swapchain.cpp`).
+
+`build-wsi.sh` applies the three `*.patch` files in name order to an export of the submodule commit. The package
+(`package.sh`) carries the layer's `LICENSE`, these patches and the source commit in `licenses/vulkan-wsi-layer/`.
 
 ## libhybris (`third_party/libhybris`, git submodule)
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // spv-compile-probe: does the vendor shader compiler take this compute SPIR-V? Control (D3D12 through vkd3d-proton)
 // dies at start because the LLVM inside vulkan.mali.so aborts on one compute shader ("LLVM ERROR: Cannot select ...
 // #405 ... i26", docs/games/control.md § Diagnosis plan, R1/C8/C9). For each .spv a forked child creates the instance

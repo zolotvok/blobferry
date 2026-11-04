@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // vs-stores-host: runs the compat layer's VS-stage store scan (spv_vs_stores, request KZ2) on SPIR-V files on the host
 // and prints, per file, whether a vertex-pipeline module writes memory and the op counts. [keeper, Claude Opus 5.5] 2026-10-30
 // cc -I../panvk-kbase-android/work/mesa/include -Isrc/compat test/vs-stores-host.c -o vs-stores-host -lpthread -lm

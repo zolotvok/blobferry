@@ -3,3 +3,5 @@ build/
 # Milestone probe output and vendor binaries pulled from the phone (proprietary): never commit or push
 m1/
 *.so
+# Python bytecode from the test helpers
+__pycache__/

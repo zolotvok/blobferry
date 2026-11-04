@@ -10,15 +10,19 @@ NDK=$HOME/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bi
 GCCDIR=$(ls -d "$SR"/usr/lib/gcc/aarch64-linux-gnu/*/ | head -1)
 SCANNER=$B/../panvk-kbase-android/work/host-wayland/bin/wayland-scanner
 PROTOCOLS=$B/../panvk-kbase-android/work/mesa/subprojects/wayland-protocols-1.41
-SRC=$B/third_party/vulkan-wsi-layer
-BUILDDIR=$B/build/vulkan-wsi-layer
+SUB=$B/third_party/vulkan-wsi-layer
+SRC=$B/build/wsi/src
+BUILDDIR=$B/build/wsi/build
 STAGE=$B/build/mali_bridge/stage/usr/lib/mali_bridge
 
-mkdir -p "$BUILDDIR"
-
-# Our changes live in patches/vulkan-wsi-layer; the submodule stays at the upstream commit. Apply what is not applied yet.
+# Our changes live in patches/vulkan-wsi-layer (0001 gamescope/Mali fixes, 0002 MALI_WSI_PACE, 0003 MALI_WSI_ASYNC_PRESENT);
+# the submodule stays clean at the upstream commit. Every build starts from a fresh export of the submodule's committed
+# HEAD (uncommitted edits in the submodule are not used) with the *.patch files applied in name order.
+# [keeper, Claude Opus 5.5] 2026-11-04
+rm -rf "$B/build/wsi" && mkdir -p "$SRC" "$BUILDDIR"
+git -C "$SUB" archive --format=tar HEAD | tar -x -C "$SRC"
 for p in "$B"/patches/vulkan-wsi-layer/*.patch; do
-  git -C "$SRC" apply --reverse --check "$p" 2>/dev/null || git -C "$SRC" apply "$p"
+  patch -p1 -s -N --no-backup-if-mismatch -d "$SRC" < "$p"
 done
 
 # Set up pkg-config environment for cross compilation
@@ -26,7 +30,11 @@ export PKG_CONFIG_DIR=
 export PKG_CONFIG_LIBDIR="$SR/usr/lib/aarch64-linux-gnu/pkgconfig:$SR/usr/share/pkgconfig:$SR/usr/local/lib/pkgconfig"
 export PKG_CONFIG_SYSROOT_DIR="$SR"
 
-FLAGS="--target=aarch64-linux-gnu --sysroot=$SR --gcc-install-dir=$GCCDIR -Wno-error=unused-command-line-argument"
+# Reproducible output: the layer's asserts and WSI_LOG_* carry __FILE__, so the source path ends up in the .so. The prefix
+# maps write the paths as /tmp/blobferry-wsi-async-rel/{src,build}, the work dir of the phone-tested build (md5 16e16c96,
+# 2026-11-02), wherever this checkout lives; with them a clean build reproduces 16e16c96 bit for bit. [keeper, Claude Opus 5.5] 2026-11-04
+PMAP="-ffile-prefix-map=$SRC=/tmp/blobferry-wsi-async-rel/src -ffile-prefix-map=$BUILDDIR=/tmp/blobferry-wsi-async-rel/build"
+FLAGS="--target=aarch64-linux-gnu --sysroot=$SR --gcc-install-dir=$GCCDIR -Wno-error=unused-command-line-argument $PMAP"
 LINK_FLAGS="--target=aarch64-linux-gnu --sysroot=$SR --gcc-install-dir=$GCCDIR --ld-path=$NDK/ld.lld -Wl,-rpath,/usr/lib/aarch64-linux-gnu:/usr/local/lib -Wl,-z,nodelete"
 
 # Build type: an empty CMAKE_BUILD_TYPE gives NO -O flag at all (-O0 code in the per-frame acquire/present path).
