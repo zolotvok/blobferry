@@ -982,6 +982,8 @@ struct BCNode { struct TrackedBCImage t; struct BCNode *next; };
 #define BC_BUCKETS 4096
 static struct BCNode *g_bc_images[BC_BUCKETS];
 static pthread_mutex_t g_bc_image_mutex = PTHREAD_MUTEX_INITIALIZER;
+// F2: tracked BC images; while 0 (games without BC textures, or before the first one) find_bc_image takes no lock.
+static _Atomic uint32_t g_bc_image_n;
 
 static uint32_t handle_bucket(uint64_t v, uint32_t n) { return (uint32_t)((v ^ (v >> 17) ^ (v >> 33)) % n); }
 
@@ -993,11 +995,14 @@ static void register_bc_image(VkImage img, VkFormat orig, VkFormat decoded, VkEx
     uint32_t bkt = handle_bucket((uint64_t)(uintptr_t)img, BC_BUCKETS);
     e->next = g_bc_images[bkt];
     g_bc_images[bkt] = e;
+    atomic_fetch_add_explicit(&g_bc_image_n, 1, memory_order_release);
     pthread_mutex_unlock(&g_bc_image_mutex);
 }
 
 // Copies the entry out (the node can be freed by another thread's vkDestroyImage).
 static bool find_bc_image(VkImage img, struct TrackedBCImage *out) {
+    // the image was created before the app records a copy to it (app-side ordering), so its count is visible here
+    if (!atomic_load_explicit(&g_bc_image_n, memory_order_acquire)) return false;
     bool found = false;
     pthread_mutex_lock(&g_bc_image_mutex);
     for (struct BCNode *e = g_bc_images[handle_bucket((uint64_t)(uintptr_t)img, BC_BUCKETS)]; e; e = e->next)
@@ -1011,7 +1016,10 @@ static void unregister_bc_image(VkImage img) {
     struct BCNode **pp = &g_bc_images[handle_bucket((uint64_t)(uintptr_t)img, BC_BUCKETS)];
     while (*pp && (*pp)->t.image != img) pp = &(*pp)->next;
     struct BCNode *e = *pp;
-    if (e) *pp = e->next;
+    if (e) {
+        *pp = e->next;
+        atomic_fetch_sub_explicit(&g_bc_image_n, 1, memory_order_relaxed);
+    }
     pthread_mutex_unlock(&g_bc_image_mutex);
     free(e);
 }
@@ -1475,42 +1483,55 @@ static struct InstanceData *get_instance_by_phys_dev(VkPhysicalDevice phys_dev) 
     return fallback;
 }
 
+// F2 (our-cpu-paths-1105.md) [keeper, Claude Opus 5.5] 2026-11-05: the device lookups ran under g_table_mutex on
+// every call (Begin/Reset, submits, waits, maps, copies, every cmd_data miss: ~16 k lock ops/s on WD1's dxvk-cs). Each
+// thread now keeps its last hit, valid while the table generation is unchanged; vkCreateDevice / vkDestroyDevice
+// bump it under the mutex (the destroy compacts the array, so every cached pointer is dropped). A pointer handed out
+// can go stale on a concurrent destroy exactly as before (the old code returned it after unlocking too). Fallbacks
+// (no match) are not cached.
+static _Atomic uint64_t g_dev_gen = 1;
+#define DEV_TABLE_CHANGED() atomic_fetch_add_explicit(&g_dev_gen, 1, memory_order_release) // g_table_mutex held
+static __thread VkDevice tl_dev_h;
+static __thread struct DeviceData *tl_dev_by_h;
+static __thread uint64_t tl_dev_h_gen;
+static __thread void *tl_dev_key;
+static __thread struct DeviceData *tl_dev_by_key;
+static __thread uint64_t tl_dev_key_gen;
+
 static struct DeviceData *get_device_data(VkDevice dev) {
+    if (dev && tl_dev_h == dev && tl_dev_h_gen == atomic_load_explicit(&g_dev_gen, memory_order_acquire)) return tl_dev_by_h;
+    struct DeviceData *hit = NULL;
     pthread_mutex_lock(&g_table_mutex);
-    for (int32_t i = (int32_t)g_device_count - 1; i >= 0; i--) {
-        if (g_devices[i].device == dev) {
-            pthread_mutex_unlock(&g_table_mutex);
-            return &g_devices[i];
-        }
-    }
+    for (int32_t i = (int32_t)g_device_count - 1; i >= 0 && !hit; i--)
+        if (g_devices[i].device == dev) hit = &g_devices[i];
     void *key = dev ? *(void **)dev : NULL;
-    if (key) {
-        for (int32_t i = (int32_t)g_device_count - 1; i >= 0; i--) {
-            if (g_devices[i].dispatch_key == key) {
-                pthread_mutex_unlock(&g_table_mutex);
-                return &g_devices[i];
-            }
-        }
+    for (int32_t i = (int32_t)g_device_count - 1; key && i >= 0 && !hit; i--)
+        if (g_devices[i].dispatch_key == key) hit = &g_devices[i];
+    struct DeviceData *r = hit ? hit : g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
+    if (hit) {
+        tl_dev_h = dev;
+        tl_dev_by_h = hit;
+        tl_dev_h_gen = atomic_load_explicit(&g_dev_gen, memory_order_relaxed);
     }
-    struct DeviceData *fallback = g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
     pthread_mutex_unlock(&g_table_mutex);
-    return fallback;
+    return r;
 }
 
 static struct DeviceData *get_device_data_by_cmd(VkCommandBuffer cmd) {
-    pthread_mutex_lock(&g_table_mutex);
     void *key = cmd ? *(void **)cmd : NULL;
-    if (key) {
-        for (int32_t i = (int32_t)g_device_count - 1; i >= 0; i--) {
-            if (g_devices[i].dispatch_key == key) {
-                pthread_mutex_unlock(&g_table_mutex);
-                return &g_devices[i];
-            }
-        }
+    if (key && tl_dev_key == key && tl_dev_key_gen == atomic_load_explicit(&g_dev_gen, memory_order_acquire)) return tl_dev_by_key;
+    struct DeviceData *hit = NULL;
+    pthread_mutex_lock(&g_table_mutex);
+    for (int32_t i = (int32_t)g_device_count - 1; key && i >= 0 && !hit; i--)
+        if (g_devices[i].dispatch_key == key) hit = &g_devices[i];
+    struct DeviceData *r = hit ? hit : g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
+    if (hit) {
+        tl_dev_key = key;
+        tl_dev_by_key = hit;
+        tl_dev_key_gen = atomic_load_explicit(&g_dev_gen, memory_order_relaxed);
     }
-    struct DeviceData *fallback = g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
     pthread_mutex_unlock(&g_table_mutex);
-    return fallback;
+    return r;
 }
 
 static struct DeviceData *get_device_data_by_cmd(VkCommandBuffer cmd);
@@ -7878,6 +7899,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             if (pthread_create(&t, NULL, pc2_log_thread, NULL) == 0) pthread_detach(t);
         }
     }
+    DEV_TABLE_CHANGED();
     pthread_mutex_unlock(&g_table_mutex);
 
     LOG("created VkDevice %p (key=%p)", (void *)*pDevice, *pDevice ? *(void **)*pDevice : NULL);
@@ -7914,6 +7936,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
                 break;
             }
         }
+        DEV_TABLE_CHANGED();
         pthread_mutex_unlock(&g_table_mutex);
     }
 }

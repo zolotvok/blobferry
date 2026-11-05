@@ -2,7 +2,7 @@
 // cpu-paths-host: host checks of the compat layer's command-pool reset (F1), lock-free device lookup (F2) and
 // per-thread push counters (F3) from docs/analysis/perf/our-cpu-paths-1105.md, with mocked driver entry points and
 // fake dispatchable handles. Also times vkResetCommandPool with many live command buffers. [keeper, Claude Opus 5.5] 2026-11-05
-// clang -O1 -g -fsanitize=address,undefined -I../panvk-kbase-android/work/mesa/include -Isrc/compat test/cpu-paths-host.c -o cpu-paths-host -lpthread -lm
+// clang [-DTEST_F2] [-DTEST_F3] -O1 -g -fsanitize=address,undefined -I../panvk-kbase-android/work/mesa/include -Isrc/compat test/cpu-paths-host.c -o cpu-paths-host -lpthread -lm
 #include "../src/compat/mali_compat_layer.c"
 #ifndef DEV_TABLE_CHANGED
 #define DEV_TABLE_CHANGED() ((void)0)
@@ -158,6 +158,53 @@ static void time_f1(struct DeviceData *da, uint32_t live) {
     for (int i = 0; i < 8; i++) free((void *)mine[i]);
     free(cbs);
 }
+
+
+#ifdef TEST_F2
+// F2: per-thread device cache, dropped on every table change (destroy compacts the array).
+static void test_f2(void) {
+    struct DeviceData *db = add_device(&g_dev_b);
+    struct FakeObj cb_a = {&g_key_a, 10}, cb_b = {&g_key_b, 11}, cb_x = {&g_dev_gen, 12}; // x: no device has its key
+    CHECK(get_device_data_by_cmd((VkCommandBuffer)&cb_a) == &g_devices[0]);
+    CHECK(get_device_data_by_cmd((VkCommandBuffer)&cb_b) == db);
+    CHECK(get_device_data_by_cmd((VkCommandBuffer)&cb_b) == db && tl_dev_by_key == db); // cached hit
+    CHECK(get_device_data((VkDevice)&g_dev_a) == &g_devices[0]);
+    CHECK(get_device_data((VkDevice)&g_dev_b) == db);
+    // no match: the fallback (last device), not cached
+    CHECK(get_device_data_by_cmd((VkCommandBuffer)&cb_x) == db && tl_dev_key != cb_x.key);
+    // destroy device a the way compat_DestroyDevice does: b moves to slot 0, the cached &g_devices[1] must not be used
+    destroy_staging_pool(&g_devices[0]);
+    pthread_mutex_lock(&g_table_mutex);
+    g_devices[0] = g_devices[1];
+    g_device_count--;
+    DEV_TABLE_CHANGED();
+    pthread_mutex_unlock(&g_table_mutex);
+    CHECK(get_device_data_by_cmd((VkCommandBuffer)&cb_b) == &g_devices[0]);
+    CHECK(get_device_data((VkDevice)&g_dev_b) == &g_devices[0]);
+    CHECK(g_devices[0].dispatch_key == &g_key_b);
+    // put a back for the rest (a at 1 now)
+    struct DeviceData *da = add_device(&g_dev_a);
+    CHECK(get_device_data_by_cmd((VkCommandBuffer)&cb_a) == da && da == &g_devices[1]);
+    // BC fast check: empty table -> false without the lock; one image -> found; unregistered -> empty again
+    struct TrackedBCImage t;
+    CHECK(!find_bc_image((VkImage)(uintptr_t)0x77, &t));
+    register_bc_image((VkImage)(uintptr_t)0x77, VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM, (VkExtent3D){4, 4, 1});
+    CHECK(find_bc_image((VkImage)(uintptr_t)0x77, &t) && t.orig_format == VK_FORMAT_BC1_RGB_UNORM_BLOCK);
+    CHECK(!find_bc_image((VkImage)(uintptr_t)0x78, &t));
+    unregister_bc_image((VkImage)(uintptr_t)0x77);
+    CHECK(atomic_load(&g_bc_image_n) == 0 && !find_bc_image((VkImage)(uintptr_t)0x77, &t));
+    // timing: lookups per call, cached vs the locked path
+    const int iters = 2000000;
+    uint64_t t0 = now_ns();
+    for (int i = 0; i < iters; i++) if (!get_device_data_by_cmd((VkCommandBuffer)&cb_b)) g_fail++;
+    uint64_t t1 = now_ns();
+    for (int i = 0; i < iters; i++) { tl_dev_key = NULL; if (!get_device_data_by_cmd((VkCommandBuffer)&cb_b)) g_fail++; }
+    uint64_t t2 = now_ns();
+    printf("F2 timing: cached lookup %.1f ns, locked lookup %.1f ns per call (host x86, -O1 ASan, uncontended)\n",
+           (t1 - t0) / (double)iters, (t2 - t1) / (double)iters);
+    printf("F2 checks done\n");
+}
+#endif
 
 int main(void) {
     struct DeviceData *da = add_device(&g_dev_a);
