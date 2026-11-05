@@ -1,0 +1,13 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// cover-trim: marks every 16x16 tile of the copied depth image that holds a texel != the pass's clear depth.
+// The tile buffer is zero-filled before this dispatch; all writers store the same 1. [keeper, Claude Opus 5.5] 2026-11-05
+#extension GL_GOOGLE_include_directive : require
+#include "ct_common.glsl"
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+void main() {
+    uvec2 q = gl_GlobalInvocationID.xy;
+    if (q.x >= p.w || q.y >= p.h) return;
+    if (U32R(p.depth).v[q.y * p.w + q.x] != p.clear_bits)
+        U32W(p.cov).v[gl_WorkGroupID.y * p.tiles_x + gl_WorkGroupID.x] = 1u;
+}

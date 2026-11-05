@@ -1,0 +1,28 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// cover-trim: one predicate per cell of an nx x ny grid over a gx x gy dispatch. Cell (cx, cy) owns groups
+// [cx*gx/nx, (cx+1)*gx/nx) x [cy*gy/ny, (cy+1)*gy/ny) (the same integer split as the layer's CPU loop). Its pixel
+// rect (groups mapped proportionally onto w x h), grown by dil_x/dil_y, is 1 when any covered tile touches it.
+// [keeper, Claude Opus 5.5] 2026-11-05
+#extension GL_GOOGLE_include_directive : require
+#include "ct_common.glsl"
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    if (i >= p.nx * p.ny) return;
+    uint cx = i % p.nx, cy = i / p.nx;
+    uint gx0 = cx * p.gx / p.nx, gx1 = (cx + 1u) * p.gx / p.nx;
+    uint gy0 = cy * p.gy / p.ny, gy1 = (cy + 1u) * p.gy / p.ny;
+    uint hit = 0u;
+    if (gx1 > gx0 && gy1 > gy0) {
+        int x0 = max(int(gx0 * p.w / p.gx) - int(p.dil_x), 0);
+        int y0 = max(int(gy0 * p.h / p.gy) - int(p.dil_y), 0);
+        uint x1 = min((gx1 * p.w + p.gx - 1u) / p.gx + p.dil_x, p.w);
+        uint y1 = min((gy1 * p.h + p.gy - 1u) / p.gy + p.dil_y, p.h);
+        uint tx1 = (x1 + 15u) / 16u, ty1 = (y1 + 15u) / 16u;
+        for (uint ty = uint(y0) / 16u; ty < ty1 && hit == 0u; ty++)
+            for (uint tx = uint(x0) / 16u; tx < tx1; tx++)
+                if (U32R(p.cov).v[ty * p.tiles_x + tx] != 0u) { hit = 1u; break; }
+    }
+    U32W(p.pred).v[i] = hit;
+}

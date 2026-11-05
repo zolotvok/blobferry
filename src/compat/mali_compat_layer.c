@@ -1284,6 +1284,16 @@ struct DcCmd {
 };
 struct DcFns;
 
+// cover-trim (cover_trim.h): the open pass, draws, the app's last scissor and conditional rendering.
+struct CtCmd {
+    uint32_t colors, draws, sdraws;
+    VkImageView depth_view;
+    VkImageLayout depth_layout;
+    float clear_depth;
+    bool depth_clear, suspending, in_pass, sc_valid, sc_wc, app_cond;
+    VkRect2D sc, area;
+};
+
 struct CmdBufData {
     VkCommandBuffer cmdbuf;
     struct DeviceData *dev;
@@ -1309,6 +1319,7 @@ struct CmdBufData {
     VkImageView gt_ssrc;
     bool async_skip;                // the bound graphics pipeline is still compiling (MALI_COMPAT_ASYNC_PSO)
     struct DcCmd dc;                // desc-capture-1 (MALI_COMPAT_DESC_CAPTURE)
+    struct CtCmd ct;                // cover-trim (MALI_COMPAT_COVER_TRIM)
     struct CmdBufData *next;
 };
 
@@ -1406,6 +1417,7 @@ struct DeviceData {
     PFN_vkCreateComputePipelines fpCreateComputePipelinesReal; // for the GPU timing's pipeline hashes
     struct GpuTime *gt; // MALI_COMPAT_GPU_TIME
     struct DcFns *dcf;  // desc-capture-1 driver entry points, NULL when off
+    struct CtDev *ct;   // cover-trim (MALI_COMPAT_COVER_TRIM), NULL when off
 };
 
 #define MAX_INSTANCES 32
@@ -2639,6 +2651,7 @@ static void reset_cmd_data(struct DeviceData *dev_data, VkCommandBuffer cmd, boo
     e->gt_ssrc = VK_NULL_HANDLE;
     e->async_skip = false;
     memset(&e->dc, 0, sizeof e->dc);
+    memset(&e->ct, 0, sizeof e->ct);
     if (remove) {
         free(e->staging_resources);
         free(e);
@@ -3233,6 +3246,10 @@ static uint32_t g_dump_hash_count;
 static uint32_t g_gt_trace; // MALI_COMPAT_GT_TRACE=<hex>: write every pass whose fragment/compute shader has this hash
                             // (=all: every pass and dispatch, in GPU order with its start time)
 static uint32_t g_skip_hash; // MALI_COMPAT_SKIP_HASH, see gt_skip
+// cover-trim (MALI_COMPAT_COVER_TRIM, cover_trim.h): on/off and the hash lists, used before the header's code.
+static int g_ct;
+static uint32_t g_ct_cs[16], g_ct_cs_n, g_ct_fs[8], g_ct_fs_n;
+static bool ct_cs_listed(uint32_t h);
 static uint32_t g_noatt_w, g_noatt_h; // MALI_COMPAT_NOATT_AREA, see compat_CmdBeginRendering
 static _Atomic uint64_t g_noatt_clamped;
 // HZD statics (requests KZ1/KZ2 of game/hzd, 2026-10-30). [keeper, Claude Opus 5.5]
@@ -3826,7 +3843,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
     const VkAllocationCallbacks *pAllocator, VkShaderModule *pShaderModule) {
     struct DeviceData *d = get_device_data(device);
     uint32_t hash = 0, mflags = 0, cnt[4];
-    if (g_gpu_time || g_dump_hash_count || g_vs_scan || g_dc_on) {
+    if (g_gpu_time || g_dump_hash_count || g_vs_scan || g_dc_on || g_ct) {
         hash = spv_hash(pCreateInfo->pCode, pCreateInfo->codeSize);
         spv_dump_if_wanted(pCreateInfo->pCode, pCreateInfo->codeSize, hash);
     }
@@ -3849,7 +3866,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
         r = d->fpCreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
         if (r == VK_SUCCESS && g_dump_inflight && pShaderModule) inflight_module_put(*pShaderModule, pCreateInfo->pCode, pCreateInfo->codeSize);
     }
-    if (r == VK_SUCCESS && (g_gpu_time || g_dc_on) && pShaderModule) hash_put(g_module_hash, (uint64_t)*pShaderModule, &hash, NULL, 1, mflags);
+    if (r == VK_SUCCESS && (g_gpu_time || g_dc_on || g_ct) && pShaderModule) hash_put(g_module_hash, (uint64_t)*pShaderModule, &hash, NULL, 1, mflags);
     if (r == VK_SUCCESS && g_fragdepth_fix && pShaderModule && spv_writes_fragdepth(pCreateInfo->pCode, pCreateInfo->codeSize))
         fragdepth_module_put(*pShaderModule, pCreateInfo->pCode, pCreateInfo->codeSize);
     return r;
@@ -4506,7 +4523,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
         createInfoCount * sizeof(VkPipelineRasterizationStateCreateInfo));
 
     // GPU timing: the stage hashes, taken before the clip/cull patch below rewrites inline SPIR-V
-    uint32_t (*gt_hash)[6] = (g_gpu_time || g_dump_hash_count) ? calloc(createInfoCount, sizeof *gt_hash) : NULL;
+    uint32_t (*gt_hash)[6] = (g_gpu_time || g_dump_hash_count || g_ct) ? calloc(createInfoCount, sizeof *gt_hash) : NULL;
     uint32_t *gt_n = gt_hash ? calloc(createInfoCount, sizeof *gt_n) : NULL;
     for (uint32_t i = 0; gt_n && i < createInfoCount; i++)
         gt_n[i] = stage_hashes(pCreateInfos[i].pStages, pCreateInfos[i].stageCount, gt_hash[i], gt_hash[i] + 3);
@@ -4775,7 +4792,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateGraphicsPipelines(
     }
     if (g_log_pipelines)
         for (uint32_t i = 0; i < createInfoCount; i++) log_pipeline(&modified[i], res);
-    if (g_gpu_time && gt_n && res == VK_SUCCESS && pPipelines)
+    if ((g_gpu_time || g_ct) && gt_n && res == VK_SUCCESS && pPipelines)
         for (uint32_t i = 0; i < createInfoCount; i++)
             if (pPipelines[i]) hash_put(g_pipeline_hash, (uint64_t)pPipelines[i], gt_hash[i], gt_hash[i] + 3, gt_n[i], pf ? pf[i] : 0);
     free(gt_hash);
@@ -4817,7 +4834,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
         }
     }
     dump_inflight_compute(createInfoCount, pCreateInfos);
-    VkResult res = d->fpCreateComputePipelinesReal(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount, pCreateInfos, pAllocator, pPipelines);
+    // cover-trim: listed compute shaders get DISPATCH_BASE (the trim splits their dispatches into vkCmdDispatchBase
+    // calls). The app's create infos are copied; a VkPipelineCreateFlags2CreateInfo in pNext is patched and restored.
+    VkComputePipelineCreateInfo *ct_ci = NULL;
+    VkPipelineCreateFlags2CreateInfoKHR *ct_f2[8] = {0};
+    VkPipelineCreateFlags2KHR ct_f2_saved[8];
+    for (uint32_t i = 0; g_ct && g_ct_cs_n && !ct_ci && i < createInfoCount; i++) {
+        uint32_t h[1], st[1];
+        if (stage_hashes(&pCreateInfos[i].stage, 1, h, st) && ct_cs_listed(h[0])) ct_ci = malloc(createInfoCount * sizeof *ct_ci);
+    }
+    if (ct_ci) {
+        for (uint32_t i = 0; i < createInfoCount; i++) {
+            uint32_t h[1], st[1];
+            ct_ci[i] = pCreateInfos[i];
+            if (!stage_hashes(&pCreateInfos[i].stage, 1, h, st) || !ct_cs_listed(h[0])) continue;
+            ct_ci[i].flags |= VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
+            VkPipelineCreateFlags2CreateInfoKHR *f2 = (VkPipelineCreateFlags2CreateInfoKHR *)find_struct(pCreateInfos[i].pNext,
+                VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
+            if (f2 && i < 8) { ct_f2[i] = f2; ct_f2_saved[i] = f2->flags; f2->flags |= VK_PIPELINE_CREATE_2_DISPATCH_BASE_BIT_KHR; }
+        }
+    }
+    VkResult res = d->fpCreateComputePipelinesReal(device, pc_for(d, pipelineCache, createInfoCount), createInfoCount,
+                                                   ct_ci ? ct_ci : pCreateInfos, pAllocator, pPipelines);
+    for (uint32_t i = 0; i < 8; i++) if (ct_f2[i]) ct_f2[i]->flags = ct_f2_saved[i];
+    free(ct_ci);
     dump_inflight_done();
     for (uint32_t i = 0; i < 8; i++)
         if (wls_sm[i]) {
@@ -4828,7 +4868,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
     for (uint32_t i = 0; i < createInfoCount; i++) {
         uint32_t hash[1], stage[1];
         uint32_t n = stage_hashes(&pCreateInfos[i].stage, 1, hash, stage);
-        if (g_gpu_time && res == VK_SUCCESS && pPipelines && pPipelines[i])
+        if ((g_gpu_time || g_ct) && res == VK_SUCCESS && pPipelines && pPipelines[i])
             hash_put(g_pipeline_hash, (uint64_t)pPipelines[i], hash, stage, n, 0);
         if (g_dc_on && res == VK_SUCCESS && pPipelines && pPipelines[i])
             dc_pipe_create(pPipelines[i], n ? hash[0] : 0, pCreateInfos[i].layout);
@@ -5267,7 +5307,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImage(
         }
     }
     if (res == VK_SUCCESS && g_log_images && pImage && *pImage) log_image(d, device, fx.use, *pImage, is_bc);
-    if (res == VK_SUCCESS && g_gpu_time && pImage && *pImage) // usage as the driver got it (RT_COMPRESS may strip STORAGE)
+    if (res == VK_SUCCESS && (g_gpu_time || g_ct) && pImage && *pImage) // usage as the driver got it (RT_COMPRESS may strip STORAGE)
         img_put(g_img_info, (struct ImgNode){(uint64_t)*pImage, *pImage, pCreateInfo->format, pCreateInfo->extent.width,
                 pCreateInfo->extent.height, 0, pCreateInfo->mipLevels, 0, pCreateInfo->arrayLayers, pCreateInfo->samples,
                 fx.use->usage, NULL});
@@ -5335,7 +5375,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImageView(
     VkDevice device, const VkImageViewCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkImageView *pView) {
     VkResult res = create_image_view(device, pCreateInfo, pAllocator, pView);
-    if (g_gpu_time && res == VK_SUCCESS && pView) {
+    if ((g_gpu_time || g_ct) && res == VK_SUCCESS && pView) {
         struct ImgNode img = {0};
         img_get(g_img_info, (uint64_t)pCreateInfo->image, &img);
         const VkImageSubresourceRange *r = &pCreateInfo->subresourceRange;
@@ -6958,6 +6998,7 @@ static bool gt_skip(struct CmdBufData *c) {
 static bool gt_draw(struct CmdBufData *c, uint32_t vcount, uint32_t icount) {
     if (c && c->async_skip) { atomic_fetch_add(&g_async_skipped, 1); return true; }
     if (gt_skip(c)) return true;
+    if (g_ct && c) { if (c->ct.in_pass) c->ct.draws++; else c->ct.sdraws++; } // cover-trim arm check
     if (!c || !c->dev->gt) return false;
     if (!g_gpu_time) return false; // the async compiles and the pass clamp share the hooks; no records without the switch
     struct GtCnt one = {c->gfx_flags & PF_EQ ? 1 : 0, c->gfx_flags & PF_DW ? 1 : 0, c->gfx_flags & PF_VSW ? 1 : 0,
@@ -6983,6 +7024,10 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdExecuteCommands(VkCommandBuffer cmd,
     GTC(GTC_EXECUTE);
     struct CmdBufData *c = cmd_data(cmd);
     struct DeviceData *d = c ? c->dev : get_device_data_by_cmd(cmd);
+    for (uint32_t i = 0; g_ct && c && c->ct.in_pass && secs && i < count; i++) { // cover-trim: tiler-mode draws
+        struct CmdBufData *s = cmd_data(secs[i]);
+        if (s) c->ct.draws += s->ct.sdraws;
+    }
     if (c && c->gt_rec >= 0 && d->gt) {
         struct GtRec *r = &d->gt->rec[c->gt_rec];
         for (uint32_t i = 0; secs && i < count; i++) {
@@ -7182,6 +7227,10 @@ static void susres_barrier(struct DeviceData *d, VkCommandBuffer cmd, const VkRe
     }
 }
 
+#include "ct/ct_cover_spv.h"
+#include "ct/ct_pred_spv.h"
+#include "cover_trim.h"
+
 static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRendering(VkCommandBuffer cmd, const VkRenderingInfo *ri) {
     GTC(GTC_RENDERING);
     if (ri->flags & VK_RENDERING_SUSPENDING_BIT) atomic_fetch_add(&g_susp_passes, 1);
@@ -7214,11 +7263,13 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRendering(VkCommandBuffer cmd, 
         ri = &clamped;
     }
     gt_render_begin(cmd, ri->renderArea.extent.width, ri->renderArea.extent.height, ri->colorAttachmentCount, ri);
+    if (g_ct) ct_pass_begin(cmd_data(cmd), ri);
     get_device_data_by_cmd(cmd)->gt->fpCmdBeginRendering(cmd, ri);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdEndRendering(VkCommandBuffer cmd) {
     get_device_data_by_cmd(cmd)->gt->fpCmdEndRendering(cmd);
     gt_render_end(cmd);
+    if (g_ct) ct_pass_end(cmd_data(cmd), cmd);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdBeginRenderPass(VkCommandBuffer cmd, const VkRenderPassBeginInfo *bi,
                                                             VkSubpassContents contents) {
@@ -7245,7 +7296,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatch(VkCommandBuffer cmd, uint32
     if (!c) { get_device_data_by_cmd(cmd)->fpCmdDispatch(cmd, x, y, z); return; }
     if (g_dc_on) dc_dispatch(c, cmd, x, y, z);
     int32_t i = gt_begin(c, cmd, GT_DISPATCH, x, y, z, c->compute_pipeline); // "WxH cZ" = the group counts
-    c->dev->fpCmdDispatch(cmd, x, y, z);
+    if (!(g_ct && ct_dispatch(c, cmd, x, y, z))) c->dev->fpCmdDispatch(cmd, x, y, z); // cover-trim: one record, same WxH
     gt_end(c, cmd, i);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDispatchIndirect(VkCommandBuffer cmd, VkBuffer buf, VkDeviceSize off) {
@@ -7262,6 +7313,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDraw(VkCommandBuffer cmd, uint32_t v
     if (fi && ic) atomic_fetch_add(&g_div_draws, 1);
     struct CmdBufData *c = cmd_data(cmd);
     if (gt_draw(c, vc, ic)) return;
+    if (g_ct && c && ct_draw(c, cmd, false, vc, ic, fv, 0, fi)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDraw(cmd, vc, ic, fv, fi);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexed(VkCommandBuffer cmd, uint32_t xc, uint32_t ic, uint32_t fx, int32_t vo,
@@ -7270,6 +7322,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndexed(VkCommandBuffer cmd, uin
     if (fi && ic) atomic_fetch_add(&g_div_draws, 1);
     struct CmdBufData *c = cmd_data(cmd);
     if (gt_draw(c, xc, ic)) return;
+    if (g_ct && c && ct_draw(c, cmd, true, xc, ic, fx, vo, fi)) return;
     (c ? c->dev : get_device_data_by_cmd(cmd))->gt->fpCmdDrawIndexed(cmd, xc, ic, fx, vo, fi);
 }
 static VKAPI_ATTR void VKAPI_CALL compat_CmdDrawIndirect(VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s) {
@@ -7432,6 +7485,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_noatt_w = g_noatt_h = 0;
     if (getenv("MALI_COMPAT_NOATT_AREA") && sscanf(getenv("MALI_COMPAT_NOATT_AREA"), "%ux%u", &g_noatt_w, &g_noatt_h) != 2)
         g_noatt_w = g_noatt_h = 0;
+    ct_parse_env();
     g_skip_hash = getenv("MALI_COMPAT_SKIP_HASH") ? (uint32_t)strtoul(getenv("MALI_COMPAT_SKIP_HASH"), NULL, 16) : 0;
     g_dump_hash_count = 0;
     for (const char *h = getenv("MALI_COMPAT_DUMP_HASH"); h && *h && g_dump_hash_count < 16;) {
@@ -7552,7 +7606,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     // Mask spoofed features before calling down
     VkDeviceCreateInfo mod_ci = *pCreateInfo;
     // VK_EXT_map_memory_placed is the layer's own: keep its name and feature struct away from the driver.
-    const char **ext_names = malloc((pCreateInfo->enabledExtensionCount + 3) * sizeof *ext_names);
+    const char **ext_names = malloc((pCreateInfo->enabledExtensionCount + 4) * sizeof *ext_names);
     if (!ext_names) return VK_ERROR_OUT_OF_HOST_MEMORY;
     mod_ci.enabledExtensionCount = 0;
     bool div_ext = false, div_khr = false;
@@ -7591,6 +7645,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         for (uint32_t i = 0; i < mod_ci.enabledExtensionCount; i++)
             have |= !strcmp(ext_names[i], VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME);
         if (!have) ext_names[mod_ci.enabledExtensionCount++] = VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME;
+    }
+    // cover-trim (MALI_COMPAT_COVER_TRIM): VK_EXT_conditional_rendering and its feature for the layer's predicated
+    // dispatches and draws, when the driver has them; otherwise the feature stays off.
+    bool ct_ext_ok = false;
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT ct_feat = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+                                                               NULL, VK_TRUE, VK_FALSE};
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT *app_ct = (VkPhysicalDeviceConditionalRenderingFeaturesEXT *)find_struct(
+        pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT);
+    VkBool32 app_ct_saved = app_ct ? app_ct->conditionalRendering : VK_FALSE;
+    if (g_ct && inst && inst->fpEnumerateDeviceExtensionProperties && inst->fpGetPhysicalDeviceFeatures2) {
+        uint32_t n = 0;
+        inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &n, NULL);
+        VkExtensionProperties *props = n ? malloc(n * sizeof *props) : NULL;
+        if (props && inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &n, props) >= 0)
+            for (uint32_t i = 0; i < n; i++) ct_ext_ok |= !strcmp(props[i].extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+        free(props);
+        VkPhysicalDeviceConditionalRenderingFeaturesEXT q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 f2q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &q};
+        if (ct_ext_ok) inst->fpGetPhysicalDeviceFeatures2(physicalDevice, &f2q);
+        ct_ext_ok = ct_ext_ok && q.conditionalRendering;
+    }
+    if (g_ct && !ct_ext_ok) fprintf(stderr, "mali-compat: cover-trim: no VK_EXT_conditional_rendering on this device; off\n");
+    if (ct_ext_ok) {
+        bool have = false;
+        for (uint32_t i = 0; i < mod_ci.enabledExtensionCount; i++) have |= !strcmp(ext_names[i], VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+        if (!have) ext_names[mod_ci.enabledExtensionCount++] = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
+        if (app_ct) app_ct->conditionalRendering = VK_TRUE;
+        else { ct_feat.pNext = (void *)mod_ci.pNext; mod_ci.pNext = &ct_feat; }
     }
     mod_ci.ppEnabledExtensionNames = ext_names;
     struct unlinked placed_feat = unlink_struct(&mod_ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT);
@@ -7673,6 +7755,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         }
     }
     VkResult res = fpCreateDevice(physicalDevice, &mod_ci, pAllocator, pDevice);
+    if (app_ct) app_ct->conditionalRendering = app_ct_saved;
     if (app_div) app_div->vertexAttributeInstanceRateZeroDivisor = app_zero_div;
     if (app_icc) app_icc->imageCompressionControl = app_icc_saved;
     relink(placed_feat);
@@ -7786,7 +7869,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         }
         d->fpCreateComputePipelinesReal = (PFN_vkCreateComputePipelines)fpGetDeviceProcAddr(*pDevice, "vkCreateComputePipelines");
         #undef LOAD_DEV
-        if (g_gpu_time || g_async_ms || g_noatt_w || g_no_susres || g_dc_on) gt_init(d, fpGetDeviceProcAddr); // without GPU_TIME: pointers only, no pool
+        if (g_gpu_time || g_async_ms || g_noatt_w || g_no_susres || g_dc_on || g_ct) gt_init(d, fpGetDeviceProcAddr); // without GPU_TIME: pointers only, no pool
+        if (g_ct && ct_ext_ok) ct_device_init(d, fpGetDeviceProcAddr);
         if (g_memlog) {
             d->ml_fpQueueSubmit = (PFN_vkQueueSubmit)fpGetDeviceProcAddr(*pDevice, "vkQueueSubmit");
             d->ml_fpQueueSubmit2 = (PFN_vkQueueSubmit2)fpGetDeviceProcAddr(*pDevice, "vkQueueSubmit2");
@@ -7858,6 +7942,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
     struct DeviceData *d = get_device_data(device);
     if (g_memlog) ml_flush();
     if (d) {
+        ct_device_destroy(d);
         gt_destroy(d);
         pc_destroy(d);
         if (d->bc_init_done) {
@@ -7955,7 +8040,17 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         struct DeviceData *dd = get_device_data(device);
         if (dd && dd->fpCmdSetDepthCompareOp) return (PFN_vkVoidFunction)compat_CmdSetDepthCompareOp;
     }
-    if (g_gpu_time || g_async_ms || g_noatt_w || g_no_susres || g_dc_on) { // GPU timing, async compiles, pass clamp, NO_SUSPEND_RESUME and desc-capture-1 share these hooks
+    if (g_ct) { // cover-trim: the app's scissor and conditional rendering, only when its device state exists
+        struct DeviceData *cd = get_device_data(device);
+        if (cd && cd->ct) {
+            if (!strcmp(pName, "vkCmdSetScissor")) return (PFN_vkVoidFunction)compat_CmdSetScissor;
+            if ((!strcmp(pName, "vkCmdSetScissorWithCount") || !strcmp(pName, "vkCmdSetScissorWithCountEXT")) && cd->ct->SetScissorWithCount)
+                return (PFN_vkVoidFunction)compat_CmdSetScissorWithCount;
+            if (!strcmp(pName, "vkCmdBeginConditionalRenderingEXT") && cd->ct->BeginCond) return (PFN_vkVoidFunction)compat_CmdBeginConditionalRenderingEXT;
+            if (!strcmp(pName, "vkCmdEndConditionalRenderingEXT") && cd->ct->EndCond) return (PFN_vkVoidFunction)compat_CmdEndConditionalRenderingEXT;
+        }
+    }
+    if (g_gpu_time || g_async_ms || g_noatt_w || g_no_susres || g_dc_on || g_ct) { // GPU timing, async compiles, pass clamp, NO_SUSPEND_RESUME, desc-capture-1 and cover-trim share these hooks
         MATCH_DEV_KHR(CmdBeginRendering);
         MATCH_DEV_KHR(CmdEndRendering);
         MATCH_DEV(CmdBeginRenderPass);
@@ -7982,6 +8077,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
                 return (PFN_vkVoidFunction)compat_CmdDispatchBase;
             // GPU timing only: secondary command buffers into their pass, queue-side CPU time
             #define MATCH_GT_NAME(fn, name) if ((g_gpu_time || g_dc_on) && !strcmp(pName, name) && gd->gt->fp##fn) return (PFN_vkVoidFunction)compat_##fn
+            if (g_ct && !strcmp(pName, "vkCmdExecuteCommands") && gd->gt->fpCmdExecuteCommands) return (PFN_vkVoidFunction)compat_CmdExecuteCommands;
             MATCH_GT_NAME(CmdExecuteCommands, "vkCmdExecuteCommands");
             MATCH_GT_NAME(QueueSubmit, "vkQueueSubmit");
             MATCH_GT_NAME(QueueSubmit2, "vkQueueSubmit2");
@@ -7999,7 +8095,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         struct DeviceData *dd = get_device_data(device);
         if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id || g_dc_on)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
     }
-    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp) MATCH_DEV(CreateComputePipelines);
+    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_ct) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
         MATCH_DEV(CreateQueryPool);
         MATCH_DEV(DestroyQueryPool);
