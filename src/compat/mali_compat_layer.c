@@ -1310,11 +1310,32 @@ struct CmdBufData {
     bool async_skip;                // the bound graphics pipeline is still compiling (MALI_COMPAT_ASYNC_PSO)
     struct DcCmd dc;                // desc-capture-1 (MALI_COMPAT_DESC_CAPTURE)
     struct CmdBufData *next;
+    struct CmdBufData *st_next, *st_prev; // on g_staged while it holds decode staging buffers (g_cmdbuf_mutex)
+    bool st_on;
 };
 
 #define CMDBUF_BUCKETS 1024
 static struct CmdBufData *g_cmdbufs[CMDBUF_BUCKETS];
 static pthread_mutex_t g_cmdbuf_mutex = PTHREAD_MUTEX_INITIALIZER;
+// F1 (our-cpu-paths-1105.md) [keeper, Claude Opus 5.5] 2026-11-05: the entries that hold decode staging buffers, so
+// vkResetCommandPool only visits those instead of every bucket and every live command buffer (ER: 15.3 ms/s on the
+// render thread, 79 % of this layer's CPU, all under g_cmdbuf_mutex). Usually empty outside texture streaming.
+static struct CmdBufData *g_staged;
+static void staged_link(struct CmdBufData *e) { // g_cmdbuf_mutex held
+    if (e->st_on) return;
+    e->st_prev = NULL;
+    e->st_next = g_staged;
+    if (g_staged) g_staged->st_prev = e;
+    g_staged = e;
+    e->st_on = true;
+}
+static void staged_unlink(struct CmdBufData *e) { // g_cmdbuf_mutex held
+    if (!e->st_on) return;
+    if (e->st_prev) e->st_prev->st_next = e->st_next; else g_staged = e->st_next;
+    if (e->st_next) e->st_next->st_prev = e->st_prev;
+    e->st_next = e->st_prev = NULL;
+    e->st_on = false;
+}
 // Bumped whenever an entry is freed; a thread's cached entry is only used while the generation is unchanged.
 static _Atomic uint64_t g_cmdbuf_gen;
 static __thread VkCommandBuffer tl_cmd;
@@ -1525,8 +1546,14 @@ static void add_staging_resource(VkCommandBuffer cmd, struct StagingResource res
         struct StagingResource *r = realloc(entry->staging_resources, new_cap * sizeof *r);
         if (r) { entry->staging_resources = r; entry->staging_capacity = new_cap; }
     }
-    if (entry && entry->staging_count < entry->staging_capacity)
+    if (entry && entry->staging_count < entry->staging_capacity) {
         entry->staging_resources[entry->staging_count++] = res;
+        if (!entry->st_on) {
+            pthread_mutex_lock(&g_cmdbuf_mutex);
+            staged_link(entry);
+            pthread_mutex_unlock(&g_cmdbuf_mutex);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2616,6 +2643,7 @@ static void reset_cmd_data(struct DeviceData *dev_data, VkCommandBuffer cmd, boo
     struct CmdBufData **pp = &g_cmdbufs[handle_bucket((uint64_t)(uintptr_t)cmd, CMDBUF_BUCKETS)];
     while (*pp && (*pp)->cmdbuf != cmd) pp = &(*pp)->next;
     struct CmdBufData *e = *pp;
+    if (e) staged_unlink(e);
     if (e && remove) {
         *pp = e->next;
         atomic_fetch_add_explicit(&g_cmdbuf_gen, 1, memory_order_release);
@@ -6179,27 +6207,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateCommandBuffers(
 
 static VKAPI_ATTR VkResult VKAPI_CALL compat_ResetCommandPool(
     VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags) {
+    // F1: only the staging buffers go back here (the pool's command buffers may be begun again only after the GPU is
+    // done with them, and must be: vkBeginCommandBuffer runs reset_cmd_data, which clears the tracked state). So only
+    // the g_staged entries are visited, not the whole table. The pool is externally synchronized with its command
+    // buffers, so no other thread touches these entries meanwhile.
     struct DeviceData *d = get_device_data(device);
     if (d) {
+        struct CmdBufData *mine = NULL;
         pthread_mutex_lock(&g_cmdbuf_mutex);
-        for (int b = 0; b < CMDBUF_BUCKETS; b++) {
-            for (struct CmdBufData *e = g_cmdbufs[b]; e; e = e->next) {
-                if (e->dev == d && e->pool == commandPool) {
-                    for (uint32_t j = 0; j < e->staging_count; j++)
-                        release_staging(d, &e->staging_resources[j]);
-                    e->staging_count = 0;
-                    e->compute_pipeline = VK_NULL_HANDLE;
-                    e->descriptor_buffers = false;
-                    e->push_count = 0;
-                    e->cpd.layout = VK_NULL_HANDLE;
-                    e->gpd.layout = VK_NULL_HANDLE;
-                    e->gfx_pipeline = VK_NULL_HANDLE;
-                    e->gt_rec = -1;
-                    e->gt_src = VK_NULL_HANDLE;
-                }
+        for (struct CmdBufData *e = g_staged, *nx; e; e = nx) {
+            nx = e->st_next;
+            if (e->dev == d && e->pool == commandPool) {
+                staged_unlink(e);
+                e->st_next = mine; // private chain until released below (st_on is false again)
+                mine = e;
             }
         }
         pthread_mutex_unlock(&g_cmdbuf_mutex);
+        for (struct CmdBufData *e = mine, *nx; e; e = nx) {
+            nx = e->st_next;
+            e->st_next = NULL;
+            for (uint32_t j = 0; j < e->staging_count; j++) release_staging(d, &e->staging_resources[j]);
+            e->staging_count = 0;
+        }
     }
     return d ? d->fpResetCommandPool(device, commandPool, flags) : VK_SUCCESS;
 }
@@ -6215,6 +6245,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyCommandPool(
                 struct CmdBufData *e = *pp;
                 if (e->dev == d && e->pool == commandPool) {
                     *pp = e->next;
+                    staged_unlink(e);
                     for (uint32_t j = 0; j < e->staging_count; j++)
                         release_staging(d, &e->staging_resources[j]);
                     free(e->staging_resources);
