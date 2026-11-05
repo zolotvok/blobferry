@@ -206,6 +206,48 @@ static void test_f2(void) {
 }
 #endif
 
+#ifdef TEST_F3
+// F3: per-thread counter slots; exact sums with more threads than slots (the overflow slot uses atomic adds).
+static void *f3_worker(void *arg) {
+    long n = (long)arg;
+    for (long i = 0; i < n; i++) pc2_count(PC2_V1);
+    pc2_count(PC2_DECODES);
+    return NULL;
+}
+static void *f3_shared_worker(void *a) {
+    for (long i = 0; i < 2000000; i++) atomic_fetch_add_explicit((_Atomic uint64_t *)a, 1, memory_order_relaxed);
+    return NULL;
+}
+static void run_threads(int threads, long per) {
+    pthread_t *t = calloc(threads, sizeof *t);
+    for (int i = 0; i < threads; i++) pthread_create(&t[i], NULL, f3_worker, (void *)per);
+    for (int i = 0; i < threads; i++) pthread_join(t[i], NULL);
+    free(t);
+}
+static void test_f3(void) {
+    uint64_t v0 = pc2_sum(PC2_V1), d0 = pc2_sum(PC2_DECODES);
+    uint64_t t0 = now_ns();
+    run_threads(8, 2000000);
+    uint64_t t1 = now_ns();
+    CHECK(pc2_sum(PC2_V1) - v0 == 8ull * 2000000 && pc2_sum(PC2_DECODES) - d0 == 8);
+    run_threads(150, 10000); // past PC2_SLOTS: 87 threads share the last slot
+    CHECK(pc2_sum(PC2_V1) - v0 == 8ull * 2000000 + 150ull * 10000 && pc2_sum(PC2_DECODES) - d0 == 158);
+    CHECK(atomic_load(&g_pc2_nslots) >= PC2_SLOTS);
+    // the old shared atomic, same load, for the timing only
+    static _Atomic uint64_t shared;
+    uint64_t t2 = now_ns();
+    {
+        pthread_t t[8];
+        for (int i = 0; i < 8; i++) pthread_create(&t[i], NULL, f3_shared_worker, &shared);
+        for (int i = 0; i < 8; i++) pthread_join(t[i], NULL);
+    }
+    uint64_t t3 = now_ns();
+    printf("F3 timing, 8 threads x 2M counts: per-thread slots %.1f ms, one shared atomic %.1f ms (host x86, ASan)\n",
+           (t1 - t0) / 1e6, (t3 - t2) / 1e6);
+    printf("F3 checks done\n");
+}
+#endif
+
 int main(void) {
     struct DeviceData *da = add_device(&g_dev_a);
     test_f1(da);

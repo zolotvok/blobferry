@@ -1250,7 +1250,34 @@ struct PushRec {
 // (VK_KHR_maintenance6), which this layer did not hook, so the restore after a BC decode left DXVK's next compute
 // dispatch with the decoder's 56 push bytes. Both entry points now feed the PushRec list above. Cumulative counters,
 // one stderr line every 10 s once any is non-zero (pc2_log_thread).
-static _Atomic uint64_t g_pc2_v1, g_pc2_v2, g_pc2_v2_unrec, g_pc2_decodes, g_pc2_decodes_v2;
+// F3 (our-cpu-paths-1105.md) [keeper, Claude Opus 5.5] 2026-11-05: the counters were five shared atomics, one
+// atomic add per push on one cache line from every recording thread (ER: 0.8 ms/s in __aarch64_ldadd8_relax over 7
+// GXWorker threads). Each thread now counts in its own cache-line slot with a plain load + store (only it writes
+// there); the log thread sums the slots. Threads past PC2_SLOTS - 1 share the last slot with atomic adds.
+enum { PC2_V1, PC2_V2, PC2_V2_UNREC, PC2_DECODES, PC2_DECODES_V2, PC2_N };
+#define PC2_SLOTS 64
+struct Pc2Slot { _Atomic uint64_t n[PC2_N]; } __attribute__((aligned(64)));
+static struct Pc2Slot g_pc2_slot[PC2_SLOTS];
+static _Atomic uint32_t g_pc2_nslots;
+static __thread struct Pc2Slot *tl_pc2;
+static __thread bool tl_pc2_shared;
+static inline void pc2_count(int k) {
+    struct Pc2Slot *s = tl_pc2;
+    if (!s) {
+        uint32_t i = atomic_fetch_add_explicit(&g_pc2_nslots, 1, memory_order_relaxed);
+        if (i >= PC2_SLOTS - 1) { i = PC2_SLOTS - 1; tl_pc2_shared = true; }
+        tl_pc2 = s = &g_pc2_slot[i];
+    }
+    if (tl_pc2_shared)
+        atomic_fetch_add_explicit(&s->n[k], 1, memory_order_relaxed);
+    else
+        atomic_store_explicit(&s->n[k], atomic_load_explicit(&s->n[k], memory_order_relaxed) + 1, memory_order_relaxed);
+}
+static uint64_t pc2_sum(int k) {
+    uint64_t t = 0;
+    for (uint32_t i = 0; i < PC2_SLOTS; i++) t += atomic_load_explicit(&g_pc2_slot[i].n[k], memory_order_relaxed);
+    return t;
+}
 
 // The app's compute push descriptors (vkd3d-proton pushes its root CBVs this way with MALI_COMPAT_VENDOR_ID=5143),
 // merged per binding since the last layout change, so they can be pushed again after a BC decode like the push
@@ -5955,7 +5982,7 @@ static void push_record(struct CmdBufData *c, VkPipelineLayout layout, VkShaderS
 static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
                                                           VkShaderStageFlags stages, uint32_t offset, uint32_t size,
                                                           const void *pValues) {
-    atomic_fetch_add_explicit(&g_pc2_v1, 1, memory_order_relaxed);
+    pc2_count(PC2_V1);
     struct CmdBufData *c = cmd_data(commandBuffer);
     if (!c) {
         get_device_data_by_cmd(commandBuffer)->fpCmdPushConstants(commandBuffer, layout, stages, offset, size, pValues);
@@ -5968,11 +5995,11 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants(VkCommandBuffer comman
 // vkCmdPushConstants2 / vkCmdPushConstants2KHR (pc2-restore-1): recorded like v1. A push with layout VK_NULL_HANDLE
 // (layout given as VkPipelineLayoutCreateInfo in pNext) or past 256 bytes is not recorded, only counted.
 static void push2_common(VkCommandBuffer commandBuffer, const VkPushConstantsInfo *info, bool khr) {
-    atomic_fetch_add_explicit(&g_pc2_v2, 1, memory_order_relaxed);
+    pc2_count(PC2_V2);
     struct CmdBufData *c = cmd_data(commandBuffer);
     struct DeviceData *d = c ? c->dev : get_device_data_by_cmd(commandBuffer);
     if (info && (info->layout == VK_NULL_HANDLE || info->offset + info->size > 256))
-        atomic_fetch_add_explicit(&g_pc2_v2_unrec, 1, memory_order_relaxed);
+        pc2_count(PC2_V2_UNREC);
     else if (c && info)
         push_record(c, info->layout, info->stageFlags, info->offset, info->size, info->pValues, true);
     PFN_vkCmdPushConstants2 fp = khr ? d->fpCmdPushConstants2KHR : d->fpCmdPushConstants2;
@@ -5989,8 +6016,8 @@ static void *pc2_log_thread(void *arg) {
     (void)arg;
     for (;;) {
         sleep(10);
-        unsigned long long v1 = atomic_load(&g_pc2_v1), v2 = atomic_load(&g_pc2_v2), un = atomic_load(&g_pc2_v2_unrec),
-                           dec = atomic_load(&g_pc2_decodes), dv2 = atomic_load(&g_pc2_decodes_v2);
+        unsigned long long v1 = pc2_sum(PC2_V1), v2 = pc2_sum(PC2_V2), un = pc2_sum(PC2_V2_UNREC),
+                           dec = pc2_sum(PC2_DECODES), dv2 = pc2_sum(PC2_DECODES_V2);
         if (v1 | v2 | un | dec | dv2)
             fprintf(stderr, "mali-compat: pc2: v1 pushes %llu, v2 pushes %llu, v2 unrecorded %llu, BC decodes %llu, "
                     "decodes replaying v2 %llu\n", v1, v2, un, dec, dv2);
@@ -6121,8 +6148,8 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
             d->fpCmdPushConstants(commandBuffer, pr->layout, pr->stages, pr->offset, pr->size, pr->data);
         }
     }
-    atomic_fetch_add_explicit(&g_pc2_decodes, 1, memory_order_relaxed);
-    if (replayed_v2) atomic_fetch_add_explicit(&g_pc2_decodes_v2, 1, memory_order_relaxed);
+    pc2_count(PC2_DECODES);
+    if (replayed_v2) pc2_count(PC2_DECODES_V2);
     // Only with MALI_COMPAT_VENDOR_ID: the recorded writes can name image/buffer views the app has destroyed since,
     // and pushing them again crashed Horizon Zero Dawn's benchmark load (C0000005, 2026-10-28 22:49).
     if (g_vendor_id && cstate->cpd.layout && !cstate->cpd.bad && cstate->cpd.count && d->fpCmdPushDescriptorSetKHR)
