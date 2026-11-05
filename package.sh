@@ -6,6 +6,7 @@
 #   Mali_Bridge.zip    the driver zip for DroidDeck's Runtime driver page ("Import Turnip zip...")
 #   install-adb.sh     installs both on a phone over adb (needs a debuggable DroidDeck build: run-as)
 #   INSTALL.txt, SOURCE.txt (commit, submodules, patches), MD5SUMS, LICENSE, NOTICE.md, licenses/{libhybris,vulkan-wsi-layer}/
+# Next to the zip: blobferry-<V>.zip.md5 and blobferry-<V>.zip.sha256 (the release assets, see the end).
 # The vendor Vulkan driver is not in it: the bridge loads the phone's own. [Claude Opus 5.5] 2026-10-28
 set -eu
 B=$(cd "$(dirname "$0")" && pwd)
@@ -111,5 +112,10 @@ EOF
 find "$OUT" -exec touch -h -d "@$T" {} +
 (cd "$B/build/dist" && rm -f "blobferry-$V.zip" && find "blobferry-$V" | LC_ALL=C sort | TZ=UTC zip -q -X -y "blobferry-$V.zip" -@)
 (cd "$B/build/dist" && md5sum "blobferry-$V.zip" > "blobferry-$V.zip.md5")
-ls -l "$B/build/dist/blobferry-$V.zip"; cat "$B/build/dist/blobferry-$V.zip.md5"
+# Release asset contract (DroidDeck's Blobferry updater, gpu/BlobferryReleases + droiddeckctl blobferry install): a
+# GitHub release tagged <V> carries blobferry-<V>.zip and blobferry-<V>.zip.sha256 (sha256sum format); the app checks
+# the sha256 against GitHub's asset digest, then the zip's MD5SUMS, SOURCE.txt and the AArch64 libraries.
+# [app, Claude Opus 5.5] 2026-11-05
+(cd "$B/build/dist" && sha256sum "blobferry-$V.zip" > "blobferry-$V.zip.sha256")
+ls -l "$B/build/dist/blobferry-$V.zip"; cat "$B/build/dist/blobferry-$V.zip.md5" "$B/build/dist/blobferry-$V.zip.sha256"
 unzip -l "$B/build/dist/blobferry-$V.zip"
