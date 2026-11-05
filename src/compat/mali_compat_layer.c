@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #define _GNU_SOURCE
+#include <dlfcn.h> // dladdr (K-WC1 wait callers)
 // Mali Compatibility Layer for DXVK / Proton (VK_LAYER_DROIDDECK_mali_compat)
 // Implements feature masking, polygon mode override, SPIR-V clip/cull distance stripping,
 // BC1-BC7 GPU compute texture emulation via PanVK shaders, and VK_EXT_memory_budget.
@@ -3226,6 +3227,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_EnumerateDeviceExtensionProperties(
 // /root/mali-spv-<hash>.spv when they are created. The timing itself is further down (gt_*).
 // -----------------------------------------------------------------------------
 static bool g_gpu_time;
+static bool g_wait_callers; // MALI_COMPAT_WAIT_CALLERS=1 (with GPU_TIME): who waits on which fence (K-WC1)
 static uint32_t g_dump_hashes[16];
 static uint32_t g_dump_hash_count;
 static uint32_t g_gt_trace; // MALI_COMPAT_GT_TRACE=<hex>: write every pass whose fragment/compute shader has this hash
@@ -6341,6 +6343,114 @@ static void qstat_add(int kind, uint64_t t0, uint32_t cbs) {
     if (cbs) atomic_fetch_add_explicit(&q->cbs, cbs, memory_order_relaxed);
 }
 
+// Wait callers (K-WC1, perf-review request (b), [keeper, Claude Opus 5.5] 2026-11-01), MALI_COMPAT_WAIT_CALLERS=1 with
+// MALI_COMPAT_GPU_TIME=1: every vkWaitForFences / vkWaitSemaphores is counted per (waiting thread, caller address,
+// kind of the waited-for fence, thread that submitted it). The caller is __builtin_return_address(0) as lib+offset
+// (dladdr at report time): winevulkan's thunk for app waits, Arm's WSI layer for its own. A fence is classified at
+// vkQueueSubmit(2): "cmd" = submitted with command buffers, "nocb-wait" = no command buffers but wait semaphores (the
+// WSI layer's present payload and the present fence that DXVK's presenter waits on: VkSwapchainPresentFenceInfo),
+// "nocb" = neither, "untracked" = never seen in a submit; vkWaitSemaphores = "timeline". "age" = wait start minus the
+// fence's submit time: how many frames back the waiter looks. Durations in 8 bins. Printed with each 5-s report.
+enum { WK_UNTRACKED, WK_CMD, WK_NOCB_WAIT, WK_NOCB, WK_TIMELINE, WK_N };
+static const char *const wk_name[WK_N] = {"untracked", "cmd", "nocb-wait", "nocb", "timeline"};
+#define WC_FENCES 2048 // open addressing, power of 2; a full table drops new tags (they wait as "untracked")
+#define WC_MAX 48
+struct WcFence { uint64_t fence, submit_ns; struct QStat *by; uint8_t kind; };
+struct WcStat { struct QStat *who, *by; uintptr_t ra; uint8_t kind; uint64_t n, ns, max_ns, age_ns, age_n, hist[8]; };
+static struct WcFence g_wc_fence[WC_FENCES];
+static struct WcStat g_wc[WC_MAX];
+static uint32_t g_wc_n, g_wc_dropped;
+static pthread_mutex_t g_wc_m = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t wc_slot(uint64_t fence) { return (uint32_t)((fence * 0x9E3779B97F4A7C15ull) >> 40) & (WC_FENCES - 1); }
+static void wc_tag(uint64_t fence, uint8_t kind) {
+    if (!fence) return;
+    struct QStat *by = qstat_self();
+    uint64_t t = now_ns();
+    pthread_mutex_lock(&g_wc_m);
+    for (uint32_t i = wc_slot(fence), k = 0; k < 64; k++, i = (i + 1) & (WC_FENCES - 1)) {
+        struct WcFence *e = &g_wc_fence[i];
+        // a slot is reused once its fence is 10 s old: fences of a destroyed swapchain/device age out
+        if (e->fence == fence || !e->fence || t - e->submit_ns > 10000000000ull) {
+            e->fence = fence; e->submit_ns = t; e->by = by; e->kind = kind;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_wc_m);
+}
+static uint8_t wc_submit_kind(uint32_t cbs, uint32_t waits) { return cbs ? WK_CMD : waits ? WK_NOCB_WAIT : WK_NOCB; }
+static int wc_bin(uint64_t ns) {
+    static const uint64_t edge[7] = {100000, 500000, 1000000, 2000000, 4000000, 8000000, 16000000};
+    int b = 0;
+    while (b < 7 && ns >= edge[b]) b++;
+    return b;
+}
+static void wc_add(uintptr_t ra, uint64_t fence, uint8_t kind, uint64_t t0) {
+    uint64_t t1 = now_ns(), dur = t1 - t0, age = 0;
+    struct QStat *who = qstat_self(), *by = NULL;
+    pthread_mutex_lock(&g_wc_m);
+    if (fence) {
+        for (uint32_t i = wc_slot(fence), k = 0; k < 64; k++, i = (i + 1) & (WC_FENCES - 1)) {
+            struct WcFence *e = &g_wc_fence[i];
+            if (!e->fence) break;
+            if (e->fence == fence) { kind = e->kind; by = e->by; age = t0 > e->submit_ns ? t0 - e->submit_ns : 0; break; }
+        }
+    }
+    struct WcStat *w = NULL;
+    for (uint32_t i = 0; i < g_wc_n; i++)
+        if (g_wc[i].who == who && g_wc[i].ra == ra && g_wc[i].kind == kind && g_wc[i].by == by) { w = &g_wc[i]; break; }
+    if (!w && g_wc_n < WC_MAX) { w = &g_wc[g_wc_n++]; memset(w, 0, sizeof *w); w->who = who; w->ra = ra; w->kind = kind; w->by = by; }
+    if (w) {
+        w->n++; w->ns += dur;
+        if (dur > w->max_ns) w->max_ns = dur;
+        if (by) { w->age_ns += age; w->age_n++; }
+        w->hist[wc_bin(dur)]++;
+    } else {
+        g_wc_dropped++;
+    }
+    pthread_mutex_unlock(&g_wc_m);
+}
+static void wc_caller(uintptr_t ra, char *out, size_t len) {
+    Dl_info di;
+    if (ra && dladdr((void *)ra, &di) && di.dli_fname) {
+        const char *b = strrchr(di.dli_fname, '/');
+        b = b ? b + 1 : di.dli_fname;
+        if (di.dli_sname && di.dli_saddr)
+            snprintf(out, len, "%s+0x%lx (%s+0x%lx)", b, (unsigned long)(ra - (uintptr_t)di.dli_fbase), di.dli_sname,
+                     (unsigned long)(ra - (uintptr_t)di.dli_saddr));
+        else
+            snprintf(out, len, "%s+0x%lx", b, (unsigned long)(ra - (uintptr_t)di.dli_fbase));
+    } else {
+        snprintf(out, len, "0x%lx", (unsigned long)ra);
+    }
+}
+// One line per (waiter, caller, kind, submitter) since the last report, then reset. Called from gt_report.
+static void wc_report(FILE *f, double interval_s) {
+    pthread_mutex_lock(&g_wc_m);
+    for (uint32_t i = 0; i < g_wc_n; i++) {
+        struct WcStat *w = &g_wc[i];
+        if (!w->n) continue;
+        char caller[192];
+        wc_caller(w->ra, caller, sizeof caller);
+        fprintf(f, "wait caller: %s <- %s kind %s", w->who && w->who->comm[0] ? w->who->comm : "?", caller, wk_name[w->kind]);
+        if (w->by) fprintf(f, " (submitted by %s, age %.2f ms)", w->by->comm[0] ? w->by->comm : "?", w->age_ns / 1e6 / w->age_n);
+        fprintf(f, ": n %llu, %.1f ms (%.1f %% of wall), mean %.3f, max %.2f ms | <0.1 %llu <0.5 %llu <1 %llu <2 %llu <4 %llu"
+                   " <8 %llu <16 %llu >=16 %llu\n", (unsigned long long)w->n, w->ns / 1e6,
+                interval_s > 0 ? 100.0 * w->ns / 1e9 / interval_s : 0, w->ns / 1e6 / w->n, w->max_ns / 1e6,
+                (unsigned long long)w->hist[0], (unsigned long long)w->hist[1], (unsigned long long)w->hist[2],
+                (unsigned long long)w->hist[3], (unsigned long long)w->hist[4], (unsigned long long)w->hist[5],
+                (unsigned long long)w->hist[6], (unsigned long long)w->hist[7]);
+    }
+    if (g_wc_dropped) fprintf(f, "wait caller: %u waits not counted (more than %d keys)\n", g_wc_dropped, WC_MAX);
+    // keep the keys (stable order between reports), zero the counters
+    for (uint32_t i = 0; i < g_wc_n; i++) {
+        struct WcStat *w = &g_wc[i];
+        w->n = w->ns = w->max_ns = w->age_ns = w->age_n = 0;
+        memset(w->hist, 0, sizeof w->hist);
+    }
+    g_wc_dropped = 0;
+    pthread_mutex_unlock(&g_wc_m);
+}
+
 // Calls per hooked entry point, printed with each report: shows which draw path the app really uses.
 enum { GTC_DRAW, GTC_DRAW_INDEXED, GTC_DRAW_INDIRECT, GTC_DRAW_INDEXED_INDIRECT, GTC_DRAW_INDIRECT_COUNT,
        GTC_DRAW_INDEXED_INDIRECT_COUNT, GTC_DRAW_MULTI, GTC_DRAW_MULTI_INDEXED, GTC_MESH, GTC_MESH_INDIRECT,
@@ -6613,6 +6723,7 @@ static void gt_report(struct GpuTime *g, double interval_s) {
             fprintf(f, ";");
         }
         if (qany) fprintf(f, "\n");
+        if (g_wait_callers) wc_report(f, interval_s);
         for (uint32_t i = 0; i < n && i < 40; i++) {
             char desc[160], att[256];
             gt_pipe_desc(v[i].pipeline, desc, sizeof desc);
@@ -6895,6 +7006,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_QueueSubmit(VkQueue queue, uint32_t
     uint64_t t0 = now_ns();
     VkResult r = d->gt->fpQueueSubmit(queue, n, si, fence);
     qstat_add(QS_SUBMIT, t0, cbs);
+    if (g_wait_callers && fence) {
+        uint32_t waits = 0;
+        for (uint32_t i = 0; si && i < n; i++) waits += si[i].waitSemaphoreCount;
+        wc_tag((uint64_t)fence, wc_submit_kind(cbs, waits));
+    }
     return r;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL compat_QueueSubmit2(VkQueue queue, uint32_t n, const VkSubmitInfo2 *si, VkFence fence) {
@@ -6905,6 +7021,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_QueueSubmit2(VkQueue queue, uint32_
     uint64_t t0 = now_ns();
     VkResult r = d->gt->fpQueueSubmit2(queue, n, si, fence);
     qstat_add(QS_SUBMIT, t0, cbs);
+    if (g_wait_callers && fence) {
+        uint32_t waits = 0;
+        for (uint32_t i = 0; si && i < n; i++) waits += si[i].waitSemaphoreInfoCount;
+        wc_tag((uint64_t)fence, wc_submit_kind(cbs, waits));
+    }
     return r;
 }
 
@@ -6927,6 +7048,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_WaitForFences(VkDevice device, uint
     uint64_t t0 = now_ns();
     VkResult r = d->gt->fpWaitForFences(device, n, fences, all, timeout);
     qstat_add(QS_WAIT, t0, 0);
+    if (g_wait_callers) wc_add((uintptr_t)__builtin_return_address(0), n && fences ? (uint64_t)fences[0] : 0, WK_UNTRACKED, t0);
     for (uint32_t i = 0; g_dc_on && r == VK_SUCCESS && fences && (all || n == 1) && i < n; i++)
         if (fences[i]) dc_done(true, (uint64_t)fences[i], 0);
     return r;
@@ -6936,6 +7058,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_WaitSemaphores(VkDevice device, con
     uint64_t t0 = now_ns();
     VkResult r = d->gt->fpWaitSemaphores(device, wi, timeout);
     qstat_add(QS_WAIT, t0, 0);
+    if (g_wait_callers) wc_add((uintptr_t)__builtin_return_address(0), 0, WK_TIMELINE, t0);
     for (uint32_t i = 0; g_dc_on && r == VK_SUCCESS && wi && wi->pSemaphores && wi->pValues &&
                          (!(wi->flags & VK_SEMAPHORE_WAIT_ANY_BIT) || wi->semaphoreCount == 1) && i < wi->semaphoreCount; i++)
         dc_done(false, (uint64_t)wi->pSemaphores[i], wi->pValues[i]);
@@ -7238,6 +7361,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     if (rt && !g_rt_compress) rt_keep_load(); // once per process: DXVK creates several instances
     g_rt_compress = rt;
     g_gpu_time = getenv("MALI_COMPAT_GPU_TIME") && strcmp(getenv("MALI_COMPAT_GPU_TIME"), "0") != 0;
+    g_wait_callers = g_gpu_time && getenv("MALI_COMPAT_WAIT_CALLERS") && strcmp(getenv("MALI_COMPAT_WAIT_CALLERS"), "0") != 0;
     { // K-CF2 port + memlog (stage kcs1+kcf2+memlog); the init line is printed once per process, always
         const char *bmb = getenv("MALI_COMPAT_BUDGET_MB");
         unsigned long long mb = bmb ? strtoull(bmb, NULL, 10) : 0;
