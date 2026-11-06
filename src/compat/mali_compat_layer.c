@@ -7829,21 +7829,55 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     }
     mod_ci.ppEnabledExtensionNames = ext_names;
     struct unlinked placed_feat = unlink_struct(&mod_ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT);
+    static const char *kFeatureNames[] = {
+        "robustBufferAccess", "fullDrawIndexUint32", "imageCubeArray", "independentBlend",
+        "geometryShader", "tessellationShader", "sampleRateShading", "dualSrcBlend",
+        "logicOp", "multiDrawIndirect", "drawIndirectFirstInstance", "depthClamp",
+        "depthBiasClamp", "wideLines", "largePoints", "alphaToOne",
+        "multiViewport", "samplerAnisotropy", "textureCompressionETC2", "textureCompressionASTC_LDR",
+        "textureCompressionBC", "occlusionQueryPrecise", "pipelineStatisticsQuery", "vertexPipelineStoresAndAtomics",
+        "fragmentStoresAndAtomics", "shaderTessellationAndGeometryPointSize", "shaderImageGatherExtended", "shaderStorageImageExtendedFormats",
+        "shaderStorageImageMultisample", "shaderStorageImageReadWithoutFormat", "shaderStorageImageWriteWithoutFormat", "shaderUniformBufferArrayDynamicIndexing",
+        "shaderSampledImageArrayDynamicIndexing", "shaderStorageBufferArrayDynamicIndexing", "shaderStorageImageArrayDynamicIndexing", "shaderClipDistance",
+        "shaderCullDistance", "shaderFloat64", "shaderInt64", "shaderInt16",
+        "shaderResourceResidency", "shaderResourceMinLod", "sparseBinding", "sparseResidencyBuffer",
+        "sparseResidencyImage2D", "sparseResidencyImage3D", "sparseResidency2Samples", "sparseResidency4Samples",
+        "sparseResidency8Samples", "sparseResidency16Samples", "sparseResidencyAliased", "variableMultisampleRate",
+        "inheritedQueries"
+    };
+
+    VkPhysicalDeviceFeatures real_features = {0};
+    if (inst && inst->fpGetPhysicalDeviceFeatures) {
+        inst->fpGetPhysicalDeviceFeatures(physicalDevice, &real_features);
+    }
+    const VkBool32 *real_arr = (const VkBool32 *)&real_features;
+
     VkPhysicalDeviceFeatures safe_features;
     if (mod_ci.pEnabledFeatures) {
         safe_features = *mod_ci.pEnabledFeatures;
-        safe_features.textureCompressionBC = VK_FALSE;
-        safe_features.shaderClipDistance = VK_FALSE;
-        safe_features.shaderCullDistance = VK_FALSE;
-        safe_features.fillModeNonSolid = VK_FALSE;
+        VkBool32 *safe_arr = (VkBool32 *)&safe_features;
+        for (size_t i = 0; i < sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32); i++) {
+            if (safe_arr[i] && !real_arr[i]) {
+                const char *fn = (i < sizeof(kFeatureNames)/sizeof(kFeatureNames[0])) ? kFeatureNames[i] : "?";
+                fprintf(stderr, "mali-compat: masking unsupported core feature %s (idx %zu)\n", fn, i);
+                safe_arr[i] = VK_FALSE;
+            }
+        }
         mod_ci.pEnabledFeatures = &safe_features;
     }
 
     // Mask features2 if chained, and check if bufferDeviceAddress is already in pNext
-    VkBool32 saved_bc = VK_FALSE, saved_clip = VK_FALSE, saved_cull = VK_FALSE, saved_fill = VK_FALSE;
+    VkPhysicalDeviceFeatures saved_f2_features;
+    memset(&saved_f2_features, 0, sizeof(saved_f2_features));
     VkPhysicalDeviceFeatures2 *f2 = NULL;
+    VkPhysicalDeviceVulkan11Features *v11_feat = NULL;
+    VkBool32 saved_v11_sb16 = VK_FALSE, saved_v11_usb16 = VK_FALSE, saved_v11_pc16 = VK_FALSE, saved_v11_io16 = VK_FALSE;
     VkPhysicalDeviceVulkan12Features *v12_feat = NULL;
-    VkBool32 saved_v12_bda = VK_FALSE;
+    VkBool32 saved_v12_bda = VK_FALSE, saved_v12_sb8 = VK_FALSE, saved_v12_usb8 = VK_FALSE, saved_v12_pc8 = VK_FALSE;
+    VkPhysicalDevice16BitStorageFeatures *f16 = NULL;
+    VkBool32 saved_f16_sb = VK_FALSE, saved_f16_usb = VK_FALSE, saved_f16_pc = VK_FALSE, saved_f16_io = VK_FALSE;
+    VkPhysicalDevice8BitStorageFeatures *f8 = NULL;
+    VkBool32 saved_f8_sb = VK_FALSE, saved_f8_usb = VK_FALSE, saved_f8_pc = VK_FALSE;
     VkPhysicalDeviceBufferDeviceAddressFeatures *existing_bda = NULL;
     VkBool32 saved_existing_bda = VK_FALSE;
 
@@ -7851,18 +7885,53 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     while (node) {
         if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
             f2 = (VkPhysicalDeviceFeatures2 *)node;
-            saved_bc = f2->features.textureCompressionBC;
-            saved_clip = f2->features.shaderClipDistance;
-            saved_cull = f2->features.shaderCullDistance;
-            saved_fill = f2->features.fillModeNonSolid;
-            f2->features.textureCompressionBC = VK_FALSE;
-            f2->features.shaderClipDistance = VK_FALSE;
-            f2->features.shaderCullDistance = VK_FALSE;
-            f2->features.fillModeNonSolid = VK_FALSE;
+            saved_f2_features = f2->features;
+            VkBool32 *f2_arr = (VkBool32 *)&f2->features;
+            for (size_t i = 0; i < sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32); i++) {
+                if (f2_arr[i] && !real_arr[i]) {
+                    const char *fn = (i < sizeof(kFeatureNames)/sizeof(kFeatureNames[0])) ? kFeatureNames[i] : "?";
+                    fprintf(stderr, "mali-compat: masking unsupported f2 feature %s (idx %zu)\n", fn, i);
+                    f2_arr[i] = VK_FALSE;
+                }
+            }
+        } else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES) {
+            f16 = (VkPhysicalDevice16BitStorageFeatures *)node;
+            saved_f16_sb = f16->storageBuffer16BitAccess;
+            saved_f16_usb = f16->uniformAndStorageBuffer16BitAccess;
+            saved_f16_pc = f16->storagePushConstant16;
+            saved_f16_io = f16->storageInputOutput16;
+            f16->storageBuffer16BitAccess = VK_FALSE;
+            f16->uniformAndStorageBuffer16BitAccess = VK_FALSE;
+            f16->storagePushConstant16 = VK_FALSE;
+            f16->storageInputOutput16 = VK_FALSE;
+        } else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES) {
+            f8 = (VkPhysicalDevice8BitStorageFeatures *)node;
+            saved_f8_sb = f8->storageBuffer8BitAccess;
+            saved_f8_usb = f8->uniformAndStorageBuffer8BitAccess;
+            saved_f8_pc = f8->storagePushConstant8;
+            f8->storageBuffer8BitAccess = VK_FALSE;
+            f8->uniformAndStorageBuffer8BitAccess = VK_FALSE;
+            f8->storagePushConstant8 = VK_FALSE;
+        } else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES) {
+            v11_feat = (VkPhysicalDeviceVulkan11Features *)node;
+            saved_v11_sb16 = v11_feat->storageBuffer16BitAccess;
+            saved_v11_usb16 = v11_feat->uniformAndStorageBuffer16BitAccess;
+            saved_v11_pc16 = v11_feat->storagePushConstant16;
+            saved_v11_io16 = v11_feat->storageInputOutput16;
+            v11_feat->storageBuffer16BitAccess = VK_FALSE;
+            v11_feat->uniformAndStorageBuffer16BitAccess = VK_FALSE;
+            v11_feat->storagePushConstant16 = VK_FALSE;
+            v11_feat->storageInputOutput16 = VK_FALSE;
         } else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
             v12_feat = (VkPhysicalDeviceVulkan12Features *)node;
             saved_v12_bda = v12_feat->bufferDeviceAddress;
             v12_feat->bufferDeviceAddress = VK_TRUE;
+            saved_v12_sb8 = v12_feat->storageBuffer8BitAccess;
+            saved_v12_usb8 = v12_feat->uniformAndStorageBuffer8BitAccess;
+            saved_v12_pc8 = v12_feat->storagePushConstant8;
+            v12_feat->storageBuffer8BitAccess = VK_FALSE;
+            v12_feat->uniformAndStorageBuffer8BitAccess = VK_FALSE;
+            v12_feat->storagePushConstant8 = VK_FALSE;
         } else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) {
             existing_bda = (VkPhysicalDeviceBufferDeviceAddressFeatures *)node;
             saved_existing_bda = existing_bda->bufferDeviceAddress;
@@ -7912,24 +7981,53 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     if (app_div) app_div->vertexAttributeInstanceRateZeroDivisor = app_zero_div;
     if (app_icc) app_icc->imageCompressionControl = app_icc_saved;
     relink(placed_feat);
-    free(ext_names);
 
     // Restore mutated pNext fields
     if (f2) {
-        f2->features.textureCompressionBC = saved_bc;
-        f2->features.shaderClipDistance = saved_clip;
-        f2->features.shaderCullDistance = saved_cull;
-        f2->features.fillModeNonSolid = saved_fill;
+        f2->features = saved_f2_features;
     }
-    if (v12_feat) v12_feat->bufferDeviceAddress = saved_v12_bda;
+    if (f16) {
+        f16->storageBuffer16BitAccess = saved_f16_sb;
+        f16->uniformAndStorageBuffer16BitAccess = saved_f16_usb;
+        f16->storagePushConstant16 = saved_f16_pc;
+        f16->storageInputOutput16 = saved_f16_io;
+    }
+    if (f8) {
+        f8->storageBuffer8BitAccess = saved_f8_sb;
+        f8->uniformAndStorageBuffer8BitAccess = saved_f8_usb;
+        f8->storagePushConstant8 = saved_f8_pc;
+    }
+    if (v11_feat) {
+        v11_feat->storageBuffer16BitAccess = saved_v11_sb16;
+        v11_feat->uniformAndStorageBuffer16BitAccess = saved_v11_usb16;
+        v11_feat->storagePushConstant16 = saved_v11_pc16;
+        v11_feat->storageInputOutput16 = saved_v11_io16;
+    }
+    if (v12_feat) {
+        v12_feat->bufferDeviceAddress = saved_v12_bda;
+        v12_feat->storageBuffer8BitAccess = saved_v12_sb8;
+        v12_feat->uniformAndStorageBuffer8BitAccess = saved_v12_usb8;
+        v12_feat->storagePushConstant8 = saved_v12_pc8;
+    }
     if (existing_bda) existing_bda->bufferDeviceAddress = saved_existing_bda;
     if (v12_feat) v12_feat->hostQueryReset = saved_v12_hqr;
     if (app_hqr) app_hqr->hostQueryReset = saved_app_hqr;
 
     if (res != VK_SUCCESS) {
-        LOG("fpCreateDevice failed: %d", res);
+        fprintf(stderr, "mali-compat: fpCreateDevice failed: %d (enabledExtensionCount=%u)\n", res, mod_ci.enabledExtensionCount);
+        for (uint32_t i = 0; i < mod_ci.enabledExtensionCount; i++) {
+            fprintf(stderr, "mali-compat:   requested ext[%u]: %s\n", i, mod_ci.ppEnabledExtensionNames[i]);
+        }
+        VkBaseOutStructure *curr = (VkBaseOutStructure *)mod_ci.pNext;
+        while (curr) {
+            fprintf(stderr, "mali-compat:   pNext sType: %d\n", curr->sType);
+            curr = curr->pNext;
+        }
+        fflush(stderr);
+        free(ext_names);
         return res;
     }
+    free(ext_names);
 
     pthread_mutex_lock(&g_table_mutex);
     if (g_device_count < MAX_DEVICES) {
