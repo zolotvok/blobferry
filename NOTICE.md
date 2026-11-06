@@ -64,7 +64,8 @@ FEX with this patch must keep FEX's copyright and license notice. Not for upstre
 AI-generated code, see FEX's `AGENTS.md`).
 
 `0002-volatile-metadata-covered-blocks-without-tso.patch` (on top of 0001: blocks inside a PE volatile-metadata range
-with no listed volatile access compile without TSO; `FEX_VOLATILEMETADATACOVERED=0` restores FEX's behaviour) and its
+with no listed volatile access compile without TSO; off by default = FEX's behaviour, `FEX_VOLATILEMETADATACOVERED=1`
+opts in) and its
 test-only harness hook `0002-test-codesizevalidation-volmeta-hook.patch` (FEX's CodeSizeValidation tool, not in any
 shipped DLL) are modifications of FEX's MIT-licensed files in the same way and are offered under the same MIT license.
 

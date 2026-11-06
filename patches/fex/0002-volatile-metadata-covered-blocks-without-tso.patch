@@ -18,8 +18,10 @@ Mcycles/frame.
 
 Change: such blocks get ForceTSOMode::ForceDisabled, except instructions the frontend flags FLAG_FORCE_TSO (mono hacks),
 which keep ForceEnabled. Blocks with a listed access and blocks outside every valid range compile exactly as before.
-New config VolatileMetadataCovered (bool, default true, AffectsCodeGen so the disk cache keeps the two codegens in
-separate buckets); FEX_VOLATILEMETADATACOVERED=0 restores the upstream behaviour.
+New config VolatileMetadataCovered (bool, default false = the upstream behaviour, AffectsCodeGen so the disk cache keeps
+the two codegens in separate buckets); FEX_VOLATILEMETADATACOVERED=1 opts in. Off by default because a module whose
+metadata does not declare all of its lock-free accesses breaks without TSO (Elden Ring: eossdk-win64-shipping.dll no
+longer reached gameplay with the change on).
 
 Local Blobferry/DroidDeck patch, not for upstream submission (FEX does not accept AI-generated code, see AGENTS.md).
 
@@ -28,7 +30,7 @@ Written with AI coding agents, directed and tested by zolotvok: Claude Opus 5.5 
 Gemini 3.8 Flash, Gemini 4 Argon (reviews)
 ---
 diff --git a/FEXCore/Source/Interface/Config/Config.json.in b/FEXCore/Source/Interface/Config/Config.json.in
-index dffc65632..f7f4e1420 100644
+index dffc65632..f9608de17 100644
 --- a/FEXCore/Source/Interface/Config/Config.json.in
 +++ b/FEXCore/Source/Interface/Config/Config.json.in
 @@ -660,6 +660,16 @@
@@ -37,12 +39,12 @@ index dffc65632..f7f4e1420 100644
        },
 +      "VolatileMetadataCovered": {
 +        "Type": "bool",
-+        "Default": "true",
++        "Default": "false",
 +        "AffectsCodeGen": "true",
 +        "Desc": [
 +          "Code inside a volatile metadata valid range (PE metadata or ExtendedVolatileMetadata) that has no listed",
 +          "volatile access is compiled without TSO, as the metadata declares.",
-+          "When disabled, such blocks keep the global TSO options (the upstream behaviour)."
++          "When disabled (the default), such blocks keep the global TSO options (the upstream behaviour)."
 +        ]
 +      },
        "X87ReducedPrecision": {

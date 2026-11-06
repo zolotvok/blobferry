@@ -1,5 +1,6 @@
 Test-only harness hook for 0002 (CodeSizeValidation, not in any shipped DLL). SPDX-License-Identifier: MIT
 FEX_TEST_VOLMETA_RANGE=1 [FEX_TEST_VOLMETA_INST=<off>] [FEX_TEST_VOLMETA_COVERED=0|1] CodeSizeValidation <suite.instcountci> <out.json>
+VolatileMetadataCovered defaults to off (upstream codegen); set FEX_TEST_VOLMETA_COVERED=1 to test the 0002 path.
 ---
 diff --git a/Source/Tools/CodeSizeValidation/Main.cpp b/Source/Tools/CodeSizeValidation/Main.cpp
 index c3ed88f4e..b367d1a98 100644
