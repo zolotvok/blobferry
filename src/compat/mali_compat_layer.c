@@ -965,6 +965,7 @@ struct InstanceData {
     PFN_vkGetPhysicalDeviceMemoryProperties2 fpGetPhysicalDeviceMemoryProperties2;
     PFN_vkCreateDevice fpCreateDevice;
     PFN_vkEnumerateDeviceExtensionProperties fpEnumerateDeviceExtensionProperties;
+    PFN_vkGetPhysicalDeviceProperties fpGetPhysicalDeviceProperties;
     PFN_vkGetPhysicalDeviceProperties2 fpGetPhysicalDeviceProperties2;
 };
 
@@ -2859,7 +2860,45 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
 // get push descriptors ("~15%" there; Mali can only preload UBOs into uniform registers). 5143 flips only that
 // choice: vkd3d's other Qualcomm check also needs driverID TURNIP. The game sees the vendor through DXGI too
 // (dxgi.customVendorId keeps it Arm). [Claude Opus 5.5] 2026-10-28
+// When MALI_COMPAT_VENDOR_ID is set (e.g. 10de for NVIDIA, 1002 for AMD), MALI_COMPAT_DEVICE_ID and
+// MALI_COMPAT_DEVICE_NAME can optionally override the device, or sensible desktop defaults are chosen so native
+// Vulkan games (DOOM Eternal / idTech) recognize the GPU.
 static uint32_t g_vendor_id;
+static uint32_t g_device_id;
+static const char *g_device_name;
+
+static void apply_properties_overrides(VkPhysicalDeviceProperties *p) {
+    p->limits.minTexelBufferOffsetAlignment = 16;
+    if (g_vendor_id) {
+        p->vendorID = g_vendor_id;
+        if (p->limits.maxUniformBufferRange > 65536)
+            p->limits.maxUniformBufferRange = 65536;
+        if (g_device_id) {
+            p->deviceID = g_device_id;
+        } else if (g_vendor_id == 0x10de) {
+            p->deviceID = 0x1eb1; // NVIDIA GeForce RTX 2080
+            p->deviceType = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+            p->driverVersion = (550 << 22) | (54 << 14) | (14 << 6);
+        } else if (g_vendor_id == 0x1002) {
+            p->deviceID = 0x73bf; // AMD Radeon RX 6800
+            p->deviceType = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+            p->driverVersion = (24 << 22) | (3 << 12) | 1;
+        } else if (g_vendor_id == 0x8086) {
+            p->deviceID = 0x56a0; // Intel Arc A770
+            p->deviceType = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+            p->driverVersion = (31 << 22) | (0 << 12) | 101;
+        }
+        if (g_device_name && *g_device_name) {
+            snprintf(p->deviceName, sizeof(p->deviceName), "%s", g_device_name);
+        } else if (g_vendor_id == 0x10de) {
+            snprintf(p->deviceName, sizeof(p->deviceName), "NVIDIA GeForce RTX 2080");
+        } else if (g_vendor_id == 0x1002) {
+            snprintf(p->deviceName, sizeof(p->deviceName), "AMD Radeon RX 6800");
+        } else if (g_vendor_id == 0x8086) {
+            snprintf(p->deviceName, sizeof(p->deviceName), "Intel(R) Arc(TM) A770 Graphics");
+        }
+    }
+}
 // GPU timing diagnostics for instanced vertex input (HZD's missing static meshes, 2026-10-29): this driver has
 // supportsNonZeroFirstInstance = false, so a draw with firstInstance != 0 on a binding whose divisor is not 1 (the
 // emulated zero divisor included) reads undefined instance data. Pipelines and dynamic vertex inputs with such
@@ -2914,19 +2953,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
         drm->primaryMinor = drm->renderMinor = g_drm_minor;
     }
     if (u.node) ((VkPhysicalDeviceMapMemoryPlacedPropertiesEXT *)u.node)->minPlacedMemoryMapAlignment = page_size();
-    // Texel buffer offsets: the vendor reports 64-byte alignment without single-texel alignment, which vkd3d-proton
-    // refuses (HZD: "Lacking support for single texel alignment"). PanVK reports single-texel / 16 bytes on the same
-    // GPU and its buffer descriptors work there, so report what PanVK does. Misaligned storage views are logged in
-    // compat_CreateBufferView to see whether they occur at all. [Claude Opus 5.5]
-    pProperties->properties.limits.minTexelBufferOffsetAlignment = 16;
-    // With the push path vkd3d sizes a root CBV as min(rest of the buffer, maxUniformBufferRange), and this driver
-    // reports 2 GiB, so root CBVs can span whole heap buffers. D3D12 CBVs address at most 64 KiB (NVIDIA/Qualcomm
-    // report that limit): report it too, so vkd3d clamps the range itself. [Claude Opus 5.5] 2026-10-28
-    if (g_vendor_id) {
-        pProperties->properties.vendorID = g_vendor_id;
-        if (pProperties->properties.limits.maxUniformBufferRange > 65536)
-            pProperties->properties.limits.maxUniformBufferRange = 65536;
-    }
+    apply_properties_overrides(&pProperties->properties);
     for (VkBaseOutStructure *h = (VkBaseOutStructure *)pProperties->pNext; h; h = h->pNext) {
         if (h->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES) {
             VkPhysicalDeviceTexelBufferAlignmentProperties *t = (VkPhysicalDeviceTexelBufferAlignmentProperties *)h;
@@ -2950,6 +2977,20 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
         inst->fpGetPhysicalDeviceProperties2(physicalDevice, &p2);
         div->maxVertexAttribDivisor = khr.maxVertexAttribDivisor;
     }
+}
+
+static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties(
+    VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties *pProperties) {
+    struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
+    if (inst && inst->fpGetPhysicalDeviceProperties) {
+        inst->fpGetPhysicalDeviceProperties(physicalDevice, pProperties);
+    } else if (inst && inst->fpGetPhysicalDeviceProperties2) {
+        VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        compat_GetPhysicalDeviceProperties2(physicalDevice, &p2);
+        *pProperties = p2.properties;
+        return;
+    }
+    apply_properties_overrides(pProperties);
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFormatProperties(
@@ -7463,6 +7504,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_spv_fix = getenv("MALI_COMPAT_SPV_FIX") && strcmp(getenv("MALI_COMPAT_SPV_FIX"), "0") != 0;
     g_fake_occlusion = getenv("MALI_COMPAT_FAKE_OCCLUSION") && strcmp(getenv("MALI_COMPAT_FAKE_OCCLUSION"), "0") != 0;
     g_vendor_id = getenv("MALI_COMPAT_VENDOR_ID") ? (uint32_t)strtoul(getenv("MALI_COMPAT_VENDOR_ID"), NULL, 16) : 0;
+    g_device_id = getenv("MALI_COMPAT_DEVICE_ID") ? (uint32_t)strtoul(getenv("MALI_COMPAT_DEVICE_ID"), NULL, 16) : 0;
+    g_device_name = getenv("MALI_COMPAT_DEVICE_NAME");
     // on by default: the write it removes is discarded by the spec anyway (MALI_COMPAT_FRAGDEPTH_FIX=0 turns it off)
     g_fragdepth_fix = !getenv("MALI_COMPAT_FRAGDEPTH_FIX") || strcmp(getenv("MALI_COMPAT_FRAGDEPTH_FIX"), "0") != 0;
     g_gt_trace = getenv("MALI_COMPAT_GT_TRACE") ? (uint32_t)strtoul(getenv("MALI_COMPAT_GT_TRACE"), NULL, 16) : 0;
@@ -7543,6 +7586,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
             inst->fpGetPhysicalDeviceMemoryProperties2 = (PFN_vkGetPhysicalDeviceMemoryProperties2)fpGetInstanceProcAddr(*pInstance, "vkGetPhysicalDeviceMemoryProperties2KHR");
         LOAD_INST(CreateDevice);
         LOAD_INST(EnumerateDeviceExtensionProperties);
+        LOAD_INST(GetPhysicalDeviceProperties);
         LOAD_INST(GetPhysicalDeviceProperties2);
         if (!inst->fpGetPhysicalDeviceProperties2)
             inst->fpGetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)fpGetInstanceProcAddr(*pInstance, "vkGetPhysicalDeviceProperties2KHR");
@@ -8166,6 +8210,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
     MATCH_INST(GetPhysicalDeviceImageFormatProperties2);
     if (!strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2KHR")) return (PFN_vkVoidFunction)compat_GetPhysicalDeviceImageFormatProperties2;
     MATCH_INST(GetPhysicalDeviceMemoryProperties2);
+    MATCH_INST(GetPhysicalDeviceProperties);
     MATCH_INST(GetPhysicalDeviceProperties2);
     if (!strcmp(pName, "vkGetPhysicalDeviceProperties2KHR")) return (PFN_vkVoidFunction)compat_GetPhysicalDeviceProperties2;
     if (!strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2KHR")) return (PFN_vkVoidFunction)compat_GetPhysicalDeviceMemoryProperties2;
