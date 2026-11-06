@@ -7850,6 +7850,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     if (inst && inst->fpGetPhysicalDeviceFeatures) {
         inst->fpGetPhysicalDeviceFeatures(physicalDevice, &real_features);
     }
+    // The real driver's 16/8-bit storage bits: mask only what it lacks. Masking them unconditionally (f7dac02) created the
+    // device WITHOUT features the vendor driver has (Mali-G1 54.1: all 7 true) while the app's SPIR-V still declares
+    // StorageBuffer16BitAccess etc. (DOOM Eternal, vkd3d-proton). [game/doom_eternal, Claude Opus 5.5] 2026-11-06
+    VkPhysicalDevice8BitStorageFeatures rs8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, NULL};
+    VkPhysicalDevice16BitStorageFeatures rs16 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES, &rs8};
+    if (inst && inst->fpGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceFeatures2 rsq = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &rs16};
+        inst->fpGetPhysicalDeviceFeatures2(physicalDevice, &rsq);
+    }
+    fprintf(stderr, "mali-compat: real storage16 %d%d%d%d storage8 %d%d%d (only false bits are masked)\n",
+            rs16.storageBuffer16BitAccess, rs16.uniformAndStorageBuffer16BitAccess, rs16.storagePushConstant16,
+            rs16.storageInputOutput16, rs8.storageBuffer8BitAccess, rs8.uniformAndStorageBuffer8BitAccess,
+            rs8.storagePushConstant8);
     const VkBool32 *real_arr = (const VkBool32 *)&real_features;
 
     VkPhysicalDeviceFeatures safe_features;
@@ -7900,28 +7913,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             saved_f16_usb = f16->uniformAndStorageBuffer16BitAccess;
             saved_f16_pc = f16->storagePushConstant16;
             saved_f16_io = f16->storageInputOutput16;
-            f16->storageBuffer16BitAccess = VK_FALSE;
-            f16->uniformAndStorageBuffer16BitAccess = VK_FALSE;
-            f16->storagePushConstant16 = VK_FALSE;
-            f16->storageInputOutput16 = VK_FALSE;
+            if (!rs16.storageBuffer16BitAccess) f16->storageBuffer16BitAccess = VK_FALSE;
+            if (!rs16.uniformAndStorageBuffer16BitAccess) f16->uniformAndStorageBuffer16BitAccess = VK_FALSE;
+            if (!rs16.storagePushConstant16) f16->storagePushConstant16 = VK_FALSE;
+            if (!rs16.storageInputOutput16) f16->storageInputOutput16 = VK_FALSE;
         } else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES) {
             f8 = (VkPhysicalDevice8BitStorageFeatures *)node;
             saved_f8_sb = f8->storageBuffer8BitAccess;
             saved_f8_usb = f8->uniformAndStorageBuffer8BitAccess;
             saved_f8_pc = f8->storagePushConstant8;
-            f8->storageBuffer8BitAccess = VK_FALSE;
-            f8->uniformAndStorageBuffer8BitAccess = VK_FALSE;
-            f8->storagePushConstant8 = VK_FALSE;
+            if (!rs8.storageBuffer8BitAccess) f8->storageBuffer8BitAccess = VK_FALSE;
+            if (!rs8.uniformAndStorageBuffer8BitAccess) f8->uniformAndStorageBuffer8BitAccess = VK_FALSE;
+            if (!rs8.storagePushConstant8) f8->storagePushConstant8 = VK_FALSE;
         } else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES) {
             v11_feat = (VkPhysicalDeviceVulkan11Features *)node;
             saved_v11_sb16 = v11_feat->storageBuffer16BitAccess;
             saved_v11_usb16 = v11_feat->uniformAndStorageBuffer16BitAccess;
             saved_v11_pc16 = v11_feat->storagePushConstant16;
             saved_v11_io16 = v11_feat->storageInputOutput16;
-            v11_feat->storageBuffer16BitAccess = VK_FALSE;
-            v11_feat->uniformAndStorageBuffer16BitAccess = VK_FALSE;
-            v11_feat->storagePushConstant16 = VK_FALSE;
-            v11_feat->storageInputOutput16 = VK_FALSE;
+            if (!rs16.storageBuffer16BitAccess) v11_feat->storageBuffer16BitAccess = VK_FALSE;
+            if (!rs16.uniformAndStorageBuffer16BitAccess) v11_feat->uniformAndStorageBuffer16BitAccess = VK_FALSE;
+            if (!rs16.storagePushConstant16) v11_feat->storagePushConstant16 = VK_FALSE;
+            if (!rs16.storageInputOutput16) v11_feat->storageInputOutput16 = VK_FALSE;
         } else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
             v12_feat = (VkPhysicalDeviceVulkan12Features *)node;
             saved_v12_bda = v12_feat->bufferDeviceAddress;
@@ -7929,9 +7942,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             saved_v12_sb8 = v12_feat->storageBuffer8BitAccess;
             saved_v12_usb8 = v12_feat->uniformAndStorageBuffer8BitAccess;
             saved_v12_pc8 = v12_feat->storagePushConstant8;
-            v12_feat->storageBuffer8BitAccess = VK_FALSE;
-            v12_feat->uniformAndStorageBuffer8BitAccess = VK_FALSE;
-            v12_feat->storagePushConstant8 = VK_FALSE;
+            if (!rs8.storageBuffer8BitAccess) v12_feat->storageBuffer8BitAccess = VK_FALSE;
+            if (!rs8.uniformAndStorageBuffer8BitAccess) v12_feat->uniformAndStorageBuffer8BitAccess = VK_FALSE;
+            if (!rs8.storagePushConstant8) v12_feat->storagePushConstant8 = VK_FALSE;
         } else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) {
             existing_bda = (VkPhysicalDeviceBufferDeviceAddressFeatures *)node;
             saved_existing_bda = existing_bda->bufferDeviceAddress;
