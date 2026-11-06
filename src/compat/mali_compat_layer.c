@@ -983,6 +983,8 @@ struct BCNode { struct TrackedBCImage t; struct BCNode *next; };
 #define BC_BUCKETS 4096
 static struct BCNode *g_bc_images[BC_BUCKETS];
 static pthread_mutex_t g_bc_image_mutex = PTHREAD_MUTEX_INITIALIZER;
+// F2: tracked BC images; while 0 (games without BC textures, or before the first one) find_bc_image takes no lock.
+static _Atomic uint32_t g_bc_image_n;
 
 static uint32_t handle_bucket(uint64_t v, uint32_t n) { return (uint32_t)((v ^ (v >> 17) ^ (v >> 33)) % n); }
 
@@ -994,11 +996,14 @@ static void register_bc_image(VkImage img, VkFormat orig, VkFormat decoded, VkEx
     uint32_t bkt = handle_bucket((uint64_t)(uintptr_t)img, BC_BUCKETS);
     e->next = g_bc_images[bkt];
     g_bc_images[bkt] = e;
+    atomic_fetch_add_explicit(&g_bc_image_n, 1, memory_order_release);
     pthread_mutex_unlock(&g_bc_image_mutex);
 }
 
 // Copies the entry out (the node can be freed by another thread's vkDestroyImage).
 static bool find_bc_image(VkImage img, struct TrackedBCImage *out) {
+    // the image was created before the app records a copy to it (app-side ordering), so its count is visible here
+    if (!atomic_load_explicit(&g_bc_image_n, memory_order_acquire)) return false;
     bool found = false;
     pthread_mutex_lock(&g_bc_image_mutex);
     for (struct BCNode *e = g_bc_images[handle_bucket((uint64_t)(uintptr_t)img, BC_BUCKETS)]; e; e = e->next)
@@ -1012,7 +1017,10 @@ static void unregister_bc_image(VkImage img) {
     struct BCNode **pp = &g_bc_images[handle_bucket((uint64_t)(uintptr_t)img, BC_BUCKETS)];
     while (*pp && (*pp)->t.image != img) pp = &(*pp)->next;
     struct BCNode *e = *pp;
-    if (e) *pp = e->next;
+    if (e) {
+        *pp = e->next;
+        atomic_fetch_sub_explicit(&g_bc_image_n, 1, memory_order_relaxed);
+    }
     pthread_mutex_unlock(&g_bc_image_mutex);
     free(e);
 }
@@ -1243,7 +1251,34 @@ struct PushRec {
 // (VK_KHR_maintenance6), which this layer did not hook, so the restore after a BC decode left DXVK's next compute
 // dispatch with the decoder's 56 push bytes. Both entry points now feed the PushRec list above. Cumulative counters,
 // one stderr line every 10 s once any is non-zero (pc2_log_thread).
-static _Atomic uint64_t g_pc2_v1, g_pc2_v2, g_pc2_v2_unrec, g_pc2_decodes, g_pc2_decodes_v2;
+// F3 (our-cpu-paths-1105.md) [keeper, Claude Opus 5.5] 2026-11-05: the counters were five shared atomics, one
+// atomic add per push on one cache line from every recording thread (ER: 0.8 ms/s in __aarch64_ldadd8_relax over 7
+// GXWorker threads). Each thread now counts in its own cache-line slot with a plain load + store (only it writes
+// there); the log thread sums the slots. Threads past PC2_SLOTS - 1 share the last slot with atomic adds.
+enum { PC2_V1, PC2_V2, PC2_V2_UNREC, PC2_DECODES, PC2_DECODES_V2, PC2_N };
+#define PC2_SLOTS 64
+struct Pc2Slot { _Atomic uint64_t n[PC2_N]; } __attribute__((aligned(64)));
+static struct Pc2Slot g_pc2_slot[PC2_SLOTS];
+static _Atomic uint32_t g_pc2_nslots;
+static __thread struct Pc2Slot *tl_pc2;
+static __thread bool tl_pc2_shared;
+static inline void pc2_count(int k) {
+    struct Pc2Slot *s = tl_pc2;
+    if (!s) {
+        uint32_t i = atomic_fetch_add_explicit(&g_pc2_nslots, 1, memory_order_relaxed);
+        if (i >= PC2_SLOTS - 1) { i = PC2_SLOTS - 1; tl_pc2_shared = true; }
+        tl_pc2 = s = &g_pc2_slot[i];
+    }
+    if (tl_pc2_shared)
+        atomic_fetch_add_explicit(&s->n[k], 1, memory_order_relaxed);
+    else
+        atomic_store_explicit(&s->n[k], atomic_load_explicit(&s->n[k], memory_order_relaxed) + 1, memory_order_relaxed);
+}
+static uint64_t pc2_sum(int k) {
+    uint64_t t = 0;
+    for (uint32_t i = 0; i < PC2_SLOTS; i++) t += atomic_load_explicit(&g_pc2_slot[i].n[k], memory_order_relaxed);
+    return t;
+}
 
 // The app's compute push descriptors (vkd3d-proton pushes its root CBVs this way with MALI_COMPAT_VENDOR_ID=5143),
 // merged per binding since the last layout change, so they can be pushed again after a BC decode like the push
@@ -1322,11 +1357,32 @@ struct CmdBufData {
     struct DcCmd dc;                // desc-capture-1 (MALI_COMPAT_DESC_CAPTURE)
     struct CtCmd ct;                // cover-trim (MALI_COMPAT_COVER_TRIM)
     struct CmdBufData *next;
+    struct CmdBufData *st_next, *st_prev; // on g_staged while it holds decode staging buffers (g_cmdbuf_mutex)
+    bool st_on;
 };
 
 #define CMDBUF_BUCKETS 1024
 static struct CmdBufData *g_cmdbufs[CMDBUF_BUCKETS];
 static pthread_mutex_t g_cmdbuf_mutex = PTHREAD_MUTEX_INITIALIZER;
+// F1 (our-cpu-paths-1105.md) [keeper, Claude Opus 5.5] 2026-11-05: the entries that hold decode staging buffers, so
+// vkResetCommandPool only visits those instead of every bucket and every live command buffer (ER: 15.3 ms/s on the
+// render thread, 79 % of this layer's CPU, all under g_cmdbuf_mutex). Usually empty outside texture streaming.
+static struct CmdBufData *g_staged;
+static void staged_link(struct CmdBufData *e) { // g_cmdbuf_mutex held
+    if (e->st_on) return;
+    e->st_prev = NULL;
+    e->st_next = g_staged;
+    if (g_staged) g_staged->st_prev = e;
+    g_staged = e;
+    e->st_on = true;
+}
+static void staged_unlink(struct CmdBufData *e) { // g_cmdbuf_mutex held
+    if (!e->st_on) return;
+    if (e->st_prev) e->st_prev->st_next = e->st_next; else g_staged = e->st_next;
+    if (e->st_next) e->st_next->st_prev = e->st_prev;
+    e->st_next = e->st_prev = NULL;
+    e->st_on = false;
+}
 // Bumped whenever an entry is freed; a thread's cached entry is only used while the generation is unchanged.
 static _Atomic uint64_t g_cmdbuf_gen;
 static __thread VkCommandBuffer tl_cmd;
@@ -1467,42 +1523,55 @@ static struct InstanceData *get_instance_by_phys_dev(VkPhysicalDevice phys_dev) 
     return fallback;
 }
 
+// F2 (our-cpu-paths-1105.md) [keeper, Claude Opus 5.5] 2026-11-05: the device lookups ran under g_table_mutex on
+// every call (Begin/Reset, submits, waits, maps, copies, every cmd_data miss: ~16 k lock ops/s on WD1's dxvk-cs). Each
+// thread now keeps its last hit, valid while the table generation is unchanged; vkCreateDevice / vkDestroyDevice
+// bump it under the mutex (the destroy compacts the array, so every cached pointer is dropped). A pointer handed out
+// can go stale on a concurrent destroy exactly as before (the old code returned it after unlocking too). Fallbacks
+// (no match) are not cached.
+static _Atomic uint64_t g_dev_gen = 1;
+#define DEV_TABLE_CHANGED() atomic_fetch_add_explicit(&g_dev_gen, 1, memory_order_release) // g_table_mutex held
+static __thread VkDevice tl_dev_h;
+static __thread struct DeviceData *tl_dev_by_h;
+static __thread uint64_t tl_dev_h_gen;
+static __thread void *tl_dev_key;
+static __thread struct DeviceData *tl_dev_by_key;
+static __thread uint64_t tl_dev_key_gen;
+
 static struct DeviceData *get_device_data(VkDevice dev) {
+    if (dev && tl_dev_h == dev && tl_dev_h_gen == atomic_load_explicit(&g_dev_gen, memory_order_acquire)) return tl_dev_by_h;
+    struct DeviceData *hit = NULL;
     pthread_mutex_lock(&g_table_mutex);
-    for (int32_t i = (int32_t)g_device_count - 1; i >= 0; i--) {
-        if (g_devices[i].device == dev) {
-            pthread_mutex_unlock(&g_table_mutex);
-            return &g_devices[i];
-        }
-    }
+    for (int32_t i = (int32_t)g_device_count - 1; i >= 0 && !hit; i--)
+        if (g_devices[i].device == dev) hit = &g_devices[i];
     void *key = dev ? *(void **)dev : NULL;
-    if (key) {
-        for (int32_t i = (int32_t)g_device_count - 1; i >= 0; i--) {
-            if (g_devices[i].dispatch_key == key) {
-                pthread_mutex_unlock(&g_table_mutex);
-                return &g_devices[i];
-            }
-        }
+    for (int32_t i = (int32_t)g_device_count - 1; key && i >= 0 && !hit; i--)
+        if (g_devices[i].dispatch_key == key) hit = &g_devices[i];
+    struct DeviceData *r = hit ? hit : g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
+    if (hit) {
+        tl_dev_h = dev;
+        tl_dev_by_h = hit;
+        tl_dev_h_gen = atomic_load_explicit(&g_dev_gen, memory_order_relaxed);
     }
-    struct DeviceData *fallback = g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
     pthread_mutex_unlock(&g_table_mutex);
-    return fallback;
+    return r;
 }
 
 static struct DeviceData *get_device_data_by_cmd(VkCommandBuffer cmd) {
-    pthread_mutex_lock(&g_table_mutex);
     void *key = cmd ? *(void **)cmd : NULL;
-    if (key) {
-        for (int32_t i = (int32_t)g_device_count - 1; i >= 0; i--) {
-            if (g_devices[i].dispatch_key == key) {
-                pthread_mutex_unlock(&g_table_mutex);
-                return &g_devices[i];
-            }
-        }
+    if (key && tl_dev_key == key && tl_dev_key_gen == atomic_load_explicit(&g_dev_gen, memory_order_acquire)) return tl_dev_by_key;
+    struct DeviceData *hit = NULL;
+    pthread_mutex_lock(&g_table_mutex);
+    for (int32_t i = (int32_t)g_device_count - 1; key && i >= 0 && !hit; i--)
+        if (g_devices[i].dispatch_key == key) hit = &g_devices[i];
+    struct DeviceData *r = hit ? hit : g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
+    if (hit) {
+        tl_dev_key = key;
+        tl_dev_by_key = hit;
+        tl_dev_key_gen = atomic_load_explicit(&g_dev_gen, memory_order_relaxed);
     }
-    struct DeviceData *fallback = g_device_count > 0 ? &g_devices[g_device_count - 1] : NULL;
     pthread_mutex_unlock(&g_table_mutex);
-    return fallback;
+    return r;
 }
 
 static struct DeviceData *get_device_data_by_cmd(VkCommandBuffer cmd);
@@ -1538,8 +1607,14 @@ static void add_staging_resource(VkCommandBuffer cmd, struct StagingResource res
         struct StagingResource *r = realloc(entry->staging_resources, new_cap * sizeof *r);
         if (r) { entry->staging_resources = r; entry->staging_capacity = new_cap; }
     }
-    if (entry && entry->staging_count < entry->staging_capacity)
+    if (entry && entry->staging_count < entry->staging_capacity) {
         entry->staging_resources[entry->staging_count++] = res;
+        if (!entry->st_on) {
+            pthread_mutex_lock(&g_cmdbuf_mutex);
+            staged_link(entry);
+            pthread_mutex_unlock(&g_cmdbuf_mutex);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2629,6 +2704,7 @@ static void reset_cmd_data(struct DeviceData *dev_data, VkCommandBuffer cmd, boo
     struct CmdBufData **pp = &g_cmdbufs[handle_bucket((uint64_t)(uintptr_t)cmd, CMDBUF_BUCKETS)];
     while (*pp && (*pp)->cmdbuf != cmd) pp = &(*pp)->next;
     struct CmdBufData *e = *pp;
+    if (e) staged_unlink(e);
     if (e && remove) {
         *pp = e->next;
         atomic_fetch_add_explicit(&g_cmdbuf_gen, 1, memory_order_release);
@@ -6096,7 +6172,7 @@ static void push_record(struct CmdBufData *c, VkPipelineLayout layout, VkShaderS
 static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
                                                           VkShaderStageFlags stages, uint32_t offset, uint32_t size,
                                                           const void *pValues) {
-    atomic_fetch_add_explicit(&g_pc2_v1, 1, memory_order_relaxed);
+    pc2_count(PC2_V1);
     struct CmdBufData *c = cmd_data(commandBuffer);
     if (!c) {
         get_device_data_by_cmd(commandBuffer)->fpCmdPushConstants(commandBuffer, layout, stages, offset, size, pValues);
@@ -6109,11 +6185,11 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants(VkCommandBuffer comman
 // vkCmdPushConstants2 / vkCmdPushConstants2KHR (pc2-restore-1): recorded like v1. A push with layout VK_NULL_HANDLE
 // (layout given as VkPipelineLayoutCreateInfo in pNext) or past 256 bytes is not recorded, only counted.
 static void push2_common(VkCommandBuffer commandBuffer, const VkPushConstantsInfo *info, bool khr) {
-    atomic_fetch_add_explicit(&g_pc2_v2, 1, memory_order_relaxed);
+    pc2_count(PC2_V2);
     struct CmdBufData *c = cmd_data(commandBuffer);
     struct DeviceData *d = c ? c->dev : get_device_data_by_cmd(commandBuffer);
     if (info && (info->layout == VK_NULL_HANDLE || info->offset + info->size > 256))
-        atomic_fetch_add_explicit(&g_pc2_v2_unrec, 1, memory_order_relaxed);
+        pc2_count(PC2_V2_UNREC);
     else if (c && info)
         push_record(c, info->layout, info->stageFlags, info->offset, info->size, info->pValues, true);
     PFN_vkCmdPushConstants2 fp = khr ? d->fpCmdPushConstants2KHR : d->fpCmdPushConstants2;
@@ -6130,8 +6206,8 @@ static void *pc2_log_thread(void *arg) {
     (void)arg;
     for (;;) {
         sleep(10);
-        unsigned long long v1 = atomic_load(&g_pc2_v1), v2 = atomic_load(&g_pc2_v2), un = atomic_load(&g_pc2_v2_unrec),
-                           dec = atomic_load(&g_pc2_decodes), dv2 = atomic_load(&g_pc2_decodes_v2);
+        unsigned long long v1 = pc2_sum(PC2_V1), v2 = pc2_sum(PC2_V2), un = pc2_sum(PC2_V2_UNREC),
+                           dec = pc2_sum(PC2_DECODES), dv2 = pc2_sum(PC2_DECODES_V2);
         if (v1 | v2 | un | dec | dv2)
             fprintf(stderr, "mali-compat: pc2: v1 pushes %llu, v2 pushes %llu, v2 unrecorded %llu, BC decodes %llu, "
                     "decodes replaying v2 %llu\n", v1, v2, un, dec, dv2);
@@ -6262,8 +6338,8 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
             d->fpCmdPushConstants(commandBuffer, pr->layout, pr->stages, pr->offset, pr->size, pr->data);
         }
     }
-    atomic_fetch_add_explicit(&g_pc2_decodes, 1, memory_order_relaxed);
-    if (replayed_v2) atomic_fetch_add_explicit(&g_pc2_decodes_v2, 1, memory_order_relaxed);
+    pc2_count(PC2_DECODES);
+    if (replayed_v2) pc2_count(PC2_DECODES_V2);
     // Only with MALI_COMPAT_VENDOR_ID: the recorded writes can name image/buffer views the app has destroyed since,
     // and pushing them again crashed Horizon Zero Dawn's benchmark load (C0000005, 2026-10-28 22:49).
     if (g_vendor_id && cstate->cpd.layout && !cstate->cpd.bad && cstate->cpd.count && d->fpCmdPushDescriptorSetKHR)
@@ -6369,27 +6445,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateCommandBuffers(
 
 static VKAPI_ATTR VkResult VKAPI_CALL compat_ResetCommandPool(
     VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags) {
+    // F1: only the staging buffers go back here (the pool's command buffers may be begun again only after the GPU is
+    // done with them, and must be: vkBeginCommandBuffer runs reset_cmd_data, which clears the tracked state). So only
+    // the g_staged entries are visited, not the whole table. The pool is externally synchronized with its command
+    // buffers, so no other thread touches these entries meanwhile.
     struct DeviceData *d = get_device_data(device);
     if (d) {
+        struct CmdBufData *mine = NULL;
         pthread_mutex_lock(&g_cmdbuf_mutex);
-        for (int b = 0; b < CMDBUF_BUCKETS; b++) {
-            for (struct CmdBufData *e = g_cmdbufs[b]; e; e = e->next) {
-                if (e->dev == d && e->pool == commandPool) {
-                    for (uint32_t j = 0; j < e->staging_count; j++)
-                        release_staging(d, &e->staging_resources[j]);
-                    e->staging_count = 0;
-                    e->compute_pipeline = VK_NULL_HANDLE;
-                    e->descriptor_buffers = false;
-                    e->push_count = 0;
-                    e->cpd.layout = VK_NULL_HANDLE;
-                    e->gpd.layout = VK_NULL_HANDLE;
-                    e->gfx_pipeline = VK_NULL_HANDLE;
-                    e->gt_rec = -1;
-                    e->gt_src = VK_NULL_HANDLE;
-                }
+        for (struct CmdBufData *e = g_staged, *nx; e; e = nx) {
+            nx = e->st_next;
+            if (e->dev == d && e->pool == commandPool) {
+                staged_unlink(e);
+                e->st_next = mine; // private chain until released below (st_on is false again)
+                mine = e;
             }
         }
         pthread_mutex_unlock(&g_cmdbuf_mutex);
+        for (struct CmdBufData *e = mine, *nx; e; e = nx) {
+            nx = e->st_next;
+            e->st_next = NULL;
+            for (uint32_t j = 0; j < e->staging_count; j++) release_staging(d, &e->staging_resources[j]);
+            e->staging_count = 0;
+        }
     }
     return d ? d->fpResetCommandPool(device, commandPool, flags) : VK_SUCCESS;
 }
@@ -6405,6 +6483,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyCommandPool(
                 struct CmdBufData *e = *pp;
                 if (e->dev == d && e->pool == commandPool) {
                     *pp = e->next;
+                    staged_unlink(e);
                     for (uint32_t j = 0; j < e->staging_count; j++)
                         release_staging(d, &e->staging_resources[j]);
                     free(e->staging_resources);
@@ -8195,6 +8274,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             if (pthread_create(&t, NULL, pc2_log_thread, NULL) == 0) pthread_detach(t);
         }
     }
+    DEV_TABLE_CHANGED();
     pthread_mutex_unlock(&g_table_mutex);
 
     LOG("created VkDevice %p (key=%p)", (void *)*pDevice, *pDevice ? *(void **)*pDevice : NULL);
@@ -8232,6 +8312,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
                 break;
             }
         }
+        DEV_TABLE_CHANGED();
         pthread_mutex_unlock(&g_table_mutex);
     }
 }
