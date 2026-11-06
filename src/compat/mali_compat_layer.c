@@ -2869,6 +2869,8 @@ static const char *g_device_name;
 
 static void apply_properties_overrides(VkPhysicalDeviceProperties *p) {
     p->limits.minTexelBufferOffsetAlignment = 16;
+    if (p->limits.minStorageBufferOffsetAlignment > 16)
+        p->limits.minStorageBufferOffsetAlignment = 16;
     if (g_vendor_id) {
         p->vendorID = g_vendor_id;
         if (p->limits.maxUniformBufferRange > 65536)
@@ -2965,6 +2967,32 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
             v->storageTexelBufferOffsetAlignmentBytes = 16;
             v->storageTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
             v->uniformTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
+        } else if (h->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES) {
+            VkPhysicalDeviceSubgroupProperties *s = (VkPhysicalDeviceSubgroupProperties *)h;
+            s->supportedStages |= (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_GEOMETRY_BIT |
+                                   VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
+            s->supportedOperations |= (VK_SUBGROUP_FEATURE_BASIC_BIT |
+                                       VK_SUBGROUP_FEATURE_VOTE_BIT |
+                                       VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
+                                       VK_SUBGROUP_FEATURE_BALLOT_BIT |
+                                       VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+                                       VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
+                                       VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
+                                       VK_SUBGROUP_FEATURE_QUAD_BIT);
+        } else if (h->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES) {
+            VkPhysicalDeviceVulkan11Properties *v11 = (VkPhysicalDeviceVulkan11Properties *)h;
+            v11->subgroupSupportedStages |= (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                             VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_GEOMETRY_BIT |
+                                             VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
+            v11->subgroupSupportedOperations |= (VK_SUBGROUP_FEATURE_BASIC_BIT |
+                                                 VK_SUBGROUP_FEATURE_VOTE_BIT |
+                                                 VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
+                                                 VK_SUBGROUP_FEATURE_BALLOT_BIT |
+                                                 VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+                                                 VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
+                                                 VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
+                                                 VK_SUBGROUP_FEATURE_QUAD_BIT);
         }
     }
     // VK_EXT_vertex_attribute_divisor properties from the vendor's KHR struct.
