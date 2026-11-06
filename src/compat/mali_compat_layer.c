@@ -2850,6 +2850,29 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
             mp->memoryMapPlaced = VK_TRUE;
             mp->memoryMapRangePlaced = VK_FALSE;
             mp->memoryUnmapReserve = VK_TRUE;
+        } else if (header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES) {
+            // DOOM Eternal (idTech 7) checks storageBuffer16BitAccess via vkGetPhysicalDeviceFeatures2.
+            VkPhysicalDevice16BitStorageFeatures *f16 = (VkPhysicalDevice16BitStorageFeatures *)header;
+            f16->storageBuffer16BitAccess = VK_TRUE;
+            f16->uniformAndStorageBuffer16BitAccess = VK_TRUE;
+            f16->storagePushConstant16 = VK_TRUE;
+            f16->storageInputOutput16 = VK_TRUE;
+        } else if (header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES) {
+            VkPhysicalDevice8BitStorageFeatures *f8 = (VkPhysicalDevice8BitStorageFeatures *)header;
+            f8->storageBuffer8BitAccess = VK_TRUE;
+            f8->uniformAndStorageBuffer8BitAccess = VK_TRUE;
+            f8->storagePushConstant8 = VK_TRUE;
+        } else if (header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES) {
+            VkPhysicalDeviceVulkan11Features *v11 = (VkPhysicalDeviceVulkan11Features *)header;
+            v11->storageBuffer16BitAccess = VK_TRUE;
+            v11->uniformAndStorageBuffer16BitAccess = VK_TRUE;
+            v11->storagePushConstant16 = VK_TRUE;
+            v11->storageInputOutput16 = VK_TRUE;
+        } else if (header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+            VkPhysicalDeviceVulkan12Features *v12 = (VkPhysicalDeviceVulkan12Features *)header;
+            v12->storageBuffer8BitAccess = VK_TRUE;
+            v12->uniformAndStorageBuffer8BitAccess = VK_TRUE;
+            v12->storagePushConstant8 = VK_TRUE;
         }
         header = header->pNext;
     }
@@ -3021,10 +3044,23 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties(
     apply_properties_overrides(pProperties);
 }
 
+static inline bool is_yuv_nv12(VkFormat f) {
+    return f == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM || f == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
+}
+
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFormatProperties(
     VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties *pFormatProperties) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
     if (!inst || !inst->fpGetPhysicalDeviceFormatProperties) return;
+    if (is_yuv_nv12(format)) {
+        inst->fpGetPhysicalDeviceFormatProperties(physicalDevice, format, pFormatProperties);
+        pFormatProperties->optimalTilingFeatures |= (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                    VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                                    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                                    VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
+                                                    VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT);
+        return;
+    }
     if (panvk_format_is_bc(format)) {
         VkFormat decoded = panvk_bc_decoded_format(format);
         inst->fpGetPhysicalDeviceFormatProperties(physicalDevice, decoded, pFormatProperties);
@@ -3043,6 +3079,15 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFormatProperties2(
     VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties2 *pFormatProperties) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
     if (!inst || !inst->fpGetPhysicalDeviceFormatProperties2) return;
+    if (is_yuv_nv12(format)) {
+        inst->fpGetPhysicalDeviceFormatProperties2(physicalDevice, format, pFormatProperties);
+        pFormatProperties->formatProperties.optimalTilingFeatures |= (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                                     VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                                                     VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                                                     VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
+                                                                     VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT);
+        return;
+    }
     if (panvk_format_is_bc(format)) {
         VkFormat decoded = panvk_bc_decoded_format(format);
         inst->fpGetPhysicalDeviceFormatProperties2(physicalDevice, decoded, pFormatProperties);
@@ -3062,6 +3107,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_GetPhysicalDeviceImageFormatPropert
     VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties *pImageFormatProperties) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
     if (!inst || !inst->fpGetPhysicalDeviceImageFormatProperties) return VK_ERROR_INITIALIZATION_FAILED;
+    if (is_yuv_nv12(format)) {
+        VkResult r = inst->fpGetPhysicalDeviceImageFormatProperties(
+            physicalDevice, format, type, tiling, usage, flags, pImageFormatProperties);
+        if (r != VK_SUCCESS && pImageFormatProperties) {
+            pImageFormatProperties->maxExtent = (VkExtent3D){4096, 4096, 1};
+            pImageFormatProperties->maxMipLevels = 1;
+            pImageFormatProperties->maxArrayLayers = 1;
+            pImageFormatProperties->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+            pImageFormatProperties->maxResourceSize = 4096 * 4096 * 2;
+            return VK_SUCCESS;
+        }
+        return r;
+    }
     if (panvk_format_is_bc(format)) {
         format = panvk_bc_decoded_format(format);
         flags &= ~VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
@@ -3165,6 +3223,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_GetPhysicalDeviceImageFormatPropert
     VkImageFormatProperties2 *pImageFormatProperties) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
     if (!inst || !inst->fpGetPhysicalDeviceImageFormatProperties2) return VK_ERROR_INITIALIZATION_FAILED;
+    if (is_yuv_nv12(pImageFormatInfo->format)) {
+        VkResult r = inst->fpGetPhysicalDeviceImageFormatProperties2(physicalDevice, pImageFormatInfo, pImageFormatProperties);
+        if (r != VK_SUCCESS && pImageFormatProperties) {
+            pImageFormatProperties->imageFormatProperties.maxExtent = (VkExtent3D){4096, 4096, 1};
+            pImageFormatProperties->imageFormatProperties.maxMipLevels = 1;
+            pImageFormatProperties->imageFormatProperties.maxArrayLayers = 1;
+            pImageFormatProperties->imageFormatProperties.sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+            pImageFormatProperties->imageFormatProperties.maxResourceSize = 4096 * 4096 * 2;
+            return VK_SUCCESS;
+        }
+        return r;
+    }
     if (panvk_format_is_bc(pImageFormatInfo->format)) {
         VkPhysicalDeviceImageFormatInfo2 mod = *pImageFormatInfo;
         mod.format = panvk_bc_decoded_format(pImageFormatInfo->format);
@@ -5357,6 +5427,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImage(
     fixup_begin(d, pCreateInfo, &fx);
     bool is_bc = fx.is_bc;
     VkResult res = d->fpCreateImage(device, fx.use, pAllocator, pImage);
+    if (res != VK_SUCCESS && is_yuv_nv12(pCreateInfo->format)) {
+        VkImageCreateInfo fallback_ci = *pCreateInfo;
+        fallback_ci.format = VK_FORMAT_R8_UNORM;
+        fallback_ci.extent.height = (pCreateInfo->extent.height * 3) / 2;
+        fallback_ci.flags &= ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+        res = d->fpCreateImage(device, &fallback_ci, pAllocator, pImage);
+        if (res == VK_SUCCESS) {
+            fprintf(stderr, "mali-compat: NV12 video image fallback to R8 (%ux%u) succeeded\n",
+                    fallback_ci.extent.width, fallback_ci.extent.height);
+        }
+    }
     if (res != VK_SUCCESS) {
         // [Claude Opus 5.5] always logged: which create info the driver refused (DXVK only prints size/format).
         const VkImageCreateInfo *ci = fx.use;
