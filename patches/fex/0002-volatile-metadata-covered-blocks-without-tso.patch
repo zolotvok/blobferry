@@ -1,0 +1,91 @@
+From: zolotvok <zolotvok@gmail.com>
+Subject: [PATCH 0002] Core: compile volatile-metadata-covered blocks with no listed access without TSO
+
+Base: FEX-2610-101-g1c4f04b + 0001 (local commit 5648a1439). Not committed; applies with `git apply` (-p1).
+
+ContextImpl::GenerateIR applies volatile metadata to a block only when the block lies in a valid range AND at least
+one listed volatile access falls inside it. A block inside a valid range with no listed access gets
+ForceTSOMode::NoOverride, i.e. the global TSOEnabled setting (ldapr/stlr for every load and store). That contradicts
+what the metadata says (the compiler declared every volatile access in the range, and this block has none) and what
+ExtendedVolatileMetadata documents ("Disable TSO for a full module: just provide the module name"): with only a module
+name, every block without a PE-listed access kept TSO.
+
+Measured impact (Witcher 3 on an Android phone with a Mali GPU, FEX ARM64EC under Proton): a vertex interleave loop at
+witcher3.exe+0x1e447c0, inside a PE valid range and with 0 of 30 589 listed accesses, stored into uncached
+HOST_COHERENT memory with stlr: ~1 520 ns per 40-B element (plain stores: 2.2-2.8 ns), ~20 ms per frame, 50 % of the
+render thread. Forcing the blocks covered through ExtendedVolatileMetadata cut the render thread from 88.3 to 58.0
+Mcycles/frame.
+
+Change: such blocks get ForceTSOMode::ForceDisabled, except instructions the frontend flags FLAG_FORCE_TSO (mono hacks),
+which keep ForceEnabled. Blocks with a listed access and blocks outside every valid range compile exactly as before.
+New config VolatileMetadataCovered (bool, default true, AffectsCodeGen so the disk cache keeps the two codegens in
+separate buckets); FEX_VOLATILEMETADATACOVERED=0 restores the upstream behaviour.
+
+Local Blobferry/DroidDeck patch, not for upstream submission (FEX does not accept AI-generated code, see AGENTS.md).
+
+SPDX-License-Identifier: MIT
+Written with AI coding agents, directed and tested by zolotvok: Claude Opus 5.5 (keeper), Claude Sonnet 5.5,
+Gemini 3.8 Flash, Gemini 4 Argon (reviews)
+---
+diff --git a/FEXCore/Source/Interface/Config/Config.json.in b/FEXCore/Source/Interface/Config/Config.json.in
+index dffc65632..f7f4e1420 100644
+--- a/FEXCore/Source/Interface/Config/Config.json.in
++++ b/FEXCore/Source/Interface/Config/Config.json.in
+@@ -660,6 +660,16 @@
+           "When metadata is unavailable falls back to the currently enabled TSO options."
+         ]
+       },
++      "VolatileMetadataCovered": {
++        "Type": "bool",
++        "Default": "true",
++        "AffectsCodeGen": "true",
++        "Desc": [
++          "Code inside a volatile metadata valid range (PE metadata or ExtendedVolatileMetadata) that has no listed",
++          "volatile access is compiled without TSO, as the metadata declares.",
++          "When disabled, such blocks keep the global TSO options (the upstream behaviour)."
++        ]
++      },
+       "X87ReducedPrecision": {
+         "Type": "bool",
+         "Default": "false",
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 02198afd3..a26a6184b 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -377,6 +377,7 @@ public:
+     FEX_CONFIG_OPT(SoftwareRNG, SOFTWARERNG);
+     FEX_CONFIG_OPT(StrictInProcessSplitLocks, STRICTINPROCESSSPLITLOCKS);
+     FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
++    FEX_CONFIG_OPT(VolatileMetadataCovered, VOLATILEMETADATACOVERED);
+     FEX_CONFIG_OPT(JITFeatures, JITFEATURES);
+   } Config;
+ 
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index e07a7da1b..1892fab41 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -581,11 +581,15 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+ #endif
+ 
+       bool BlockInForceTSOValidRange = false;
++      bool BlockVolatileCoveredNoAccess = false;
+       auto InstForceTSOIt = ForceTSOInstructions.end();
+       if (ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
+         if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); It != ForceTSOInstructions.end() && *It < Block.Entry + Block.Size) {
+           InstForceTSOIt = It;
+           BlockInForceTSOValidRange = true;
++        } else if (Config.VolatileMetadataCovered) {
++          // The metadata covers this block and lists no volatile access in it: nothing in it needs TSO.
++          BlockVolatileCoveredNoAccess = true;
+         }
+       }
+ 
+@@ -687,6 +691,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+             }
+           } else if (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) {
+             ForceTSO = IR::ForceTSOMode::ForceEnabled;
++          } else if (BlockVolatileCoveredNoAccess) {
++            ForceTSO = IR::ForceTSOMode::ForceDisabled;
+           }
+ 
+           Thread->OpDispatcher->SetForceTSO(ForceTSO);

@@ -1,0 +1,38 @@
+Test-only harness hook for 0002 (CodeSizeValidation, not in any shipped DLL). SPDX-License-Identifier: MIT
+FEX_TEST_VOLMETA_RANGE=1 [FEX_TEST_VOLMETA_INST=<off>] [FEX_TEST_VOLMETA_COVERED=0|1] CodeSizeValidation <suite.instcountci> <out.json>
+---
+diff --git a/Source/Tools/CodeSizeValidation/Main.cpp b/Source/Tools/CodeSizeValidation/Main.cpp
+index c3ed88f4e..b367d1a98 100644
+--- a/Source/Tools/CodeSizeValidation/Main.cpp
++++ b/Source/Tools/CodeSizeValidation/Main.cpp
+@@ -699,6 +699,10 @@ int main(int argc, char** argv, char** const envp) {
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_HOSTFEATURES, fextl::fmt::format("{}", HostFeatureControl));
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_FORCESVEWIDTH, fextl::fmt::format("{}", SVEWidth));
+ 
++  if (const char* Covered = getenv("FEX_TEST_VOLMETA_COVERED")) {
++    FEXCore::Config::Set(FEXCore::Config::ConfigOption::CONFIG_VOLATILEMETADATACOVERED, Covered);
++  }
++
+   // Create FEXCore context.
+   fextl::unique_ptr<FEXCore::Context::Context> CTX;
+   {
+@@ -715,6 +719,19 @@ int main(int argc, char** argv, char** const envp) {
+   if (!CTX->InitCore()) {
+     return -1;
+   }
++  // Test only (Blobferry 0002): FEX_TEST_VOLMETA_RANGE=1 marks the whole test code region as a volatile metadata
++  // valid range; FEX_TEST_VOLMETA_INST=<offset> also lists the instruction at that offset as a volatile access.
++  if (const char* Range = getenv("FEX_TEST_VOLMETA_RANGE"); Range && Range[0] == '1') {
++    constexpr uint64_t Begin = 0x1'0000;
++    FEXCore::IntervalList<uint64_t> ValidRanges;
++    ValidRanges.Insert({Begin, Begin + 512 * 1024 * 1024});
++    fextl::set<uint64_t> Instructions;
++    if (const char* Inst = getenv("FEX_TEST_VOLMETA_INST")) {
++      Instructions.emplace(Begin + strtoull(Inst, nullptr, 0));
++    }
++    std::scoped_lock Lock(CTX->GetCodeInvalidationMutex());
++    CTX->AddForceTSOInformation(ValidRanges, std::move(Instructions));
++  }
+   auto ParentThread = CTX->CreateThread();
+ 
+   // GDT data

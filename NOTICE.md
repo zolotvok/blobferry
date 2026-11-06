@@ -63,6 +63,11 @@ license, not under the GPL of Blobferry's own code. FEX itself is not included h
 FEX with this patch must keep FEX's copyright and license notice. Not for upstream submission (FEX does not accept
 AI-generated code, see FEX's `AGENTS.md`).
 
+`0002-volatile-metadata-covered-blocks-without-tso.patch` (on top of 0001: blocks inside a PE volatile-metadata range
+with no listed volatile access compile without TSO; `FEX_VOLATILEMETADATACOVERED=0` restores FEX's behaviour) and its
+test-only harness hook `0002-test-codesizevalidation-volmeta-hook.patch` (FEX's CodeSizeValidation tool, not in any
+shipped DLL) are modifications of FEX's MIT-licensed files in the same way and are offered under the same MIT license.
+
 ## android-headers (`third_party/android-headers`, git submodule)
 
 From [Halium](https://github.com/Halium/android-headers): AOSP headers, mostly Apache-2.0 (see each file's header),
