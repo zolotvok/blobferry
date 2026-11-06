@@ -61,10 +61,11 @@ the session on Blobferry).
 
 ## Status
 
-State on 2026-11-02, from the measurements up to 2026-11-01 (one phone, one person testing). Every FPS figure carries its
+State on 2026-11-06, from the measurements up to 2026-11-06 (one phone, one person testing). Every FPS figure carries its
 date, its settings and the Android thermal status (0-4): the GPU clock cap falls from thermal 2 on, so numbers at thermal 3-4
 are not comparable with cool ones. "User" marks something the tester reported without a meter. Games with no measured
-current state are left out.
+current state are left out. "Unreleased" marks a figure that needs a compat layer or FEX build that is not on `main`
+or in a release yet.
 
 | Game | API | Latest measured state |
 |---|---|---|
@@ -75,11 +76,14 @@ current state are left out.
 | Hob | DX11 → DXVK (32-bit) | 2026-10-31: starts to the menu and plays, autoplay 244 s min 24 / avg 38.7 / max 45 FPS (thermal not recorded). Loading is intermittent, see [notes](#hob) |
 | The Witcher 3 (Steam `next-gen` build 14504303, DX11 exe) | DX11 → DXVK | 2026-11-01 17:09, after Continue: 20.9-22.0 FPS at thermal 1 (CPU/GPU 84 °C, skin 42.5 °C). 2026-10-30, low settings, 1600x720, White Orchard: 18.3-18.7 FPS average standing at the spawn view (thermal not logged), 29.2 FPS in one cool view (GPU clock ~1240 MHz, thermal 1-2); at the Kaer Morhen training ground 13.9 FPS at thermal 3-4 (GPU clock 312 MHz average). Needs `NOATT_AREA`, `PIPELINE_CACHE` and `ASYNC_PSO`, see [notes](#the-witcher-3) |
 | The Witcher 3 (classic v1.32) | DX11 → DXVK | older measurement (date not recorded): 41-48 FPS indoors, 19-29 FPS outdoors at thermal 3 (GPU 75-82 °C) |
-| The Witcher 3 (current release) | DX12 → vkd3d-proton | 2026-10-28 21:06 22.2 FPS in White Orchard (thermal not recorded); 2026-10-30 averages 19.3 and 18.3 FPS (thermal 1 → 2 and 2 → 3). Not the exe a launch starts any more on the `next-gen` build |
+| The Witcher 3 (current release) | DX12 → vkd3d-proton | 2026-11-06 11:55-11:56, uncapped (VSync off, LimitFPS 0), standing in the White Orchard village at night: 28.0 min / 33.1 avg / 35.0 max FPS at thermal 2-3 (CPU 100 °C), walking 27.6-33.7 FPS with 0 major flashes, after `FEX_EXTENDEDVOLATILEMETADATA` took TSO off for one hot loop (render thread −34 % cycles per frame). 13:11-13:12 with a patched FEX DLL instead of that key: 33.7 avg / 27.9 min at thermal 1-2. Unreleased: both runs used compat layer 3f7cf69c with `MALI_COMPAT_FB_MASK=0x0d6`, and the patched FEX DLL is not shipped. Open: 4 major flashes in 622 s once daylight came (13:37-13:48, 29-30 FPS capped). Older: 2026-10-28 22.2 FPS in White Orchard; 2026-10-30 19.3 and 18.3 FPS |
 | Horizon Zero Dawn | DX12 → vkd3d-proton | built-in benchmark, 1600x720 Custom preset: 2026-11-01 13:25 avg 15 / min 7 / max 35 FPS (CPU 15, GPU 24, thermal 3); 2026-11-01 14:55 14-26 FPS at thermal 2, then a 0-FPS stall at benchmark + 2:56 with no result screen. Static meshes (buildings, props, cliffs) were missing in every run that checked it (last 2026-10-29), see [notes](#horizon-zero-dawn) |
-| Control | DX12 → vkd3d-proton | plays on the Low preset: 2026-11-01 17:53-17:58 gameplay min 23.0 / avg 29.4 / max 39.9 FPS at thermal 3 (CPU/GPU max 105 °C, skin 46.1 °C); about 20 FPS after the janitor mini-cutscene. Shadow flicker, a freeze and a pause problem are open, see [notes](#control) |
+| Control | DX12 → vkd3d-proton | plays on the Low preset: 2026-11-01 17:53-17:58 gameplay min 23.0 / avg 29.4 / max 39.9 FPS at thermal 3 (CPU/GPU max 105 °C, skin 46.1 °C); about 20 FPS after the janitor mini-cutscene. 2026-11-06 12:37-12:42, Low, security booth: the shadow flicker is gone with `MALI_COMPAT_FB_MASK=0x0d6` (0 flipping cells in a 30-s clip, 23.5/28.2/30.4 FPS at thermal 2-3) and back with it off in the same launch (21.8/26.4/29.7 FPS, thermal 3); unreleased (compat layer 3f7cf69c). A freeze and a pause problem are open, see [notes](#control) |
 | Watch Dogs | DX11 → DXVK (Ubisoft Connect) | starts and reaches gameplay with the current Ubisoft Connect in the prefix and `MALI_COMPAT_WLS_CLAMP=all`: 2026-11-01 22:52, prologue, 60 s on the DXVK HUD min 23.7 / mean 26.8 / max 31.9 FPS at thermal 4 (CPU/GPU 71-75 °C). User: lowering the resolution in the game's options crashed it |
 | Watch Dogs 2 | DX11 → DXVK (Ubisoft Connect) | playable (user report) with `MALI_COMPAT_WLS_CLAMP` (six shader hashes) and serialized submissions. User, evening of 2026-11-01, no meter, thermal not measured: the protagonist's head is drawn, ~40 FPS at the start falling to ~15 and ~8 in firefights, crash after cutting the power in the server room (cause not measured), see [notes](#watch-dogs-2) |
+| Resident Evil Village | DX12 → vkd3d-proton | starts and plays. 2026-11-06 20:10, the game's 30-FPS cap: 28.8-30 FPS in all six test arms (thermal not recorded). Open: shadow flicker and parts of the scene (a sofa) that vanish and pop back; none of the pass-order barrier settings changed it |
+| Elden Ring | DX12 → vkd3d-proton | 2026-11-06 14:22-14:23, user playing at 800x450: 8.1 min / 13.9 avg / 23.6 max FPS at thermal 0 (CPU/GPU 84 °C); 2026-11-05 15:00 11.4 avg at thermal 1. Main-thread bound: its CPU time is about 0.7x the frame time, GPU 16-22 ms per frame; native resolution gives the same FPS (user) |
+| DOOM Eternal | Vulkan | with `MALI_COMPAT_VENDOR_ID=10de` the launcher accepts the GPU and the game reaches its loading screen (26.3 FPS, 2026-11-06 20:06, thermal 1), then exits about 40 s after start. Does not get past the loading screen yet |
 
 ### Control
 
@@ -104,9 +108,10 @@ current state are left out.
   Measured at the step: records per frame 15 → 150-190, draws per frame 36 → 717-929, GPU time per frame 4 → 29-55 ms.
   User: not the heat. Whether the game streamed in more, or the cutscene scene is simply heavier, is not separated.
 - **Open:**
-  - Shadow flicker in the security booth (one light pool flips bright and dark frame by frame). Not fixed. Ruled out
-    by measurement: a barrier between the split render-pass parts (`SUSRES_BARRIER`), AFBC/AFRC on the depth atlas,
-    GPU timing, caster culling. `FORCE_COHERENT` is untested there: the run that had it froze before the booth.
+  - Shadow flicker in the security booth (one light pool flips bright and dark frame by frame): fixed 2026-11-06 by
+    `MALI_COMPAT_FB_MASK=0x0d6` (barriers at render-pass boundaries) on compat layer 3f7cf69c, which is not on `main`
+    yet. Earlier ruled out by measurement: a barrier between the split render-pass parts (`SUSRES_BARRIER`), AFBC/AFRC
+    on the depth atlas, GPU timing, caster culling.
   - Freeze at the security gate, 2026-11-01 17:58:48: 0 FPS, process alive, thermal 3, GPU memory 6226 MB. Cause not measured.
   - Opening the pause menu in gameplay ended the game in 4 of 6 tries (2026-11-01 06:00 to 16:46, none of them on Low);
     one death (14:08) was a SIGKILL (exit code 9). Who sent it is not measured (low memory is suspected); not re-tested on Low.
