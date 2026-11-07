@@ -2589,9 +2589,73 @@ static void rt_emit_stage_functions(struct RtMegaBuilder *mb,
                                              mb->g_payload_u32, true);
                 }
 
-                /* 2. Save caller's ShaderRecordBufferKHR BDA */
+                /* 2. Save caller's complete traversal and builtin state if recursive (!is_rgen) */
                 uint32_t saved_rec_bda = rt_alloc_id(mb);
                 spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u64, saved_rec_bda, mb->g_cur_record_bda);
+
+                uint32_t s_orig = 0, s_dir = 0, s_tmin = 0, s_tmax = 0;
+                uint32_t s_flags = 0, s_cull = 0, s_sbtoff = 0, s_sbtstr = 0, s_miss = 0;
+                uint32_t s_cust = 0, s_inst = 0, s_prim = 0, s_geom = 0, s_kind = 0;
+                uint32_t s_obj_orig = 0, s_obj_dir = 0, s_otw = 0, s_wto = 0;
+                uint32_t s_hitattr = 0, s_in_pay = 0, s_in_attr = 0;
+
+                bool is_rgen = (sr->stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+                if (!is_rgen) {
+                    s_orig    = rt_alloc_id(mb);
+                    s_dir     = rt_alloc_id(mb);
+                    s_tmin    = rt_alloc_id(mb);
+                    s_tmax    = rt_alloc_id(mb);
+                    s_flags   = rt_alloc_id(mb);
+                    s_cull    = rt_alloc_id(mb);
+                    s_sbtoff  = rt_alloc_id(mb);
+                    s_sbtstr  = rt_alloc_id(mb);
+                    s_miss    = rt_alloc_id(mb);
+                    s_cust    = rt_alloc_id(mb);
+                    s_inst    = rt_alloc_id(mb);
+                    s_prim    = rt_alloc_id(mb);
+                    s_geom    = rt_alloc_id(mb);
+                    s_kind    = rt_alloc_id(mb);
+                    s_hitattr = rt_alloc_id(mb);
+
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_v3f32, s_orig,   mb->g_world_ray_orig);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_v3f32, s_dir,    mb->g_world_ray_dir);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_f32,   s_tmin,   mb->g_ray_tmin);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_f32,   s_tmax,   mb->g_ray_tmax);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_flags,  mb->g_incoming_ray_flags);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_cull,   mb->g_cull_mask);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_sbtoff, mb->g_trace_sbt_offset);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_sbtstr, mb->g_trace_sbt_stride);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_miss,   mb->g_trace_miss_index);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_cust,   mb->g_instance_custom_idx);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_inst,   mb->g_instance_id);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_prim,   mb->g_primitive_id);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_geom,   mb->g_geom_index);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_u32,   s_kind,   mb->g_hit_kind);
+                    spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_arr_hitattr, s_hitattr, mb->g_hitattr_u32);
+
+                    if (mb->uses_object_ray) {
+                        s_obj_orig = rt_alloc_id(mb);
+                        s_obj_dir  = rt_alloc_id(mb);
+                        spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_v3f32, s_obj_orig, mb->g_obj_ray_orig);
+                        spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_v3f32, s_obj_dir,  mb->g_obj_ray_dir);
+                    }
+                    if (mb->uses_obj_to_world) {
+                        s_otw = rt_alloc_id(mb);
+                        spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_mat4x3f32, s_otw, mb->g_obj_to_world);
+                    }
+                    if (mb->uses_world_to_obj) {
+                        s_wto = rt_alloc_id(mb);
+                        spv_emit_op3(&mb->functions, RT_OP_LOAD, mb->t_mat4x3f32, s_wto, mb->g_world_to_obj);
+                    }
+                    if (sp->incoming_payload_var != 0) {
+                        s_in_pay = rt_alloc_id(mb);
+                        spv_emit_op3(&mb->functions, RT_OP_LOAD, sp->incoming_payload_type, s_in_pay, sp->incoming_payload_var);
+                    }
+                    if (sp->hit_attr_var != 0) {
+                        s_in_attr = rt_alloc_id(mb);
+                        spv_emit_op3(&mb->functions, RT_OP_LOAD, sp->hit_attr_type, s_in_attr, sp->hit_attr_var);
+                    }
+                }
 
                 /* 3. Ensure integer parameters are uint32 */
                 uint32_t flags_u   = rt_ensure_u32(mb, &mb->functions, flags,      code[i + 2], sp);
@@ -2600,7 +2664,6 @@ static void rt_emit_stage_functions(struct RtMegaBuilder *mb,
                 uint32_t sbtstr_u  = rt_ensure_u32(mb, &mb->functions, sbt_stride, code[i + 5], sp);
                 uint32_t miss_u    = rt_ensure_u32(mb, &mb->functions, miss_idx,   code[i + 6], sp);
 
-                bool is_rgen = (sr->stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR);
                 uint32_t rq_var  = is_rgen ? mb->g_rq_d0 : mb->g_rq_d1;
                 uint32_t fn_loop = is_rgen ? mb->fn_trace_loop_d0 : mb->fn_trace_loop_d1;
 
@@ -2627,8 +2690,44 @@ static void rt_emit_stage_functions(struct RtMegaBuilder *mb,
                 uint32_t call_id = rt_alloc_id(mb);
                 spv_emit_op3(&mb->functions, RT_OP_FUNCTION_CALL, mb->t_void, call_id, fn_loop);
 
-                /* 6. Restore caller's ShaderRecordBufferKHR BDA and unpack returned payload */
+                /* 6. Restore caller's complete traversal and builtin state */
                 spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_cur_record_bda, saved_rec_bda);
+                if (!is_rgen) {
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_world_ray_orig,     s_orig);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_world_ray_dir,      s_dir);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_ray_tmin,           s_tmin);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_ray_tmax,           s_tmax);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_incoming_ray_flags, s_flags);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_cull_mask,          s_cull);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_trace_sbt_offset,   s_sbtoff);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_trace_sbt_stride,   s_sbtstr);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_trace_miss_index,   s_miss);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_instance_custom_idx, s_cust);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_instance_id,         s_inst);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_primitive_id,        s_prim);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_geom_index,          s_geom);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_hit_kind,            s_kind);
+                    spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_hitattr_u32,        s_hitattr);
+
+                    if (mb->uses_object_ray) {
+                        spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_obj_ray_orig, s_obj_orig);
+                        spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_obj_ray_dir,  s_obj_dir);
+                    }
+                    if (mb->uses_obj_to_world) {
+                        spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_obj_to_world, s_otw);
+                    }
+                    if (mb->uses_world_to_obj) {
+                        spv_emit_op2(&mb->functions, RT_OP_STORE, mb->g_world_to_obj, s_wto);
+                    }
+                    if (sp->incoming_payload_var != 0) {
+                        spv_emit_op2(&mb->functions, RT_OP_STORE, sp->incoming_payload_var, s_in_pay);
+                    }
+                    if (sp->hit_attr_var != 0) {
+                        spv_emit_op2(&mb->functions, RT_OP_STORE, sp->hit_attr_var, s_in_attr);
+                    }
+                    rt_emit_stage_builtin_sync(mb, &mb->functions, sp);
+                }
+
                 if (pay_var && pay_type) {
                     uint32_t slot = 0;
                     rt_emit_pack_unpack_type(mb, &mb->functions, pay_var, pay_type,
@@ -3134,12 +3233,14 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
     uint32_t hit_base   = rt_alloc_id(mb);
     uint32_t hit_stride = rt_alloc_id(mb);
     uint32_t hit_size   = rt_alloc_id(mb);
+    uint32_t pc_bda     = rt_alloc_id(mb);
 
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, sbt_off,    mb->g_trace_sbt_offset);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, sbt_stride, mb->g_trace_sbt_stride);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, hit_base,   mb->g_hit_base);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, hit_stride, mb->g_hit_stride);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, hit_size,   mb->g_hit_size);
+    spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, pc_bda,     mb->g_push_consts_bda);
 
     /* sbt_hit_idx = sbt_off + sbt_stride * geom_idx + inst_sbt_off */
     uint32_t mul_geom = rt_alloc_id(mb);
@@ -3154,7 +3255,10 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
     spv_emit_op4(b, RT_OP_IMUL,     mb->t_u32, byte_off32, hit_idx, hit_stride);
     spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, byte_off64, byte_off32);
 
-    /* Bounds check: hit_base != 0 && byte_off64 + 32ULL <= hit_size */
+    /* Bounds check:
+     * 1. hit_base must be non-zero (has_base).
+     * 2. If hit_size >= 32ULL: end_off must be <= hit_size.
+     * 3. If hit_size < 32ULL: table size was not provided by application (open-ended). */
     uint32_t c_zero64 = rt_get_const_u64(mb, 0ULL);
     uint32_t c_32_64  = rt_get_const_u64(mb, 32ULL);
 
@@ -3164,8 +3268,14 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
     uint32_t end_off = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, end_off, byte_off64, c_32_64);
 
+    uint32_t has_hit_size = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_hit_size, hit_size, c_32_64);
+
+    uint32_t within_size = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, within_size, end_off, hit_size);
+
     uint32_t in_bounds = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, in_bounds, end_off, hit_size);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_bool, in_bounds, has_hit_size, within_size, mb->c_true);
 
     uint32_t is_valid = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid, has_base, in_bounds);
@@ -3176,10 +3286,13 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
     uint32_t rec_base = rt_alloc_id(mb);
     spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, rec_base, is_valid, calc_base, c_zero64);
 
+    /* If valid: local root arguments are at calc_base + 32ULL.
+     * If invalid / missing: fallback to pc_bda (valid 256-byte scratch buffer of zeroes).
+     * NEVER set g_cur_record_bda to 0ULL! */
     uint32_t calc_srb = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_srb, calc_base, c_32_64);
     uint32_t srb_bda = rt_alloc_id(mb);
-    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, srb_bda, is_valid, calc_srb, c_zero64);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, srb_bda, is_valid, calc_srb, pc_bda);
     spv_emit_op2(b, RT_OP_STORE, mb->g_cur_record_bda, srb_bda);
 
     return rec_base;
@@ -3445,8 +3558,14 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
     uint32_t miss_end_off = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, miss_end_off, miss_off64, c_32_64);
 
+    uint32_t has_miss_sz = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_miss_sz, miss_size, c_32_64);
+
+    uint32_t miss_within_sz = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, miss_within_sz, miss_end_off, miss_size);
+
     uint32_t miss_in_bounds = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, miss_in_bounds, miss_end_off, miss_size);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_bool, miss_in_bounds, has_miss_sz, miss_within_sz, mb->c_true);
 
     uint32_t run_miss = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_miss, has_miss_base, miss_in_bounds);
@@ -3651,10 +3770,14 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     uint32_t c_zero64   = rt_get_const_u64(mb, 0ULL);
     uint32_t c_32_64    = rt_get_const_u64(mb, 32ULL);
     uint32_t has_rgen   = rt_alloc_id(mb);
+    uint32_t has_rgen_sz= rt_alloc_id(mb);
+    uint32_t is_zero_rgen_sz = rt_alloc_id(mb);
     uint32_t rgen_sz_ok = rt_alloc_id(mb);
     uint32_t run_rgen   = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_rgen, cur_rgen_base, c_zero64);
-    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, rgen_sz_ok, cur_rgen_size, c_32_64);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_rgen_sz, cur_rgen_size, c_32_64);
+    spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_zero_rgen_sz, cur_rgen_size, c_zero64);
+    spv_emit_op4(b, RT_OP_LOGICAL_OR, mb->t_bool, rgen_sz_ok, has_rgen_sz, is_zero_rgen_sz);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_rgen, has_rgen, rgen_sz_ok);
 
     uint32_t lbl_do_rgen = rt_alloc_id(mb);
@@ -4470,6 +4593,18 @@ compat_CmdTraceRaysKHR(
     pc.push_consts_bda = rt_upload_user_push_constants(d, commandBuffer, cs);
     pc.indirect_bda    = 0ULL;
 
+    static uint32_t g_trace_log_count = 0;
+    if (g_trace_log_count < 20 || (g_trace_log_count % 300) == 0) {
+        g_trace_log_count++;
+        COMPAT_INFO("CmdTraceRays #%u: dim=%ux%ux%u rgen=%lx:sz%u:str%u miss=%lx:sz%u:str%u hit=%lx:sz%u:str%u call=%lx:sz%u:str%u pc_bda=%lx",
+                    g_trace_log_count, width, height, depth,
+                    (unsigned long)pc.rgen_base, pc.rgen_size, pc.rgen_stride,
+                    (unsigned long)pc.miss_base, pc.miss_size, pc.miss_stride,
+                    (unsigned long)pc.hit_base, pc.hit_size, pc.hit_stride,
+                    (unsigned long)pc.call_base, pc.call_size, pc.call_stride,
+                    (unsigned long)pc.push_consts_bda);
+    }
+
     rt_prepare_and_bind_megakernel(d, commandBuffer, cs, rp, &pc);
 
     uint32_t gx = (width  + 7u) / 8u;
@@ -4568,6 +4703,18 @@ static void rt_dispatch_indirect_common(
     pc.indirect_mode   = indirect_mode;
     pc.push_consts_bda = rt_upload_user_push_constants(d, commandBuffer, cs);
     pc.indirect_bda    = indirectDeviceAddress;
+
+    static uint32_t g_ind_trace_log_count = 0;
+    if (g_ind_trace_log_count < 20 || (g_ind_trace_log_count % 300) == 0) {
+        g_ind_trace_log_count++;
+        COMPAT_INFO("CmdTraceRaysIndirect (mode %u) #%u: ind_bda=%lx rgen=%lx:sz%u miss=%lx:sz%u hit=%lx:sz%u pc_bda=%lx",
+                    indirect_mode, g_ind_trace_log_count,
+                    (unsigned long)indirectDeviceAddress,
+                    (unsigned long)pc.rgen_base, pc.rgen_size,
+                    (unsigned long)pc.miss_base, pc.miss_size,
+                    (unsigned long)pc.hit_base, pc.hit_size,
+                    (unsigned long)pc.push_consts_bda);
+    }
 
     rt_ensure_indirect_setup_pipeline(d);
 

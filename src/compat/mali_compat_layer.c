@@ -58,7 +58,29 @@ static void relink(struct unlinked u) {
     if (u.prev) u.prev->pNext = u.node;
 }
 
-#define LOG(...) do { if (g_debug) { fprintf(stderr, "mali-compat: " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
+static void mali_compat_log_write(const char *fmt, ...) {
+    static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+    va_list ap;
+    va_start(ap, fmt);
+    if (g_debug) {
+        vfprintf(stderr, fmt, ap);
+        fputc('\n', stderr);
+        fflush(stderr);
+    }
+    va_end(ap);
+
+    pthread_mutex_lock(&log_lock);
+    FILE *f = fopen("/data/local/tmp/mali-compat.log", "a");
+    if (f) {
+        va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        fputc('\n', f);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&log_lock);
+}
+
+#define LOG(...) mali_compat_log_write("mali-compat: " __VA_ARGS__)
 
 // -----------------------------------------------------------------------------
 // SPIR-V Stripper / Patcher (ClipDistance / CullDistance)
