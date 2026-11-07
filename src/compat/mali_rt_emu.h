@@ -763,7 +763,7 @@ struct RtDedupType {
 struct RtDedupTypeN {
     uint32_t op;
     uint32_t opnd_count;
-    uint32_t opnds[16];
+    uint32_t opnds[48];
     uint32_t res_id;
 };
 
@@ -1044,6 +1044,7 @@ static uint32_t rt_find_or_emit_type(struct RtMegaBuilder *mb, uint32_t op,
 
 static uint32_t rt_find_or_emit_complex_type(struct RtMegaBuilder *mb, uint32_t op,
                                              const uint32_t *opnds, uint32_t opnd_count) {
+    if (opnd_count > 48) opnd_count = 48;
     for (uint32_t i = 0; i < mb->dedup_complex_type_count; i++) {
         if (mb->dedup_complex_types[i].op == op &&
             mb->dedup_complex_types[i].opnd_count == opnd_count) {
@@ -1068,7 +1069,7 @@ static uint32_t rt_find_or_emit_complex_type(struct RtMegaBuilder *mb, uint32_t 
         struct RtDedupTypeN *d = &mb->dedup_complex_types[mb->dedup_complex_type_count++];
         d->op = op;
         d->opnd_count = opnd_count;
-        for (uint32_t k = 0; k < opnd_count && k < 16; k++) d->opnds[k] = opnds[k];
+        for (uint32_t k = 0; k < opnd_count; k++) d->opnds[k] = opnds[k];
         d->res_id = id;
     }
     return id;
@@ -1980,9 +1981,10 @@ static bool rt_parse_and_emit_stage_globals(struct RtMegaBuilder *mb,
 
             case RT_OP_TYPE_FUNCTION: {
                 uint32_t orig_id = code[i + 1];
-                uint32_t opnds[16];
+                uint32_t opnds[48];
                 uint32_t opnd_count = (wc > 2) ? (wc - 2) : 0;
-                for (uint32_t k = 0; k < opnd_count && k < 16; k++) {
+                if (opnd_count > 48) opnd_count = 48;
+                for (uint32_t k = 0; k < opnd_count; k++) {
                     uint32_t opnd = code[i + 2 + k];
                     opnds[k] = (opnd < bound) ? sp->remap[opnd] : opnd;
                 }
@@ -2014,11 +2016,12 @@ static bool rt_parse_and_emit_stage_globals(struct RtMegaBuilder *mb,
 
             case RT_OP_TYPE_IMAGE: {
                 uint32_t orig_id = code[i + 1];
-                uint32_t opnds[8];
+                uint32_t opnds[16];
                 uint32_t opnd_count = (wc > 2) ? (wc - 2) : 0;
+                if (opnd_count > 16) opnd_count = 16;
                 uint32_t smp_orig = code[i + 2];
                 opnds[0] = (smp_orig < bound) ? sp->remap[smp_orig] : smp_orig;
-                for (uint32_t k = 1; k < opnd_count && k < 8; k++) {
+                for (uint32_t k = 1; k < opnd_count; k++) {
                     opnds[k] = code[i + 2 + k]; /* Dim, Depth, Arrayed, MS, Sampled, Format are literals */
                 }
                 uint32_t mid = rt_find_or_emit_complex_type(mb, RT_OP_TYPE_IMAGE, opnds, opnd_count);
