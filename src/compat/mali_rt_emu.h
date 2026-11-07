@@ -181,6 +181,7 @@ static void rt_patch_fex_thunks(void);
 #define RT_OP_UGREATER_THAN                          172u
 #define RT_OP_UGREATER_THAN_EQUAL                    174u
 #define RT_OP_ULESS_THAN                             176u
+#define RT_OP_ULESS_THAN_EQUAL                       178u
 #define RT_OP_FORD_LESS_THAN_EQUAL                   186u
 #define RT_OP_FORD_GREATER_THAN_EQUAL                188u
 #define RT_OP_BITWISE_OR                             197u
@@ -883,14 +884,20 @@ struct RtMegaBuilder {
     uint32_t v_rt_pc;
 
     uint32_t g_rgen_base;
+    uint32_t g_rgen_size;
     uint32_t g_miss_base;
     uint32_t g_miss_stride;
+    uint32_t g_miss_size;
     uint32_t g_hit_base;
     uint32_t g_hit_stride;
+    uint32_t g_hit_size;
     uint32_t g_call_base;
     uint32_t g_call_stride;
+    uint32_t g_call_size;
     uint32_t g_push_consts_bda;
     uint32_t g_cur_record_bda;
+    uint32_t g_cand_rahit_id;
+    uint32_t g_cand_rint_id;
 
     uint32_t g_launch_id;
     uint32_t g_launch_size;
@@ -1281,14 +1288,20 @@ static void rt_mega_init_preamble(struct RtMegaBuilder *mb) {
 
     /* Private globals for SBT & dispatch state */
     mb->g_rgen_base         = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
+    mb->g_rgen_size         = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
     mb->g_miss_base         = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
     mb->g_miss_stride       = rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
+    mb->g_miss_size         = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
     mb->g_hit_base          = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
     mb->g_hit_stride        = rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
+    mb->g_hit_size          = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
     mb->g_call_base         = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
     mb->g_call_stride       = rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
+    mb->g_call_size         = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
     mb->g_push_consts_bda   = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
     mb->g_cur_record_bda    = rt_emit_global_var(mb, mb->t_ptr_priv_u64, RT_SC_PRIVATE);
+    mb->g_cand_rahit_id     = rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
+    mb->g_cand_rint_id      = rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
 
     /* Private globals for RT BuiltIns */
     mb->g_launch_id         = rt_emit_global_var(mb, mb->t_ptr_priv_v3u32, RT_SC_PRIVATE);
@@ -2993,25 +3006,36 @@ static void rt_emit_invoke_rcall_fn(struct RtMegaBuilder *mb,
     spv_emit_op1(b, RT_OP_LABEL, lbl_entry);
 
     uint32_t c_zero64  = rt_get_const_u64(mb, 0ULL);
+    uint32_t c_32_64   = rt_get_const_u64(mb, 32ULL);
     uint32_t call_base = rt_alloc_id(mb);
+    uint32_t call_size = rt_alloc_id(mb);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, call_base, mb->g_call_base);
+    spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, call_size, mb->g_call_size);
     uint32_t has_call  = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_call, call_base, c_zero64);
 
+    uint32_t stride32  = rt_alloc_id(mb);
+    spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, stride32, mb->g_call_stride);
+    uint32_t off32     = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IMUL, mb->t_u32, off32, p_idx, stride32);
+    uint32_t off64     = rt_alloc_id(mb);
+    spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, off64, off32);
+
+    uint32_t end_off   = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, end_off, off64, c_32_64);
+    uint32_t in_bounds = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, in_bounds, end_off, call_size);
+
+    uint32_t run_call  = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_call, has_call, in_bounds);
+
     spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_exit, 0u);
-    spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, has_call, lbl_valid, lbl_exit);
+    spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, run_call, lbl_valid, lbl_exit);
 
     spv_emit_op1(b, RT_OP_LABEL, lbl_valid);
-    uint32_t stride32 = rt_alloc_id(mb);
-    spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, stride32, mb->g_call_stride);
-    uint32_t off32    = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IMUL, mb->t_u32, off32, p_idx, stride32);
-    uint32_t off64    = rt_alloc_id(mb);
-    spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, off64, off32);
     uint32_t rec_base = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, rec_base, call_base, off64);
 
-    uint32_t c_32_64  = rt_get_const_u64(mb, 32ULL);
     uint32_t srb_bda  = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, srb_bda, rec_base, c_32_64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_cur_record_bda, srb_bda);
@@ -3109,11 +3133,13 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
     uint32_t sbt_stride = rt_alloc_id(mb);
     uint32_t hit_base   = rt_alloc_id(mb);
     uint32_t hit_stride = rt_alloc_id(mb);
+    uint32_t hit_size   = rt_alloc_id(mb);
 
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, sbt_off,    mb->g_trace_sbt_offset);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, sbt_stride, mb->g_trace_sbt_stride);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, hit_base,   mb->g_hit_base);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, hit_stride, mb->g_hit_stride);
+    spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, hit_size,   mb->g_hit_size);
 
     /* sbt_hit_idx = sbt_off + sbt_stride * geom_idx + inst_sbt_off */
     uint32_t mul_geom = rt_alloc_id(mb);
@@ -3125,14 +3151,35 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
 
     uint32_t byte_off32 = rt_alloc_id(mb);
     uint32_t byte_off64 = rt_alloc_id(mb);
-    uint32_t rec_base   = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IMUL,     mb->t_u32, byte_off32, hit_idx, hit_stride);
     spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, byte_off64, byte_off32);
-    spv_emit_op4(b, RT_OP_IADD,     mb->t_u64, rec_base,   hit_base, byte_off64);
 
-    uint32_t c_32_64 = rt_get_const_u64(mb, 32ULL);
+    /* Bounds check: hit_base != 0 && byte_off64 + 32ULL <= hit_size */
+    uint32_t c_zero64 = rt_get_const_u64(mb, 0ULL);
+    uint32_t c_32_64  = rt_get_const_u64(mb, 32ULL);
+
+    uint32_t has_base = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_base, hit_base, c_zero64);
+
+    uint32_t end_off = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, end_off, byte_off64, c_32_64);
+
+    uint32_t in_bounds = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, in_bounds, end_off, hit_size);
+
+    uint32_t is_valid = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid, has_base, in_bounds);
+
+    uint32_t calc_base = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_base, hit_base, byte_off64);
+
+    uint32_t rec_base = rt_alloc_id(mb);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, rec_base, is_valid, calc_base, c_zero64);
+
+    uint32_t calc_srb = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_srb, calc_base, c_32_64);
     uint32_t srb_bda = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, srb_bda, rec_base, c_32_64);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, srb_bda, is_valid, calc_srb, c_zero64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_cur_record_bda, srb_bda);
 
     return rec_base;
@@ -3190,10 +3237,32 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
         rt_emit_rq_populate_hit_builtins(mb, b, rq_var, mb->c_u32_0, &cand_geom, &cand_sbt_off);
         uint32_t hit_rec = rt_emit_compute_hit_record_bda(mb, b, cand_geom, cand_sbt_off);
 
+        uint32_t c_zero64 = rt_get_const_u64(mb, 0ULL);
+        uint32_t has_rec  = rt_alloc_id(mb);
+        spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_rec, hit_rec, c_zero64);
+
+        spv_emit_op2(b, RT_OP_STORE, mb->g_cand_rahit_id, mb->c_u32_0);
+        spv_emit_op2(b, RT_OP_STORE, mb->g_cand_rint_id,  mb->c_u32_0);
+
+        uint32_t lbl_load_ids = rt_alloc_id(mb);
+        uint32_t lbl_ids_done = rt_alloc_id(mb);
+        spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_ids_done, 0u);
+        spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, has_rec, lbl_load_ids, lbl_ids_done);
+
+        spv_emit_op1(b, RT_OP_LABEL, lbl_load_ids);
+        uint32_t loaded_rahit = rt_alloc_id(mb);
+        uint32_t loaded_rint  = rt_alloc_id(mb);
+        rt_emit_psb_load_u32(mb, b, loaded_rahit, hit_rec, 16u);
+        rt_emit_psb_load_u32(mb, b, loaded_rint,  hit_rec, 20u);
+        spv_emit_op2(b, RT_OP_STORE, mb->g_cand_rahit_id, loaded_rahit);
+        spv_emit_op2(b, RT_OP_STORE, mb->g_cand_rint_id,  loaded_rint);
+        spv_emit_op1(b, RT_OP_BRANCH, lbl_ids_done);
+
+        spv_emit_op1(b, RT_OP_LABEL, lbl_ids_done);
         uint32_t rahit_id = rt_alloc_id(mb);
         uint32_t rint_id  = rt_alloc_id(mb);
-        rt_emit_psb_load_u32(mb, b, rahit_id, hit_rec, 16u);
-        rt_emit_psb_load_u32(mb, b, rint_id,  hit_rec, 20u);
+        spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, rahit_id, mb->g_cand_rahit_id);
+        spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, rint_id,  mb->g_cand_rint_id);
 
         uint32_t cand_type = rt_alloc_id(mb);
         uint32_t is_tri    = rt_alloc_id(mb);
@@ -3327,21 +3396,19 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
     spv_emit_op1(b, RT_OP_LABEL, lbl_hit_attr_done);
     uint32_t comm_hit_rec = rt_emit_compute_hit_record_bda(mb, b, comm_geom, comm_sbt_off);
 
-    /* Check SkipClosestHitShaderKHR (flag bit 0x8) and non-null hit SBT */
-    uint32_t c_zero64   = rt_get_const_u64(mb, 0ULL);
-    uint32_t hit_base   = rt_alloc_id(mb);
-    uint32_t has_hit_sbt= rt_alloc_id(mb);
-    uint32_t rflags     = rt_alloc_id(mb);
-    uint32_t skip_bit   = rt_alloc_id(mb);
-    uint32_t not_skip   = rt_alloc_id(mb);
-    uint32_t run_chit   = rt_alloc_id(mb);
+    /* Check SkipClosestHitShaderKHR (flag bit 0x8) and valid hit record */
+    uint32_t c_zero64    = rt_get_const_u64(mb, 0ULL);
+    uint32_t has_hit_rec = rt_alloc_id(mb);
+    uint32_t rflags      = rt_alloc_id(mb);
+    uint32_t skip_bit    = rt_alloc_id(mb);
+    uint32_t not_skip    = rt_alloc_id(mb);
+    uint32_t run_chit    = rt_alloc_id(mb);
 
-    spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, hit_base, mb->g_hit_base);
-    spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_hit_sbt, hit_base, c_zero64);
+    spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_hit_rec, comm_hit_rec, c_zero64);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, rflags, mb->g_incoming_ray_flags);
     spv_emit_op4(b, RT_OP_BITWISE_AND, mb->t_u32, skip_bit, rflags, mb->c_u32_8);
     spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, not_skip, skip_bit, mb->c_u32_0);
-    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_chit, has_hit_sbt, not_skip);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_chit, has_hit_rec, not_skip);
 
     spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_after_chit, 0u);
     spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, run_chit, lbl_do_chit, lbl_after_chit);
@@ -3358,27 +3425,39 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
 
     /* Committed Miss */
     spv_emit_op1(b, RT_OP_LABEL, lbl_miss);
+    uint32_t c_32_64      = rt_get_const_u64(mb, 32ULL);
     uint32_t miss_base    = rt_alloc_id(mb);
-    uint32_t has_miss_sbt = rt_alloc_id(mb);
+    uint32_t miss_size    = rt_alloc_id(mb);
+    uint32_t has_miss_base= rt_alloc_id(mb);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, miss_base, mb->g_miss_base);
-    spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_miss_sbt, miss_base, c_zero64);
+    spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, miss_size, mb->g_miss_size);
+    spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_miss_base, miss_base, c_zero64);
 
-    spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_after_miss, 0u);
-    spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, has_miss_sbt, lbl_do_miss, lbl_after_miss);
-
-    spv_emit_op1(b, RT_OP_LABEL, lbl_do_miss);
-    uint32_t miss_idx    = rt_alloc_id(mb);
-    uint32_t miss_stride = rt_alloc_id(mb);
-    uint32_t miss_off32  = rt_alloc_id(mb);
-    uint32_t miss_off64  = rt_alloc_id(mb);
-    uint32_t miss_rec    = rt_alloc_id(mb);
+    uint32_t miss_idx     = rt_alloc_id(mb);
+    uint32_t miss_stride  = rt_alloc_id(mb);
+    uint32_t miss_off32   = rt_alloc_id(mb);
+    uint32_t miss_off64   = rt_alloc_id(mb);
     spv_emit_op3(b, RT_OP_LOAD,     mb->t_u32, miss_idx,    mb->g_trace_miss_index);
     spv_emit_op3(b, RT_OP_LOAD,     mb->t_u32, miss_stride, mb->g_miss_stride);
     spv_emit_op4(b, RT_OP_IMUL,     mb->t_u32, miss_off32,  miss_idx, miss_stride);
     spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, miss_off64,  miss_off32);
-    spv_emit_op4(b, RT_OP_IADD,     mb->t_u64, miss_rec,    miss_base, miss_off64);
 
-    uint32_t c_32_64   = rt_get_const_u64(mb, 32ULL);
+    uint32_t miss_end_off = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, miss_end_off, miss_off64, c_32_64);
+
+    uint32_t miss_in_bounds = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, miss_in_bounds, miss_end_off, miss_size);
+
+    uint32_t run_miss = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_miss, has_miss_base, miss_in_bounds);
+
+    spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_after_miss, 0u);
+    spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, run_miss, lbl_do_miss, lbl_after_miss);
+
+    spv_emit_op1(b, RT_OP_LABEL, lbl_do_miss);
+    uint32_t miss_rec = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, miss_rec, miss_base, miss_off64);
+
     uint32_t msrb_bda  = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, msrb_bda, miss_rec, c_32_64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_cur_record_bda, msrb_bda);
@@ -3427,12 +3506,16 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
 
     /* Load push constant parameters into globals */
     uint32_t rgen_base   = rt_emit_load_pc_member(mb, b, 0,  true);
+    uint32_t rgen_sz32   = rt_emit_load_pc_member(mb, b, 2,  false);
     uint32_t miss_base   = rt_emit_load_pc_member(mb, b, 3,  true);
     uint32_t miss_stride = rt_emit_load_pc_member(mb, b, 4,  false);
+    uint32_t miss_sz32   = rt_emit_load_pc_member(mb, b, 5,  false);
     uint32_t hit_base    = rt_emit_load_pc_member(mb, b, 6,  true);
     uint32_t hit_stride  = rt_emit_load_pc_member(mb, b, 7,  false);
+    uint32_t hit_sz32    = rt_emit_load_pc_member(mb, b, 8,  false);
     uint32_t call_base   = rt_emit_load_pc_member(mb, b, 9,  true);
     uint32_t call_stride = rt_emit_load_pc_member(mb, b, 10, false);
+    uint32_t call_sz32   = rt_emit_load_pc_member(mb, b, 11, false);
     uint32_t lw          = rt_emit_load_pc_member(mb, b, 12, false);
     uint32_t lh          = rt_emit_load_pc_member(mb, b, 13, false);
     uint32_t ld          = rt_emit_load_pc_member(mb, b, 14, false);
@@ -3440,16 +3523,29 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     uint32_t pc_bda      = rt_emit_load_pc_member(mb, b, 16, true);
     uint32_t ind_bda     = rt_emit_load_pc_member(mb, b, 17, true);
 
+    uint32_t rgen_sz64   = rt_alloc_id(mb);
+    uint32_t miss_sz64   = rt_alloc_id(mb);
+    uint32_t hit_sz64    = rt_alloc_id(mb);
+    uint32_t call_sz64   = rt_alloc_id(mb);
+    spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, rgen_sz64, rgen_sz32);
+    spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, miss_sz64, miss_sz32);
+    spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, hit_sz64,  hit_sz32);
+    spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, call_sz64, call_sz32);
+
     uint32_t lsize_dir = rt_alloc_id(mb);
     spv_emit_op5(b, RT_OP_COMPOSITE_CONSTRUCT, mb->t_v3u32, lsize_dir, lw, lh, ld);
 
     spv_emit_op2(b, RT_OP_STORE, mb->g_rgen_base,       rgen_base);
+    spv_emit_op2(b, RT_OP_STORE, mb->g_rgen_size,       rgen_sz64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_miss_base,       miss_base);
     spv_emit_op2(b, RT_OP_STORE, mb->g_miss_stride,     miss_stride);
+    spv_emit_op2(b, RT_OP_STORE, mb->g_miss_size,       miss_sz64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_hit_base,        hit_base);
     spv_emit_op2(b, RT_OP_STORE, mb->g_hit_stride,      hit_stride);
+    spv_emit_op2(b, RT_OP_STORE, mb->g_hit_size,        hit_sz64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_call_base,       call_base);
     spv_emit_op2(b, RT_OP_STORE, mb->g_call_stride,     call_stride);
+    spv_emit_op2(b, RT_OP_STORE, mb->g_call_size,       call_sz64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_launch_size,     lsize_dir);
     spv_emit_op2(b, RT_OP_STORE, mb->g_push_consts_bda, pc_bda);
 
@@ -3479,29 +3575,37 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
 
     /* Indirect2: VkTraceRaysIndirectCommand2KHR */
     spv_emit_op1(b, RT_OP_LABEL, lbl_ind2);
-    uint32_t i2_rgen_b = rt_alloc_id(mb);
-    uint32_t i2_miss_b = rt_alloc_id(mb), i2_miss_s = rt_alloc_id(mb);
-    uint32_t i2_hit_b  = rt_alloc_id(mb), i2_hit_s  = rt_alloc_id(mb);
-    uint32_t i2_call_b = rt_alloc_id(mb), i2_call_s = rt_alloc_id(mb);
+    uint32_t i2_rgen_b = rt_alloc_id(mb), i2_rgen_sz = rt_alloc_id(mb);
+    uint32_t i2_miss_b = rt_alloc_id(mb), i2_miss_sz = rt_alloc_id(mb), i2_miss_s = rt_alloc_id(mb);
+    uint32_t i2_hit_b  = rt_alloc_id(mb), i2_hit_sz  = rt_alloc_id(mb), i2_hit_s  = rt_alloc_id(mb);
+    uint32_t i2_call_b = rt_alloc_id(mb), i2_call_sz = rt_alloc_id(mb), i2_call_s = rt_alloc_id(mb);
     uint32_t i2_w = rt_alloc_id(mb), i2_h = rt_alloc_id(mb), i2_d = rt_alloc_id(mb), i2_sz = rt_alloc_id(mb);
-    rt_emit_psb_load_u64(mb, b, i2_rgen_b, ind_bda, 0u);
-    rt_emit_psb_load_u64(mb, b, i2_miss_b, ind_bda, 16u);
-    rt_emit_psb_load_u32(mb, b, i2_miss_s, ind_bda, 32u);
-    rt_emit_psb_load_u64(mb, b, i2_hit_b,  ind_bda, 40u);
-    rt_emit_psb_load_u32(mb, b, i2_hit_s,  ind_bda, 56u);
-    rt_emit_psb_load_u64(mb, b, i2_call_b, ind_bda, 64u);
-    rt_emit_psb_load_u32(mb, b, i2_call_s, ind_bda, 80u);
-    rt_emit_psb_load_u32(mb, b, i2_w,      ind_bda, 88u);
-    rt_emit_psb_load_u32(mb, b, i2_h,      ind_bda, 92u);
-    rt_emit_psb_load_u32(mb, b, i2_d,      ind_bda, 96u);
+    rt_emit_psb_load_u64(mb, b, i2_rgen_b,  ind_bda, 0u);
+    rt_emit_psb_load_u64(mb, b, i2_rgen_sz, ind_bda, 8u);
+    rt_emit_psb_load_u64(mb, b, i2_miss_b,  ind_bda, 16u);
+    rt_emit_psb_load_u64(mb, b, i2_miss_sz, ind_bda, 24u);
+    rt_emit_psb_load_u32(mb, b, i2_miss_s,  ind_bda, 32u);
+    rt_emit_psb_load_u64(mb, b, i2_hit_b,   ind_bda, 40u);
+    rt_emit_psb_load_u64(mb, b, i2_hit_sz,  ind_bda, 48u);
+    rt_emit_psb_load_u32(mb, b, i2_hit_s,   ind_bda, 56u);
+    rt_emit_psb_load_u64(mb, b, i2_call_b,  ind_bda, 64u);
+    rt_emit_psb_load_u64(mb, b, i2_call_sz, ind_bda, 72u);
+    rt_emit_psb_load_u32(mb, b, i2_call_s,  ind_bda, 80u);
+    rt_emit_psb_load_u32(mb, b, i2_w,       ind_bda, 88u);
+    rt_emit_psb_load_u32(mb, b, i2_h,       ind_bda, 92u);
+    rt_emit_psb_load_u32(mb, b, i2_d,       ind_bda, 96u);
     spv_emit_op5(b, RT_OP_COMPOSITE_CONSTRUCT, mb->t_v3u32, i2_sz, i2_w, i2_h, i2_d);
     spv_emit_op2(b, RT_OP_STORE, mb->g_rgen_base,   i2_rgen_b);
+    spv_emit_op2(b, RT_OP_STORE, mb->g_rgen_size,   i2_rgen_sz);
     spv_emit_op2(b, RT_OP_STORE, mb->g_miss_base,   i2_miss_b);
     spv_emit_op2(b, RT_OP_STORE, mb->g_miss_stride, i2_miss_s);
+    spv_emit_op2(b, RT_OP_STORE, mb->g_miss_size,   i2_miss_sz);
     spv_emit_op2(b, RT_OP_STORE, mb->g_hit_base,    i2_hit_b);
     spv_emit_op2(b, RT_OP_STORE, mb->g_hit_stride,  i2_hit_s);
+    spv_emit_op2(b, RT_OP_STORE, mb->g_hit_size,    i2_hit_sz);
     spv_emit_op2(b, RT_OP_STORE, mb->g_call_base,   i2_call_b);
     spv_emit_op2(b, RT_OP_STORE, mb->g_call_stride, i2_call_s);
+    spv_emit_op2(b, RT_OP_STORE, mb->g_call_size,   i2_call_sz);
     spv_emit_op2(b, RT_OP_STORE, mb->g_launch_size, i2_sz);
     spv_emit_op1(b, RT_OP_BRANCH, lbl_after_ind2);
 
@@ -3540,8 +3644,24 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     spv_emit_op2(b, RT_OP_STORE, mb->g_launch_id, gid);
 
     uint32_t cur_rgen_base = rt_alloc_id(mb);
+    uint32_t cur_rgen_size = rt_alloc_id(mb);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, cur_rgen_base, mb->g_rgen_base);
-    uint32_t c_32_64  = rt_get_const_u64(mb, 32ULL);
+    spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, cur_rgen_size, mb->g_rgen_size);
+
+    uint32_t c_zero64   = rt_get_const_u64(mb, 0ULL);
+    uint32_t c_32_64    = rt_get_const_u64(mb, 32ULL);
+    uint32_t has_rgen   = rt_alloc_id(mb);
+    uint32_t rgen_sz_ok = rt_alloc_id(mb);
+    uint32_t run_rgen   = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_rgen, cur_rgen_base, c_zero64);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, rgen_sz_ok, cur_rgen_size, c_32_64);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_rgen, has_rgen, rgen_sz_ok);
+
+    uint32_t lbl_do_rgen = rt_alloc_id(mb);
+    spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_exit, 0u);
+    spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, run_rgen, lbl_do_rgen, lbl_exit);
+
+    spv_emit_op1(b, RT_OP_LABEL, lbl_do_rgen);
     uint32_t rgen_srb = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, rgen_srb, cur_rgen_base, c_32_64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_cur_record_bda, rgen_srb);
@@ -4252,10 +4372,11 @@ static bool rt_alloc_cmd_buffer(struct DeviceData *d,
 static VkDeviceAddress rt_upload_user_push_constants(struct DeviceData *d,
                                                      VkCommandBuffer cmd,
                                                      const struct RtCmdState *cs) {
-    if (!cs || cs->user_pc_dirty_size == 0) return 0ULL;
+    uint8_t zero_pc[256] = {0};
+    const void *data = (cs && cs->user_pc_dirty_size > 0) ? cs->user_push_constants : zero_pc;
     VkDeviceAddress bda = 0ULL;
     if (!rt_alloc_cmd_buffer(d, cmd, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                             cs->user_push_constants, NULL, &bda)) {
+                             data, NULL, &bda)) {
         return 0ULL;
     }
     return bda;
