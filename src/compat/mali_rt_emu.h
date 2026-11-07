@@ -4975,6 +4975,7 @@ struct RtAsTrack {
     struct RtAsTrack          *next;
 };
 
+#define RT_AS_TYPE_UNBUILT ((VkAccelerationStructureTypeKHR)0x7fffffff)
 #define RT_AS_BUCKETS 1024
 static struct RtAsTrack *g_rt_as_tracks[RT_AS_BUCKETS];
 static pthread_mutex_t   g_rt_as_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -5023,7 +5024,7 @@ compat_CreateAccelerationStructureKHR(
                 track->size         = pCreateInfo->size;
                 track->created_type = pCreateInfo->type;
             }
-            track->built_type    = 0; /* unbuilt */
+            track->built_type    = RT_AS_TYPE_UNBUILT; /* unbuilt */
 
             pthread_mutex_lock(&g_rt_as_lock);
             unsigned b = rt_as_hash((uint64_t)(uintptr_t)track->orig_handle);
@@ -5116,14 +5117,11 @@ compat_CmdBuildAccelerationStructuresKHR(
         VkAccelerationStructureKHR dst = infos[i].dstAccelerationStructure;
         struct RtAsTrack *track = rt_as_lookup_locked(dst);
         if (track) {
-            if (track->built_type == 0) {
+            if (track->built_type == RT_AS_TYPE_UNBUILT) {
                 track->built_type = infos[i].type;
             } else if (track->built_type != infos[i].type) {
-                COMPAT_INFO("RT_EMU: AS %p mutated type %u -> %u! Re-creating clean driver handle.",
+                COMPAT_INFO("RT_EMU: AS %p mutated type %u -> %u! Allocating clean driver handle.",
                            (void *)track->orig_handle, (unsigned)track->built_type, (unsigned)infos[i].type);
-                if (d->fpDestroyAccelerationStructureKHR && track->active_handle) {
-                    d->fpDestroyAccelerationStructureKHR(track->device, track->active_handle, NULL);
-                }
                 VkAccelerationStructureCreateInfoKHR ci = {
                     .sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
                     .type   = infos[i].type,
@@ -5138,12 +5136,14 @@ compat_CmdBuildAccelerationStructuresKHR(
                     track->built_type    = infos[i].type;
                 }
             }
-            infos[i].dstAccelerationStructure = track->active_handle;
+            if (track->active_handle) {
+                infos[i].dstAccelerationStructure = track->active_handle;
+            }
         }
 
         if (infos[i].srcAccelerationStructure) {
             struct RtAsTrack *src_t = rt_as_lookup_locked(infos[i].srcAccelerationStructure);
-            if (src_t) {
+            if (src_t && src_t->active_handle) {
                 infos[i].srcAccelerationStructure = src_t->active_handle;
             }
         }
@@ -5151,6 +5151,22 @@ compat_CmdBuildAccelerationStructuresKHR(
     pthread_mutex_unlock(&g_rt_as_lock);
 
     d->fpCmdBuildAccelerationStructuresKHR(commandBuffer, count, infos, ppBuildRangeInfos);
+
+    if (d->fpCmdPipelineBarrier) {
+        VkMemoryBarrier mb = {
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext         = NULL,
+            .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
+        };
+        d->fpCmdPipelineBarrier(commandBuffer,
+                                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                0,
+                                1, &mb,
+                                0, NULL,
+                                0, NULL);
+    }
 
     if (infos != stack_infos) free(infos);
 }
@@ -5175,6 +5191,22 @@ compat_CmdCopyAccelerationStructureKHR(
     pthread_mutex_unlock(&g_rt_as_lock);
 
     d->fpCmdCopyAccelerationStructureKHR(commandBuffer, &copy);
+
+    if (d->fpCmdPipelineBarrier) {
+        VkMemoryBarrier mb = {
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext         = NULL,
+            .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
+        };
+        d->fpCmdPipelineBarrier(commandBuffer,
+                                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                0,
+                                1, &mb,
+                                0, NULL,
+                                0, NULL);
+    }
 }
 
 static VKAPI_ATTR void VKAPI_CALL

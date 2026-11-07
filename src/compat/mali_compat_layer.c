@@ -7700,7 +7700,7 @@ static void sd_init_once(void) {
     atomic_store(&g_sd_k4, k4 && strcmp(k4, "0") != 0);
     // The hooks are needed when a barrier or submit mode is asked for, or may be switched on later (ctl file);
     // GT_SPLIT_SKIP alone is a flag in the GPU timing code and needs none of them.
-    g_sd_armed = ctl || atomic_load(&g_sd_fbm) || atomic_load(&g_sd_si_ms);
+    g_sd_armed = ctl || atomic_load(&g_sd_fbm) || atomic_load(&g_sd_si_ms) || g_rt_pipeline;
     if (!g_sd_armed && !atomic_load(&g_sd_k4)) return;
     g_sd_ctl = ctl;
     if (getenv("MALI_COMPAT_SYNC_REPORT_S") && atoi(getenv("MALI_COMPAT_SYNC_REPORT_S")) > 0)
@@ -7781,6 +7781,60 @@ static uint32_t sd_kbit(int k) {
                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT)
 #define SD_ST_XFER (VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT | \
                     VK_PIPELINE_STAGE_2_RESOLVE_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT)
+
+#ifndef VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR
+#define VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR 0x00200000ULL
+#endif
+#ifndef VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+#define VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR 0x00200000
+#endif
+#ifndef VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR
+#define VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR 0x00200000ULL
+#endif
+#ifndef VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR
+#define VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR 0x00400000ULL
+#endif
+#ifndef VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+#define VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR 0x00200000
+#endif
+#ifndef VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR
+#define VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR 0x00400000
+#endif
+
+static inline __attribute__((unused)) VkPipelineStageFlags rt_remap_stage(VkPipelineStageFlags s) {
+    if (s & VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR) {
+        s = (s & ~VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR) | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
+    return s;
+}
+
+static inline __attribute__((unused)) VkPipelineStageFlags2 rt_remap_stage2(VkPipelineStageFlags2 s) {
+    if (s & VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR) {
+        s = (s & ~VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR) | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    }
+    return s;
+}
+
+static inline __attribute__((unused)) VkAccessFlags rt_remap_access(VkAccessFlags a) {
+    if (a & VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR) {
+        a |= VK_ACCESS_SHADER_READ_BIT;
+    }
+    if (a & VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR) {
+        a |= VK_ACCESS_SHADER_WRITE_BIT;
+    }
+    return a;
+}
+
+static inline __attribute__((unused)) VkAccessFlags2 rt_remap_access2(VkAccessFlags2 a) {
+    if (a & VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR) {
+        a |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    }
+    if (a & VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR) {
+        a |= VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    }
+    return a;
+}
+
 static void sd_hist(uint64_t src, uint64_t dst) {
     SD_CNT(SDC_H_BARRIERS);
     if (dst & SD_ST_TESS) SD_CNT(SDC_H_DTESS);
@@ -7803,6 +7857,10 @@ static VKAPI_ATTR void VKAPI_CALL sd_CmdPipelineBarrier(VkCommandBuffer cmd, VkP
     PFN_vkCmdPipelineBarrier next = SD_NEXT(d, SD_PB, PFN_vkCmdPipelineBarrier);
     struct CmdBufData *c = cmd_data(cmd);
     uint32_t w = SD_FB(FBM_DST | FBM_SRC | FBM_ACC);
+    if (g_rt_pipeline) {
+        src = rt_remap_stage(src);
+        dst = rt_remap_stage(dst);
+    }
     if (c && !c->sd_pass) sd_hist(src, dst);
     if (!c || c->sd_pass || !w) {
         if (c && c->sd_pass && w) SD_CNT(SDC_INPASS);
@@ -7843,9 +7901,10 @@ static VKAPI_ATTR void VKAPI_CALL sd_CmdPipelineBarrier2(VkCommandBuffer cmd, co
         for (uint32_t i = 0; i < di->memoryBarrierCount; i++) { hs |= di->pMemoryBarriers[i].srcStageMask; hd |= di->pMemoryBarriers[i].dstStageMask; }
         for (uint32_t i = 0; i < di->bufferMemoryBarrierCount; i++) { hs |= di->pBufferMemoryBarriers[i].srcStageMask; hd |= di->pBufferMemoryBarriers[i].dstStageMask; }
         for (uint32_t i = 0; i < di->imageMemoryBarrierCount; i++) { hs |= di->pImageMemoryBarriers[i].srcStageMask; hd |= di->pImageMemoryBarriers[i].dstStageMask; }
+        if (g_rt_pipeline) { hs = rt_remap_stage2(hs); hd = rt_remap_stage2(hd); }
         sd_hist(hs, hd);
     }
-    if (!c || c->sd_pass || !di || !w) {
+    if (!c || c->sd_pass || !di || (!w && !g_rt_pipeline)) {
         if (c && c->sd_pass && w) SD_CNT(SDC_INPASS);
         next(cmd, di);
         return;
@@ -7864,7 +7923,13 @@ static VKAPI_ATTR void VKAPI_CALL sd_CmdPipelineBarrier2(VkCommandBuffer cmd, co
     }
     #define SD_W2(x) do { if (w & FBM_SRC) (x).srcStageMask |= VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; \
                           if (w & FBM_DST) (x).dstStageMask |= VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT; \
-                          if (w & FBM_ACC) { (x).srcAccessMask |= SD_ACC2; (x).dstAccessMask |= SD_ACC2; } } while (0)
+                          if (w & FBM_ACC) { (x).srcAccessMask |= SD_ACC2; (x).dstAccessMask |= SD_ACC2; } \
+                          if (g_rt_pipeline) { \
+                              (x).srcStageMask = rt_remap_stage2((x).srcStageMask); \
+                              (x).dstStageMask = rt_remap_stage2((x).dstStageMask); \
+                              (x).srcAccessMask = rt_remap_access2((x).srcAccessMask); \
+                              (x).dstAccessMask = rt_remap_access2((x).dstAccessMask); \
+                          } } while (0)
     for (uint32_t i = 0; i < nm; i++) { mw[i] = di->pMemoryBarriers[i]; SD_W2(mw[i]); }
     if (extra) {
         uint64_t es = (w & FBM_SRC) ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : 0, ed = (w & FBM_DST) ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : 0;
