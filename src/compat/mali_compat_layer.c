@@ -8729,11 +8729,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     }
     mod_ci.ppEnabledExtensionNames = ext_names;
     struct unlinked placed_feat = unlink_struct(&mod_ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT);
+    // VkPhysicalDeviceFeatures in declaration order (55 VkBool32). The old table lacked fillModeNonSolid and depthBounds, so
+    // every name from idx 13 on was shifted by two: the logged "wideLines (13)", "largePoints (14)", "pipelineStatisticsQuery
+    // (22)", "fragmentStoresAndAtomics (24)", "shaderFloat64 (37)", "shaderInt64 (38)" were really fillModeNonSolid,
+    // depthBounds, textureCompressionBC, pipelineStatisticsQuery, shaderClipDistance, shaderCullDistance (all false on the
+    // blob). The masking itself compared by index and was right. [keeper, Claude Opus 5.5] 2026-11-06
     static const char *kFeatureNames[] = {
         "robustBufferAccess", "fullDrawIndexUint32", "imageCubeArray", "independentBlend",
         "geometryShader", "tessellationShader", "sampleRateShading", "dualSrcBlend",
         "logicOp", "multiDrawIndirect", "drawIndirectFirstInstance", "depthClamp",
-        "depthBiasClamp", "wideLines", "largePoints", "alphaToOne",
+        "depthBiasClamp", "fillModeNonSolid", "depthBounds", "wideLines", "largePoints", "alphaToOne",
         "multiViewport", "samplerAnisotropy", "textureCompressionETC2", "textureCompressionASTC_LDR",
         "textureCompressionBC", "occlusionQueryPrecise", "pipelineStatisticsQuery", "vertexPipelineStoresAndAtomics",
         "fragmentStoresAndAtomics", "shaderTessellationAndGeometryPointSize", "shaderImageGatherExtended", "shaderStorageImageExtendedFormats",
@@ -8745,9 +8750,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         "sparseResidency8Samples", "sparseResidency16Samples", "sparseResidencyAliased", "variableMultisampleRate",
         "inheritedQueries"
     };
+    _Static_assert(sizeof kFeatureNames / sizeof kFeatureNames[0] == sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32),
+                   "kFeatureNames must name every VkPhysicalDeviceFeatures member in order");
+    // One stderr line per vkCreateDevice: the names masked in pEnabledFeatures and/or VkPhysicalDeviceFeatures2.
+    char masked_log[1024];
+    size_t masked_len = 0;
+    uint64_t masked_bits = 0;
+    masked_log[0] = 0;
 
+    // The real driver's core features through the next layer's vkGetPhysicalDeviceFeatures2 (the same struct the v1 call
+    // fills; v1 only when the driver has no features2). Not the layer's own compat_GetPhysicalDeviceFeatures*, which spoofs.
     VkPhysicalDeviceFeatures real_features = {0};
-    if (inst && inst->fpGetPhysicalDeviceFeatures) {
+    if (inst && inst->fpGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceFeatures2 rf2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, NULL};
+        inst->fpGetPhysicalDeviceFeatures2(physicalDevice, &rf2);
+        real_features = rf2.features;
+    } else if (inst && inst->fpGetPhysicalDeviceFeatures) {
         inst->fpGetPhysicalDeviceFeatures(physicalDevice, &real_features);
     }
     // The real driver's 16/8-bit storage bits: mask only what it lacks. Masking them unconditionally (f7dac02) created the
@@ -8771,8 +8789,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         VkBool32 *safe_arr = (VkBool32 *)&safe_features;
         for (size_t i = 0; i < sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32); i++) {
             if (safe_arr[i] && !real_arr[i]) {
-                const char *fn = (i < sizeof(kFeatureNames)/sizeof(kFeatureNames[0])) ? kFeatureNames[i] : "?";
-                fprintf(stderr, "mali-compat: masking unsupported core feature %s (idx %zu)\n", fn, i);
+                if (!(masked_bits & (1ull << i)) && masked_len + 48 < sizeof masked_log)
+                    masked_len += (size_t)snprintf(masked_log + masked_len, sizeof masked_log - masked_len, "%s%s(%zu)",
+                                                   masked_len ? " " : "", kFeatureNames[i], i);
+                masked_bits |= 1ull << i;
                 safe_arr[i] = VK_FALSE;
             }
         }
@@ -8802,8 +8822,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             VkBool32 *f2_arr = (VkBool32 *)&f2->features;
             for (size_t i = 0; i < sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32); i++) {
                 if (f2_arr[i] && !real_arr[i]) {
-                    const char *fn = (i < sizeof(kFeatureNames)/sizeof(kFeatureNames[0])) ? kFeatureNames[i] : "?";
-                    fprintf(stderr, "mali-compat: masking unsupported f2 feature %s (idx %zu)\n", fn, i);
+                    if (!(masked_bits & (1ull << i)) && masked_len + 48 < sizeof masked_log)
+                        masked_len += (size_t)snprintf(masked_log + masked_len, sizeof masked_log - masked_len, "%s%s(%zu)",
+                                                       masked_len ? " " : "", kFeatureNames[i], i);
+                    masked_bits |= 1ull << i;
                     f2_arr[i] = VK_FALSE;
                 }
             }
@@ -8852,6 +8874,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         }
         node = node->pNext;
     }
+    fprintf(stderr, "mali-compat: vkCreateDevice masks %d core feature(s) the driver lacks: %s\n",
+            __builtin_popcountll(masked_bits), masked_len ? masked_log : "none");
 
     // Ensure bufferDeviceAddress is requested only if neither Vulkan12Features nor BDA struct was in pNext
     VkPhysicalDeviceBufferDeviceAddressFeatures bda_feat = {
@@ -9145,12 +9169,33 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
 // -----------------------------------------------------------------------------
 // Loader Layer Negotiate & ProcAddr Dispatch
 // -----------------------------------------------------------------------------
+// MALI_COMPAT_PASSTHRU=1: A/B switch, "no layer but the CreateDevice feature masking". Every entry point except
+// vkCreateInstance/DestroyInstance, vkCreateDevice/DestroyDevice and the two GetProcAddr goes straight to the next layer /
+// driver: no feature/format/property spoofing, no SPIR-V patching, no object hooks. The app then sees the driver's real
+// features and the layer only drops the enabled ones the driver lacks (Quake II RTX: pipelineStatisticsQuery; without any
+// layer its vkCreateDevice fails with VK_ERROR_FEATURE_NOT_PRESENT). Tells whether a black/faulting picture comes from the
+// layer's hooks or from below. [keeper, Claude Opus 5.5] 2026-11-06
+static bool passthru_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("MALI_COMPAT_PASSTHRU");
+        v = e && e[0] == '1';
+        if (v) fprintf(stderr, "mali-compat: PASSTHRU=1: only vkCreateDevice feature masking is active\n");
+    }
+    return v;
+}
+
 EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char *pName) {
     if (!pName) return NULL;
     // Must be this layer's own: the Arm WSI layer above resolves every entry point it does not know through the
     // "vkGetDeviceProcAddr" it gets here. Forwarding the name handed it the driver's, so vkCreateShaderModule and
     // vkCreateGraphicsPipelines skipped this layer (no SPIR-V patching, vendor compiler crash). [Claude Opus 5.5]
     if (!strcmp(pName, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+    if (passthru_on()) {
+        if (!strcmp(pName, "vkDestroyDevice")) return (PFN_vkVoidFunction)compat_DestroyDevice;
+        struct DeviceData *pd = get_device_data(device);
+        return pd ? pd->get_device_proc_addr(device, pName) : NULL;
+    }
     if (g_sd_armed && !tl_sd_inner) { PFN_vkVoidFunction sw = sd_proc(device, pName); if (sw) return sw; } // sync-diag
     // GPU timing: which vkCmdDraw*/Dispatch* entry points the app asks for (once each), to see what the hooks miss.
     if (g_gpu_time && (!strncmp(pName, "vkCmdDraw", 9) || !strncmp(pName, "vkCmdDispatch", 13) ||
@@ -9331,6 +9376,12 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
     if (!strcmp(pName, "vkCreateDevice")) return (PFN_vkVoidFunction)compat_CreateDevice;
     if (!strcmp(pName, "vkGetInstanceProcAddr")) return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
     if (!strcmp(pName, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+    if (passthru_on()) {
+        if (!strcmp(pName, "vkDestroyInstance")) return (PFN_vkVoidFunction)compat_DestroyInstance;
+        if (!strcmp(pName, "vkDestroyDevice")) return (PFN_vkVoidFunction)compat_DestroyDevice;
+        struct InstanceData *pi = get_instance_data(instance);
+        return pi ? pi->get_instance_proc_addr(instance, pName) : NULL;
+    }
 
     #define MATCH_INST(fn) if (!strcmp(pName, "vk" #fn)) return (PFN_vkVoidFunction)compat_##fn
     MATCH_INST(DestroyInstance);
