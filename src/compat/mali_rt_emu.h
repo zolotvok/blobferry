@@ -4584,6 +4584,13 @@ compat_DeferredHostOperationJoinKHR(
 
 /* ── FEX Thunk Function Pointer Patching ─────────────────────────────────── */
 
+static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateAccelerationStructureKHR(VkDevice, const VkAccelerationStructureCreateInfoKHR*, const VkAllocationCallbacks*, VkAccelerationStructureKHR*);
+static VKAPI_ATTR void VKAPI_CALL compat_DestroyAccelerationStructureKHR(VkDevice, VkAccelerationStructureKHR, const VkAllocationCallbacks*);
+static VKAPI_ATTR void VKAPI_CALL compat_CmdBuildAccelerationStructuresKHR(VkCommandBuffer, uint32_t, const VkAccelerationStructureBuildGeometryInfoKHR*, const VkAccelerationStructureBuildRangeInfoKHR* const*);
+static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyAccelerationStructureKHR(VkCommandBuffer, const VkCopyAccelerationStructureInfoKHR*);
+static VKAPI_ATTR void VKAPI_CALL compat_CmdWriteAccelerationStructuresPropertiesKHR(VkCommandBuffer, uint32_t, const VkAccelerationStructureKHR*, VkQueryType, VkQueryPool, uint32_t);
+static VKAPI_ATTR VkDeviceAddress VKAPI_CALL compat_GetAccelerationStructureDeviceAddressKHR(VkDevice, const VkAccelerationStructureDeviceAddressInfoKHR*);
+
 struct FexThunkMapping {
     const char *sym_name;
     uintptr_t fallback_offset;
@@ -4657,6 +4664,12 @@ static void rt_patch_fex_thunks(void) {
         { "fexldr_ptr_libvulkan_vkCmdTraceRaysIndirect2KHR",           0xbacc0, (void *)compat_CmdTraceRaysIndirect2KHR },
         { "fexldr_ptr_libvulkan_vkGetRayTracingShaderGroupStackSizeKHR", 0xbb8f0, (void *)compat_GetRayTracingShaderGroupStackSizeKHR },
         { "fexldr_ptr_libvulkan_vkCmdSetRayTracingPipelineStackSizeKHR", 0xbb8f8, (void *)compat_CmdSetRayTracingPipelineStackSizeKHR },
+        { "fexldr_ptr_libvulkan_vkCreateAccelerationStructureKHR",     0, (void *)compat_CreateAccelerationStructureKHR },
+        { "fexldr_ptr_libvulkan_vkDestroyAccelerationStructureKHR",    0, (void *)compat_DestroyAccelerationStructureKHR },
+        { "fexldr_ptr_libvulkan_vkCmdBuildAccelerationStructuresKHR",  0, (void *)compat_CmdBuildAccelerationStructuresKHR },
+        { "fexldr_ptr_libvulkan_vkCmdCopyAccelerationStructureKHR",    0, (void *)compat_CmdCopyAccelerationStructureKHR },
+        { "fexldr_ptr_libvulkan_vkCmdWriteAccelerationStructuresPropertiesKHR", 0, (void *)compat_CmdWriteAccelerationStructuresPropertiesKHR },
+        { "fexldr_ptr_libvulkan_vkGetAccelerationStructureDeviceAddressKHR", 0, (void *)compat_GetAccelerationStructureDeviceAddressKHR },
     };
     size_t num_targets = sizeof(targets) / sizeof(targets[0]);
 
@@ -4946,6 +4959,276 @@ compat_RtCmdSetDescriptorBufferOffsetsEXT(
     }
     d->fpCmdSetDescriptorBufferOffsetsEXT(commandBuffer, pipelineBindPoint, layout,
                                           firstSet, setCount, pBufferIndices, pOffsets);
+}
+
+/* ── Acceleration Structure Lifetime & Mutation Tracking ─────────────────── */
+
+struct RtAsTrack {
+    VkAccelerationStructureKHR orig_handle;
+    VkAccelerationStructureKHR active_handle;
+    VkDevice                   device;
+    VkBuffer                   buffer;
+    VkDeviceSize               offset;
+    VkDeviceSize               size;
+    VkAccelerationStructureTypeKHR created_type;
+    VkAccelerationStructureTypeKHR built_type;
+    struct RtAsTrack          *next;
+};
+
+#define RT_AS_BUCKETS 1024
+static struct RtAsTrack *g_rt_as_tracks[RT_AS_BUCKETS];
+static pthread_mutex_t   g_rt_as_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline unsigned rt_as_hash(uint64_t v) {
+    v ^= v >> 16;
+    v ^= v >> 32;
+    return (unsigned)(v % RT_AS_BUCKETS);
+}
+
+static struct RtAsTrack *rt_as_lookup_locked(VkAccelerationStructureKHR as) {
+    if (!as) return NULL;
+    unsigned b = rt_as_hash((uint64_t)(uintptr_t)as);
+    for (struct RtAsTrack *t = g_rt_as_tracks[b]; t; t = t->next) {
+        if (t->orig_handle == as || t->active_handle == as) return t;
+    }
+    for (unsigned i = 0; i < RT_AS_BUCKETS; i++) {
+        if (i == b) continue;
+        for (struct RtAsTrack *t = g_rt_as_tracks[i]; t; t = t->next) {
+            if (t->orig_handle == as || t->active_handle == as) return t;
+        }
+    }
+    return NULL;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+compat_CreateAccelerationStructureKHR(
+    VkDevice                                    device,
+    const VkAccelerationStructureCreateInfoKHR *pCreateInfo,
+    const VkAllocationCallbacks                *pAllocator,
+    VkAccelerationStructureKHR                 *pAccelerationStructure)
+{
+    struct DeviceData *d = get_device_data(device);
+    if (!d || !d->fpCreateAccelerationStructureKHR) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkResult res = d->fpCreateAccelerationStructureKHR(device, pCreateInfo, pAllocator, pAccelerationStructure);
+    if (res == VK_SUCCESS && pAccelerationStructure && *pAccelerationStructure) {
+        struct RtAsTrack *track = (struct RtAsTrack *)calloc(1, sizeof(*track));
+        if (track) {
+            track->orig_handle   = *pAccelerationStructure;
+            track->active_handle = *pAccelerationStructure;
+            track->device        = device;
+            if (pCreateInfo) {
+                track->buffer       = pCreateInfo->buffer;
+                track->offset       = pCreateInfo->offset;
+                track->size         = pCreateInfo->size;
+                track->created_type = pCreateInfo->type;
+            }
+            track->built_type    = 0; /* unbuilt */
+
+            pthread_mutex_lock(&g_rt_as_lock);
+            unsigned b = rt_as_hash((uint64_t)(uintptr_t)track->orig_handle);
+            track->next = g_rt_as_tracks[b];
+            g_rt_as_tracks[b] = track;
+            pthread_mutex_unlock(&g_rt_as_lock);
+        }
+    }
+    return res;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+compat_DestroyAccelerationStructureKHR(
+    VkDevice                                    device,
+    VkAccelerationStructureKHR                  accelerationStructure,
+    const VkAllocationCallbacks                *pAllocator)
+{
+    struct DeviceData *d = get_device_data(device);
+    if (!d || !accelerationStructure) return;
+
+    VkAccelerationStructureKHR real_handle = accelerationStructure;
+    pthread_mutex_lock(&g_rt_as_lock);
+    unsigned b = rt_as_hash((uint64_t)(uintptr_t)accelerationStructure);
+    struct RtAsTrack **pp = &g_rt_as_tracks[b];
+    while (*pp) {
+        if ((*pp)->orig_handle == accelerationStructure || (*pp)->active_handle == accelerationStructure) {
+            struct RtAsTrack *victim = *pp;
+            *pp = victim->next;
+            real_handle = victim->active_handle;
+            pthread_mutex_unlock(&g_rt_as_lock);
+            if (d->fpDestroyAccelerationStructureKHR) {
+                d->fpDestroyAccelerationStructureKHR(device, real_handle, pAllocator);
+            }
+            free(victim);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+    for (unsigned i = 0; i < RT_AS_BUCKETS; i++) {
+        if (i == b) continue;
+        pp = &g_rt_as_tracks[i];
+        while (*pp) {
+            if ((*pp)->orig_handle == accelerationStructure || (*pp)->active_handle == accelerationStructure) {
+                struct RtAsTrack *victim = *pp;
+                *pp = victim->next;
+                real_handle = victim->active_handle;
+                pthread_mutex_unlock(&g_rt_as_lock);
+                if (d->fpDestroyAccelerationStructureKHR) {
+                    d->fpDestroyAccelerationStructureKHR(device, real_handle, pAllocator);
+                }
+                free(victim);
+                return;
+            }
+            pp = &(*pp)->next;
+        }
+    }
+    pthread_mutex_unlock(&g_rt_as_lock);
+
+    if (d->fpDestroyAccelerationStructureKHR) {
+        d->fpDestroyAccelerationStructureKHR(device, real_handle, pAllocator);
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+compat_CmdBuildAccelerationStructuresKHR(
+    VkCommandBuffer                                         commandBuffer,
+    uint32_t                                                infoCount,
+    const VkAccelerationStructureBuildGeometryInfoKHR      *pInfos,
+    const VkAccelerationStructureBuildRangeInfoKHR * const *ppBuildRangeInfos)
+{
+    struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
+    if (!d || !d->fpCmdBuildAccelerationStructuresKHR) return;
+
+    if (!pInfos || infoCount == 0) {
+        d->fpCmdBuildAccelerationStructuresKHR(commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
+        return;
+    }
+
+    VkAccelerationStructureBuildGeometryInfoKHR stack_infos[8];
+    VkAccelerationStructureBuildGeometryInfoKHR *infos = stack_infos;
+    if (infoCount > 8) {
+        infos = (VkAccelerationStructureBuildGeometryInfoKHR *)malloc(infoCount * sizeof(*infos));
+        if (!infos) infos = stack_infos;
+    }
+    uint32_t count = (infos == stack_infos && infoCount > 8) ? 8 : infoCount;
+    memcpy(infos, pInfos, count * sizeof(*infos));
+
+    pthread_mutex_lock(&g_rt_as_lock);
+    for (uint32_t i = 0; i < count; i++) {
+        VkAccelerationStructureKHR dst = infos[i].dstAccelerationStructure;
+        struct RtAsTrack *track = rt_as_lookup_locked(dst);
+        if (track) {
+            if (track->built_type == 0) {
+                track->built_type = infos[i].type;
+            } else if (track->built_type != infos[i].type) {
+                COMPAT_INFO("RT_EMU: AS %p mutated type %u -> %u! Re-creating clean driver handle.",
+                           (void *)track->orig_handle, (unsigned)track->built_type, (unsigned)infos[i].type);
+                if (d->fpDestroyAccelerationStructureKHR && track->active_handle) {
+                    d->fpDestroyAccelerationStructureKHR(track->device, track->active_handle, NULL);
+                }
+                VkAccelerationStructureCreateInfoKHR ci = {
+                    .sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+                    .type   = infos[i].type,
+                    .buffer = track->buffer,
+                    .offset = track->offset,
+                    .size   = track->size,
+                };
+                VkAccelerationStructureKHR new_h = VK_NULL_HANDLE;
+                if (d->fpCreateAccelerationStructureKHR &&
+                    d->fpCreateAccelerationStructureKHR(track->device, &ci, NULL, &new_h) == VK_SUCCESS) {
+                    track->active_handle = new_h;
+                    track->built_type    = infos[i].type;
+                }
+            }
+            infos[i].dstAccelerationStructure = track->active_handle;
+        }
+
+        if (infos[i].srcAccelerationStructure) {
+            struct RtAsTrack *src_t = rt_as_lookup_locked(infos[i].srcAccelerationStructure);
+            if (src_t) {
+                infos[i].srcAccelerationStructure = src_t->active_handle;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_rt_as_lock);
+
+    d->fpCmdBuildAccelerationStructuresKHR(commandBuffer, count, infos, ppBuildRangeInfos);
+
+    if (infos != stack_infos) free(infos);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+compat_CmdCopyAccelerationStructureKHR(
+    VkCommandBuffer                             commandBuffer,
+    const VkCopyAccelerationStructureInfoKHR   *pInfo)
+{
+    struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
+    if (!d || !d->fpCmdCopyAccelerationStructureKHR) return;
+    if (!pInfo) {
+        d->fpCmdCopyAccelerationStructureKHR(commandBuffer, pInfo);
+        return;
+    }
+    VkCopyAccelerationStructureInfoKHR copy = *pInfo;
+    pthread_mutex_lock(&g_rt_as_lock);
+    struct RtAsTrack *st = rt_as_lookup_locked(pInfo->src);
+    if (st) copy.src = st->active_handle;
+    struct RtAsTrack *dt = rt_as_lookup_locked(pInfo->dst);
+    if (dt) copy.dst = dt->active_handle;
+    pthread_mutex_unlock(&g_rt_as_lock);
+
+    d->fpCmdCopyAccelerationStructureKHR(commandBuffer, &copy);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+compat_CmdWriteAccelerationStructuresPropertiesKHR(
+    VkCommandBuffer                             commandBuffer,
+    uint32_t                                    accelerationStructureCount,
+    const VkAccelerationStructureKHR           *pAccelerationStructures,
+    VkQueryType                                 queryType,
+    VkQueryPool                                 queryPool,
+    uint32_t                                    firstQuery)
+{
+    struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
+    if (!d || !d->fpCmdWriteAccelerationStructuresPropertiesKHR) return;
+    if (!pAccelerationStructures || accelerationStructureCount == 0) {
+        d->fpCmdWriteAccelerationStructuresPropertiesKHR(commandBuffer, accelerationStructureCount,
+                                                         pAccelerationStructures, queryType, queryPool, firstQuery);
+        return;
+    }
+
+    VkAccelerationStructureKHR stack_as[16];
+    VkAccelerationStructureKHR *as_arr = stack_as;
+    if (accelerationStructureCount > 16) {
+        as_arr = (VkAccelerationStructureKHR *)malloc(accelerationStructureCount * sizeof(*as_arr));
+        if (!as_arr) as_arr = stack_as;
+    }
+    uint32_t cnt = (as_arr == stack_as && accelerationStructureCount > 16) ? 16 : accelerationStructureCount;
+
+    pthread_mutex_lock(&g_rt_as_lock);
+    for (uint32_t i = 0; i < cnt; i++) {
+        struct RtAsTrack *t = rt_as_lookup_locked(pAccelerationStructures[i]);
+        as_arr[i] = t ? t->active_handle : pAccelerationStructures[i];
+    }
+    pthread_mutex_unlock(&g_rt_as_lock);
+
+    d->fpCmdWriteAccelerationStructuresPropertiesKHR(commandBuffer, cnt, as_arr, queryType, queryPool, firstQuery);
+
+    if (as_arr != stack_as) free(as_arr);
+}
+
+static VKAPI_ATTR VkDeviceAddress VKAPI_CALL
+compat_GetAccelerationStructureDeviceAddressKHR(
+    VkDevice                                           device,
+    const VkAccelerationStructureDeviceAddressInfoKHR *pInfo)
+{
+    struct DeviceData *d = get_device_data(device);
+    if (!d || !d->fpGetAccelerationStructureDeviceAddressKHR || !pInfo) return 0ULL;
+
+    VkAccelerationStructureDeviceAddressInfoKHR info = *pInfo;
+    pthread_mutex_lock(&g_rt_as_lock);
+    struct RtAsTrack *t = rt_as_lookup_locked(pInfo->accelerationStructure);
+    if (t) info.accelerationStructure = t->active_handle;
+    pthread_mutex_unlock(&g_rt_as_lock);
+
+    return d->fpGetAccelerationStructureDeviceAddressKHR(device, &info);
 }
 
 #endif /* MALI_RT_EMU_H */

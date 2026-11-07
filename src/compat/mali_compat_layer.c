@@ -1495,6 +1495,12 @@ struct DeviceData {
     PFN_vkCmdDispatchIndirect fpCmdDispatchIndirect;
     PFN_vkCmdSetDescriptorBufferOffsetsEXT fpCmdSetDescriptorBufferOffsetsEXT;
     PFN_vkCmdBindDescriptorSets fpCmdBindDescriptorSets;
+    PFN_vkCreateAccelerationStructureKHR fpCreateAccelerationStructureKHR;
+    PFN_vkDestroyAccelerationStructureKHR fpDestroyAccelerationStructureKHR;
+    PFN_vkCmdBuildAccelerationStructuresKHR fpCmdBuildAccelerationStructuresKHR;
+    PFN_vkCmdCopyAccelerationStructureKHR fpCmdCopyAccelerationStructureKHR;
+    PFN_vkCmdWriteAccelerationStructuresPropertiesKHR fpCmdWriteAccelerationStructuresPropertiesKHR;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR fpGetAccelerationStructureDeviceAddressKHR;
     pthread_mutex_t bc_lock;
 };
 
@@ -6783,6 +6789,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_ResetCommandPool(
             for (uint32_t j = 0; j < e->staging_count; j++) release_staging(d, &e->staging_resources[j]);
             e->staging_count = 0;
         }
+        if (g_rt_pipeline) {
+            pthread_mutex_lock(&g_cmdbuf_mutex);
+            for (int b = 0; b < CMDBUF_BUCKETS; b++) {
+                for (struct CmdBufData *e = g_cmdbufs[b]; e; e = e->next) {
+                    if (e->dev == d && e->pool == commandPool) {
+                        rt_reset_cmd_state(e->cmdbuf, false);
+                    }
+                }
+            }
+            pthread_mutex_unlock(&g_cmdbuf_mutex);
+        }
     }
     return d ? d->fpResetCommandPool(device, commandPool, flags) : VK_SUCCESS;
 }
@@ -6799,6 +6816,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyCommandPool(
                 if (e->dev == d && e->pool == commandPool) {
                     *pp = e->next;
                     staged_unlink(e);
+                    if (g_rt_pipeline) rt_reset_cmd_state(e->cmdbuf, true);
                     for (uint32_t j = 0; j < e->staging_count; j++)
                         release_staging(d, &e->staging_resources[j]);
                     free(e->staging_resources);
@@ -9241,6 +9259,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         d->fpCmdSetDescriptorBufferOffsetsEXT = (PFN_vkCmdSetDescriptorBufferOffsetsEXT)fpGetDeviceProcAddr(*pDevice, "vkCmdSetDescriptorBufferOffsetsEXT");
         d->fpCmdBindDescriptorSets = (PFN_vkCmdBindDescriptorSets)fpGetDeviceProcAddr(*pDevice, "vkCmdBindDescriptorSets");
         d->fpCmdDispatchIndirect = (PFN_vkCmdDispatchIndirect)fpGetDeviceProcAddr(*pDevice, "vkCmdDispatchIndirect");
+        d->fpCreateAccelerationStructureKHR = (PFN_vkCreateAccelerationStructureKHR)fpGetDeviceProcAddr(*pDevice, "vkCreateAccelerationStructureKHR");
+        d->fpDestroyAccelerationStructureKHR = (PFN_vkDestroyAccelerationStructureKHR)fpGetDeviceProcAddr(*pDevice, "vkDestroyAccelerationStructureKHR");
+        d->fpCmdBuildAccelerationStructuresKHR = (PFN_vkCmdBuildAccelerationStructuresKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdBuildAccelerationStructuresKHR");
+        d->fpCmdCopyAccelerationStructureKHR = (PFN_vkCmdCopyAccelerationStructureKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdCopyAccelerationStructureKHR");
+        d->fpCmdWriteAccelerationStructuresPropertiesKHR = (PFN_vkCmdWriteAccelerationStructuresPropertiesKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdWriteAccelerationStructuresPropertiesKHR");
+        d->fpGetAccelerationStructureDeviceAddressKHR = (PFN_vkGetAccelerationStructureDeviceAddressKHR)fpGetDeviceProcAddr(*pDevice, "vkGetAccelerationStructureDeviceAddressKHR");
         pthread_mutex_init(&d->bc_lock, NULL);
         d->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdPushDescriptorSetKHR");
         if (!d->fpCmdPushDescriptorSetKHR)
@@ -9534,6 +9558,12 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
             struct DeviceData *dd = get_device_data(device);
             if (dd && dd->fpCmdSetDescriptorBufferOffsetsEXT) return (PFN_vkVoidFunction)compat_RtCmdSetDescriptorBufferOffsetsEXT;
         }
+        if (!strcmp(pName, "vkCreateAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_CreateAccelerationStructureKHR;
+        if (!strcmp(pName, "vkDestroyAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_DestroyAccelerationStructureKHR;
+        if (!strcmp(pName, "vkCmdBuildAccelerationStructuresKHR")) return (PFN_vkVoidFunction)compat_CmdBuildAccelerationStructuresKHR;
+        if (!strcmp(pName, "vkCmdCopyAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_CmdCopyAccelerationStructureKHR;
+        if (!strcmp(pName, "vkCmdWriteAccelerationStructuresPropertiesKHR")) return (PFN_vkVoidFunction)compat_CmdWriteAccelerationStructuresPropertiesKHR;
+        if (!strcmp(pName, "vkGetAccelerationStructureDeviceAddressKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureDeviceAddressKHR;
     }
     if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_ct || g_fail_log) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
@@ -9678,6 +9708,12 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
         if (!strcmp(pName, "vkCreatePipelineLayout")) return (PFN_vkVoidFunction)compat_RtCreatePipelineLayout;
         if (!strcmp(pName, "vkCmdBindDescriptorSets")) return (PFN_vkVoidFunction)compat_RtCmdBindDescriptorSets;
         if (!strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT")) return (PFN_vkVoidFunction)compat_RtCmdSetDescriptorBufferOffsetsEXT;
+        if (!strcmp(pName, "vkCreateAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_CreateAccelerationStructureKHR;
+        if (!strcmp(pName, "vkDestroyAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_DestroyAccelerationStructureKHR;
+        if (!strcmp(pName, "vkCmdBuildAccelerationStructuresKHR")) return (PFN_vkVoidFunction)compat_CmdBuildAccelerationStructuresKHR;
+        if (!strcmp(pName, "vkCmdCopyAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_CmdCopyAccelerationStructureKHR;
+        if (!strcmp(pName, "vkCmdWriteAccelerationStructuresPropertiesKHR")) return (PFN_vkVoidFunction)compat_CmdWriteAccelerationStructuresPropertiesKHR;
+        if (!strcmp(pName, "vkGetAccelerationStructureDeviceAddressKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureDeviceAddressKHR;
     }
     #undef MATCH_DEV2
 
@@ -9804,4 +9840,62 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRayTracingPipelineStackSizeKHR(
 {
     rt_patch_fex_thunks();
     compat_CmdSetRayTracingPipelineStackSizeKHR(commandBuffer, pipelineStackSize);
+}
+
+EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateAccelerationStructureKHR(
+    VkDevice device,
+    const VkAccelerationStructureCreateInfoKHR *pCreateInfo,
+    const VkAllocationCallbacks *pAllocator,
+    VkAccelerationStructureKHR *pAccelerationStructure)
+{
+    rt_patch_fex_thunks();
+    return compat_CreateAccelerationStructureKHR(device, pCreateInfo, pAllocator, pAccelerationStructure);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyAccelerationStructureKHR(
+    VkDevice device,
+    VkAccelerationStructureKHR accelerationStructure,
+    const VkAllocationCallbacks *pAllocator)
+{
+    rt_patch_fex_thunks();
+    compat_DestroyAccelerationStructureKHR(device, accelerationStructure, pAllocator);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBuildAccelerationStructuresKHR(
+    VkCommandBuffer commandBuffer,
+    uint32_t infoCount,
+    const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+    const VkAccelerationStructureBuildRangeInfoKHR * const *ppBuildRangeInfos)
+{
+    rt_patch_fex_thunks();
+    compat_CmdBuildAccelerationStructuresKHR(commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyAccelerationStructureKHR(
+    VkCommandBuffer commandBuffer,
+    const VkCopyAccelerationStructureInfoKHR *pInfo)
+{
+    rt_patch_fex_thunks();
+    compat_CmdCopyAccelerationStructureKHR(commandBuffer, pInfo);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteAccelerationStructuresPropertiesKHR(
+    VkCommandBuffer commandBuffer,
+    uint32_t accelerationStructureCount,
+    const VkAccelerationStructureKHR *pAccelerationStructures,
+    VkQueryType queryType,
+    VkQueryPool queryPool,
+    uint32_t firstQuery)
+{
+    rt_patch_fex_thunks();
+    compat_CmdWriteAccelerationStructuresPropertiesKHR(commandBuffer, accelerationStructureCount,
+                                                       pAccelerationStructures, queryType, queryPool, firstQuery);
+}
+
+EXPORT VKAPI_ATTR VkDeviceAddress VKAPI_CALL vkGetAccelerationStructureDeviceAddressKHR(
+    VkDevice device,
+    const VkAccelerationStructureDeviceAddressInfoKHR *pInfo)
+{
+    rt_patch_fex_thunks();
+    return compat_GetAccelerationStructureDeviceAddressKHR(device, pInfo);
 }
