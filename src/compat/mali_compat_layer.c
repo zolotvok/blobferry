@@ -3108,9 +3108,49 @@ static uint32_t g_vendor_id;
 static uint32_t g_device_id;
 static const char *g_device_name;
 
+// 752c09f's two DOOM Eternal overrides (subgroup supportedStages/Operations widened to VERTEX/TESS/GEOM, and
+// minStorageBufferOffsetAlignment clamped to 16) are OPT-IN since 11-07: they break Watch Dogs 2 (Marcus renders as floating
+// clothes, then a crash; with the real limits it renders correctly). DOOM Eternal needs both to start, RE Village the clamp to
+// load (docs/games/doom_eternal.md, docs/games/resident_evil_village.md). Default: the driver's real limits.
+// MALI_COMPAT_FAKE_LIMITS=1: both overrides. MALI_COMPAT_FAKE_SUBGROUP=1 / MALI_COMPAT_FAKE_ALIGN=1: one half alone.
+// The old MALI_COMPAT_REAL_SUBGROUP / _REAL_ALIGN / _REAL_LIMITS keys force the real values (they win over FAKE_*), so old
+// env entries stay harmless. [keeper, Claude Opus 5.5] 2026-11-07
+static int real_on(const char *e) { return e && *e && strcmp(e, "0") != 0; }
+static int real_limits_cfg(int which) { // 0 = subgroup, 1 = align; returns 1 when the REAL value is reported
+    static int v[2] = {-1, -1};
+    if (v[0] < 0) {
+        int fake_both = real_on(getenv("MALI_COMPAT_FAKE_LIMITS"));
+        int fake_sg = fake_both || real_on(getenv("MALI_COMPAT_FAKE_SUBGROUP"));
+        int fake_al = fake_both || real_on(getenv("MALI_COMPAT_FAKE_ALIGN"));
+        int real_both = real_on(getenv("MALI_COMPAT_REAL_LIMITS"));
+        int real_sg = real_both || real_on(getenv("MALI_COMPAT_REAL_SUBGROUP"));
+        int real_al = real_both || real_on(getenv("MALI_COMPAT_REAL_ALIGN"));
+        v[0] = !fake_sg || real_sg;
+        v[1] = !fake_al || real_al;
+        fprintf(stderr, "mali-compat: limits mode: subgroup %s, storage-buffer offset alignment %s (FAKE_SUBGROUP=%d FAKE_ALIGN=%d%s)\n",
+                v[0] ? "real" : "widened (FAKE)", v[1] ? "real" : "clamped to 16 (FAKE)", fake_sg, fake_al,
+                (real_sg || real_al) ? ", a REAL_* key forces real" : "");
+    }
+    return v[which];
+}
+#define real_subgroup() real_limits_cfg(0)
+#define real_align() real_limits_cfg(1)
+#define SG_WIDE_STAGES (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | \
+                        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | \
+                        VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT)
+#define SG_WIDE_OPS (VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | \
+                     VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT | \
+                     VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT | VK_SUBGROUP_FEATURE_CLUSTERED_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT)
+// RT emulation (MALI_COMPAT_RT_PIPELINE, rtx-clone-fix-1110) adds the RT stages to the subgroup stage mask in both modes: the
+// emulated RT stages run as compute, so they have the compute subgroup support. [night keeper, Claude Opus 5.5] 2026-11-10
+static uint32_t sg_stages(uint32_t real) {
+    return (real_subgroup() ? real : real | SG_WIDE_STAGES) | (g_rt_pipeline ? RT_SHADER_STAGE_MASK : 0);
+}
+static uint32_t sg_ops(uint32_t real) { return real_subgroup() ? real : real | SG_WIDE_OPS; }
+
 static void apply_properties_overrides(VkPhysicalDeviceProperties *p) {
     p->limits.minTexelBufferOffsetAlignment = 16;
-    if (p->limits.minStorageBufferOffsetAlignment > 16)
+    if (!real_align() && p->limits.minStorageBufferOffsetAlignment > 16)
         p->limits.minStorageBufferOffsetAlignment = 16;
     if (g_vendor_id) {
         p->vendorID = g_vendor_id;
@@ -3224,32 +3264,12 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
             v->uniformTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
         } else if (h->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES) {
             VkPhysicalDeviceSubgroupProperties *s = (VkPhysicalDeviceSubgroupProperties *)h;
-            s->supportedStages |= (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
-                                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_GEOMETRY_BIT |
-                                   VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT |
-                                   (g_rt_pipeline ? RT_SHADER_STAGE_MASK : 0));
-            s->supportedOperations |= (VK_SUBGROUP_FEATURE_BASIC_BIT |
-                                       VK_SUBGROUP_FEATURE_VOTE_BIT |
-                                       VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
-                                       VK_SUBGROUP_FEATURE_BALLOT_BIT |
-                                       VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
-                                       VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
-                                       VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
-                                       VK_SUBGROUP_FEATURE_QUAD_BIT);
+            s->supportedStages = sg_stages(s->supportedStages);
+            s->supportedOperations = sg_ops(s->supportedOperations);
         } else if (h->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES) {
             VkPhysicalDeviceVulkan11Properties *v11 = (VkPhysicalDeviceVulkan11Properties *)h;
-            v11->subgroupSupportedStages |= (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
-                                             VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_GEOMETRY_BIT |
-                                             VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT |
-                                             (g_rt_pipeline ? RT_SHADER_STAGE_MASK : 0));
-            v11->subgroupSupportedOperations |= (VK_SUBGROUP_FEATURE_BASIC_BIT |
-                                                 VK_SUBGROUP_FEATURE_VOTE_BIT |
-                                                 VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
-                                                 VK_SUBGROUP_FEATURE_BALLOT_BIT |
-                                                 VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
-                                                 VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
-                                                 VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
-                                                 VK_SUBGROUP_FEATURE_QUAD_BIT);
+            v11->subgroupSupportedStages = sg_stages(v11->subgroupSupportedStages);
+            v11->subgroupSupportedOperations = sg_ops(v11->subgroupSupportedOperations);
         }
     }
     // VK_EXT_vertex_attribute_divisor properties from the vendor's KHR struct.
@@ -8951,6 +8971,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     dc_init(); // also here: a device created without this layer's vkCreateInstance (checks) still parses the key
     wls_clamp_init(); // same for MALI_COMPAT_WLS_CLAMP (pthread_once)
     sd_init(); // sync-diag keys (pthread_once)
+    {   // once: real vs reported subgroup masks (+ storage alignment), to see what FAKE_SUBGROUP / FAKE_ALIGN change
+        static int logged;
+        if (!logged && inst && inst->fpGetPhysicalDeviceProperties2) {
+            logged = 1;
+            VkPhysicalDeviceVulkan11Properties r11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+            VkPhysicalDeviceProperties2 rp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &r11};
+            inst->fpGetPhysicalDeviceProperties2(physicalDevice, &rp); // the driver's own answer (below this layer)
+            fprintf(stderr, "mali-compat: subgroup real stages 0x%x ops 0x%x -> reported stages 0x%x ops 0x%x (real=%d); "
+                    "minStorageBufferOffsetAlignment real %llu -> reported %llu (real=%d)\n",
+                    r11.subgroupSupportedStages, r11.subgroupSupportedOperations,
+                    sg_stages(r11.subgroupSupportedStages), sg_ops(r11.subgroupSupportedOperations), real_subgroup(),
+                    (unsigned long long)rp.properties.limits.minStorageBufferOffsetAlignment,
+                    (unsigned long long)(!real_align() && rp.properties.limits.minStorageBufferOffsetAlignment > 16
+                                         ? 16 : rp.properties.limits.minStorageBufferOffsetAlignment), real_align());
+        }
+    }
 
     VkLayerDeviceCreateInfo *chain_info = (VkLayerDeviceCreateInfo *)pCreateInfo->pNext;
     while (chain_info &&

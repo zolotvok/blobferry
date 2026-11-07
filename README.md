@@ -219,6 +219,8 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 | `MALI_COMPAT_ASYNC_PSO=<ms>` | compile graphics pipelines on worker threads and wait at most `<ms>`; a slower one returns a stand-in whose draws are dropped until it is ready (pop-in instead of a stall) |
 | `MALI_COMPAT_ASYNC_THREADS=<n>` | worker threads for `ASYNC_PSO` (default 2) |
 | `MALI_COMPAT_VENDOR_ID=<hex>` | report another PCI vendor ID (driverID stays Arm); `5143` makes vkd3d-proton use push descriptors for root CBVs |
+| `MALI_COMPAT_FAKE_LIMITS=1` | 752c09f's two DOOM Eternal overrides: subgroup `supportedStages` widened to VERTEX/TESS/GEOMETRY and `minStorageBufferOffsetAlignment` clamped to 16. Off by default since 2026-11-07 (they were on for every game up to v0.2.0 and broke Watch Dogs 2: floating clothes, then a crash). DOOM Eternal needs them to start |
+| `MALI_COMPAT_FAKE_ALIGN=1` / `MALI_COMPAT_FAKE_SUBGROUP=1` | one half of `FAKE_LIMITS` alone; RE Village needs `FAKE_ALIGN` to load. The old `MALI_COMPAT_REAL_ALIGN` / `_REAL_SUBGROUP` / `_REAL_LIMITS` keys still force the driver's real values (they win) |
 | `MALI_COMPAT_SPV_FIX=1` | two SPIR-V rewrites against vendor-compiler aborts (u32→u64→float conversions, uniform `BroadcastFirst`); for Control the vendor-compiler abort stays with it (2026-10-30); Control runs with a stub shader override instead, see [Control](#control) |
 | `MALI_COMPAT_SPV_DONTUNROLL=1` | mark every loop DontUnroll (experiment against slow compiles) |
 | `MALI_COMPAT_NO_SUSPEND_RESUME=1` | turn vkd3d-proton's suspended/resumed render passes into plain passes (fixed HZD's blocky sky, needed by Control); installs the render-pass hooks itself, no `GPU_TIME` needed and no timing work without it |
