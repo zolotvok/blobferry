@@ -1404,6 +1404,8 @@ struct DeviceData {
     PFN_vkCreateGraphicsPipelines fpCreateGraphicsPipelines;
     PFN_vkCreateComputePipelines fpCreateComputePipelines;
     PFN_vkCreateDescriptorPool fpCreateDescriptorPool; // MALI_COMPAT_DESC_POOL_SCALE
+    PFN_vkCreateDescriptorSetLayout fpCreateDescriptorSetLayout; // MALI_COMPAT_FAIL_LOG descriptor hooks
+    PFN_vkAllocateDescriptorSets fpAllocateDescriptorSets;
     PFN_vkDestroyPipeline fpDestroyPipeline;
     PFN_vkCreatePipelineLayout fpCreatePipelineLayout;
     PFN_vkDestroyPipelineLayout fpDestroyPipelineLayout;
@@ -4066,34 +4068,148 @@ done:
 // Desktop drivers do not enforce pool type counts; the vendor driver does, vkAllocateDescriptorSets fails and the
 // engine asserts (int3 at 0x141c18809). Costs only pool memory. [game/doom_eternal, Claude Opus 5.5] 2026-11-06
 static uint32_t g_desc_pool_scale;
+// MALI_COMPAT_DESC_POOL_PAD=<n> (1..64): every core descriptor type that a vkCreateDescriptorPool does not list at all is
+// added with n x maxSets descriptors. Quake II RTX <= 1.8.0 (vertex_buffer.c vkpt_vertex_buffer_create) puts a
+// UNIFORM_BUFFER binding (sun color UBO) in its vbo set layout but gives the pool only a STORAGE_BUFFER size (fixed
+// upstream in 1.8.1). Desktop drivers allocate anyway; the vendor driver refuses the set (NULL), the release build
+// ignores the VkResult and vkUpdateDescriptorSets(dstSet = NULL) faults at NULL+8. Scaling cannot help (0 x n = 0).
+// [keeper, Claude Opus 5.5] 2026-11-07
+static uint32_t g_desc_pool_pad;
+static int g_fail_lvl; // MALI_COMPAT_FAIL_LOG level (1 = failures, 2 = also the first 16 calls of each descriptor entry)
+static void fl_pool_log(const VkDescriptorPoolCreateInfo *ci, VkResult r);
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDescriptorPool(VkDevice device, const VkDescriptorPoolCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkDescriptorPool *pPool) {
     struct DeviceData *d = get_device_data(device);
     VkDescriptorPoolCreateInfo ci = *pCreateInfo;
     VkDescriptorPoolSize sizes[64];
     uint32_t k = g_desc_pool_scale;
-    if (k > 1 && ci.poolSizeCount <= 64) {
+    uint32_t added = 0;
+    if ((k > 1 || g_desc_pool_pad) && ci.poolSizeCount <= 64 - 11) {
         for (uint32_t i = 0; i < ci.poolSizeCount; i++) {
             sizes[i] = pCreateInfo->pPoolSizes[i];
             // inline uniform block counts are bytes: keep them (the IUB pNext struct caps the bindings anyway)
-            if (sizes[i].type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) sizes[i].descriptorCount *= k;
+            if (k > 1 && sizes[i].type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) sizes[i].descriptorCount *= k;
         }
+        if (k > 1) ci.maxSets *= k;
+        if (g_desc_pool_pad) // core types 0..10 (SAMPLER .. INPUT_ATTACHMENT) the app left out
+            for (int t = VK_DESCRIPTOR_TYPE_SAMPLER; t <= VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT; t++) {
+                bool have = false;
+                for (uint32_t i = 0; i < pCreateInfo->poolSizeCount; i++) if ((int)pCreateInfo->pPoolSizes[i].type == t) have = true;
+                if (!have) { sizes[ci.poolSizeCount + added] = (VkDescriptorPoolSize){(VkDescriptorType)t, g_desc_pool_pad * ci.maxSets}; added++; }
+            }
+        ci.poolSizeCount += added;
         ci.pPoolSizes = sizes;
-        ci.maxSets *= k;
     }
     VkResult r = d->fpCreateDescriptorPool(device, &ci, pAllocator, pPool);
     static atomic_uint logged;
-    if (k > 1 && atomic_fetch_add(&logged, 1) < 4)
-        fprintf(stderr, "mali-compat: desc-pool-scale x%u: maxSets %u -> %u, %u sizes, flags 0x%x, result %d\n", k,
-                pCreateInfo->maxSets, ci.maxSets, ci.poolSizeCount, (unsigned)ci.flags, r);
-    if (r != VK_SUCCESS && k > 1) { // fall back to the app's own sizes rather than fail
+    if ((k > 1 || g_desc_pool_pad) && atomic_fetch_add(&logged, 1) < 4)
+        fprintf(stderr, "mali-compat: desc-pool-scale x%u pad %u: maxSets %u -> %u, %u sizes (+%u missing types), flags 0x%x, result %d\n", k,
+                g_desc_pool_pad, pCreateInfo->maxSets, ci.maxSets, pCreateInfo->poolSizeCount, added, (unsigned)ci.flags, r);
+    if (r != VK_SUCCESS && (k > 1 || added)) { // fall back to the app's own sizes rather than fail
         r = d->fpCreateDescriptorPool(device, pCreateInfo, pAllocator, pPool);
         fprintf(stderr, "mali-compat: desc-pool-scale: scaled pool failed, app sizes -> %d\n", r);
     }
+    if (g_fail_lvl) fl_pool_log(pCreateInfo, r);
     return r;
 }
 
 static bool g_fail_log; // MALI_COMPAT_FAIL_LOG=1: also hook vkCreateComputePipelines to log its failures
+
+// ---- MALI_COMPAT_FAIL_LOG descriptor hooks (Quake II RTX native: vkUpdateDescriptorSets got dstSet = NULL in
+// vkpt_vertex_buffer_create, so its set layout or set allocation failed silently; Q2RTX release builds drop the
+// VkResult). FAIL_LOG=1: every non-success VkResult of vkCreateDescriptorSetLayout / vkAllocateDescriptorSets /
+// vkCreateDescriptorPool / vkCreatePipelineLayout, and a "success" that leaves a NULL handle, is printed with its
+// binding list / pool sizes / set layouts. FAIL_LOG=2: also the first 16 calls of each, successes included.
+// Not active while MALI_COMPAT_DESC_CAPTURE owns these entries.
+// MALI_COMPAT_DSL_STAGE_RETRY=1: a failed set layout is retried once with VK_SHADER_STAGE_ALL bindings reduced to
+// graphics + compute + ray tracing stages (0x3f3f; drops mesh/task/subpass-shading/cluster bits).
+// [keeper, Claude Opus 5.5] 2026-11-07
+static bool g_dsl_stage_retry;
+static bool fl_want(VkResult r, atomic_uint *n) {
+    if (r != VK_SUCCESS) return true;
+    return g_fail_lvl >= 2 && atomic_fetch_add(n, 1) < 16;
+}
+static void fl_dsl_print(const char *tag, const VkDescriptorSetLayoutCreateInfo *ci, VkResult r, uint64_t h) {
+    const VkDescriptorSetLayoutBindingFlagsCreateInfo *bf = NULL;
+    for (const VkBaseInStructure *e = ci->pNext; e; e = e->pNext)
+        if (e->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO) bf = (const void *)e;
+    char buf[2048]; int o = 0;
+    for (uint32_t i = 0; i < ci->bindingCount && i < 40 && o < (int)sizeof buf - 64; i++) {
+        const VkDescriptorSetLayoutBinding *b = &ci->pBindings[i];
+        o += snprintf(buf + o, sizeof buf - o, " [b%u t%d n%u s0x%x%s f0x%x]", b->binding, (int)b->descriptorType,
+                      b->descriptorCount, (unsigned)b->stageFlags, b->pImmutableSamplers ? " imm" : "",
+                      bf && i < bf->bindingCount && bf->pBindingFlags ? (unsigned)bf->pBindingFlags[i] : 0u);
+    }
+    fprintf(stderr, "mali-compat: fail-log %s vkCreateDescriptorSetLayout result %d handle 0x%llx flags 0x%x pNext %s, %u bindings:%s\n",
+            tag, r, (unsigned long long)h, (unsigned)ci->flags, ci->pNext ? (bf ? "binding-flags" : "other") : "none",
+            ci->bindingCount, buf);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_FlCreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayoutCreateInfo *ci,
+                                                                          const VkAllocationCallbacks *a, VkDescriptorSetLayout *l) {
+    struct DeviceData *d = get_device_data(device);
+    static atomic_uint n;
+    VkResult r = d->fpCreateDescriptorSetLayout(device, ci, a, l);
+    bool null_ok = r == VK_SUCCESS && l && *l == VK_NULL_HANDLE;
+    if (fl_want(r, &n) || null_ok) fl_dsl_print(null_ok ? "NULL-ON-SUCCESS" : "", ci, r, l ? (uint64_t)*l : 0);
+    if (r != VK_SUCCESS && g_dsl_stage_retry && ci->bindingCount <= 64) {
+        VkDescriptorSetLayoutBinding b[64];
+        VkDescriptorSetLayoutCreateInfo c2 = *ci;
+        bool changed = false;
+        for (uint32_t i = 0; i < ci->bindingCount; i++) {
+            b[i] = ci->pBindings[i];
+            if (b[i].stageFlags & ~0x3f3fu) { b[i].stageFlags &= 0x3f3fu; changed = true; }
+        }
+        if (changed) {
+            c2.pBindings = b;
+            r = d->fpCreateDescriptorSetLayout(device, &c2, a, l);
+            fl_dsl_print("stage-retry", &c2, r, l ? (uint64_t)*l : 0);
+        }
+    }
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_FlAllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo *ai,
+                                                                       VkDescriptorSet *sets) {
+    static atomic_uint n;
+    VkResult r = get_device_data(device)->fpAllocateDescriptorSets(device, ai, sets);
+    bool null_ok = false;
+    if (r == VK_SUCCESS)
+        for (uint32_t i = 0; i < ai->descriptorSetCount; i++) if (!sets[i]) null_ok = true;
+    if (fl_want(r, &n) || null_ok) {
+        char buf[512]; int o = 0;
+        for (uint32_t i = 0; i < ai->descriptorSetCount && i < 16 && o < (int)sizeof buf - 48; i++)
+            o += snprintf(buf + o, sizeof buf - o, " L0x%llx->S0x%llx", (unsigned long long)ai->pSetLayouts[i],
+                          (unsigned long long)(r == VK_SUCCESS ? sets[i] : 0));
+        fprintf(stderr, "mali-compat: fail-log %svkAllocateDescriptorSets result %d pool 0x%llx count %u pNext %s:%s\n",
+                null_ok ? "NULL-ON-SUCCESS " : "", r, (unsigned long long)ai->descriptorPool, ai->descriptorSetCount,
+                ai->pNext ? "yes" : "none", buf);
+    }
+    return r;
+}
+static void fl_pool_log(const VkDescriptorPoolCreateInfo *ci, VkResult r) {
+    static atomic_uint n;
+    if (!fl_want(r, &n)) return;
+    char buf[1024]; int o = 0;
+    for (uint32_t i = 0; i < ci->poolSizeCount && i < 24 && o < (int)sizeof buf - 32; i++)
+        o += snprintf(buf + o, sizeof buf - o, " t%d:%u", (int)ci->pPoolSizes[i].type, ci->pPoolSizes[i].descriptorCount);
+    fprintf(stderr, "mali-compat: fail-log vkCreateDescriptorPool result %d (app values) maxSets %u flags 0x%x pNext %s sizes:%s\n",
+            r, ci->maxSets, (unsigned)ci->flags, ci->pNext ? "yes" : "none", buf);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_FlCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo *ci,
+                                                                     const VkAllocationCallbacks *a, VkPipelineLayout *l) {
+    static atomic_uint n;
+    VkResult r = get_device_data(device)->fpCreatePipelineLayout(device, ci, a, l);
+    if (fl_want(r, &n)) {
+        char buf[512]; int o = 0;
+        for (uint32_t i = 0; i < ci->setLayoutCount && i < 16 && o < (int)sizeof buf - 24; i++)
+            o += snprintf(buf + o, sizeof buf - o, " 0x%llx", (unsigned long long)ci->pSetLayouts[i]);
+        for (uint32_t i = 0; i < ci->pushConstantRangeCount && i < 8 && o < (int)sizeof buf - 40; i++)
+            o += snprintf(buf + o, sizeof buf - o, " pc[s0x%x %u+%u]", (unsigned)ci->pPushConstantRanges[i].stageFlags,
+                          ci->pPushConstantRanges[i].offset, ci->pPushConstantRanges[i].size);
+        fprintf(stderr, "mali-compat: fail-log vkCreatePipelineLayout result %d handle 0x%llx sets %u:%s\n", r,
+                (unsigned long long)(r == VK_SUCCESS ? *l : 0), ci->setLayoutCount, buf);
+    }
+    return r;
+}
 static void fail_spv_dump(const uint32_t *code, size_t bytes, uint32_t hash) {
     static atomic_uint n;
     if (!code || !bytes || atomic_fetch_add(&n, 1) >= 32) return;
@@ -8336,7 +8452,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_log_pipelines = access("/root/mali-pipelines.txt", W_OK) == 0;
     g_desc_pool_scale = getenv("MALI_COMPAT_DESC_POOL_SCALE") ? (uint32_t)atoi(getenv("MALI_COMPAT_DESC_POOL_SCALE")) : 0;
     if (g_desc_pool_scale > 64) g_desc_pool_scale = 64;
+    g_desc_pool_pad = getenv("MALI_COMPAT_DESC_POOL_PAD") ? (uint32_t)atoi(getenv("MALI_COMPAT_DESC_POOL_PAD")) : 0;
+    if (g_desc_pool_pad > 64) g_desc_pool_pad = 64;
     g_fail_log = getenv("MALI_COMPAT_FAIL_LOG") && atoi(getenv("MALI_COMPAT_FAIL_LOG")) > 0;
+    g_fail_lvl = g_fail_log ? atoi(getenv("MALI_COMPAT_FAIL_LOG")) : 0;
+    g_dsl_stage_retry = getenv("MALI_COMPAT_DSL_STAGE_RETRY") && atoi(getenv("MALI_COMPAT_DSL_STAGE_RETRY")) > 0;
     g_log_images = access("/root/mali-images.txt", W_OK) == 0;
     g_bc_afrc = !getenv("MALI_COMPAT_BC_AFRC") || strcmp(getenv("MALI_COMPAT_BC_AFRC"), "0") != 0;
     bool rt = getenv("MALI_COMPAT_RT_COMPRESS") && strcmp(getenv("MALI_COMPAT_RT_COMPRESS"), "0") != 0;
@@ -8839,6 +8959,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         LOAD_DEV(CreateGraphicsPipelines);
         LOAD_DEV(CreateComputePipelines);
         LOAD_DEV(CreateDescriptorPool);
+        LOAD_DEV(CreateDescriptorSetLayout);
+        LOAD_DEV(AllocateDescriptorSets);
         LOAD_DEV(DestroyPipeline);
         LOAD_DEV(CreatePipelineLayout);
         LOAD_DEV(DestroyPipelineLayout);
@@ -9154,7 +9276,13 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     #undef MATCH_DEV_KHR
     MATCH_DEV(DestroyDevice);
     MATCH_DEV(CreateShaderModule);
-    if (g_desc_pool_scale > 1) MATCH_DEV(CreateDescriptorPool);
+    if (g_desc_pool_scale > 1 || g_desc_pool_pad || g_fail_lvl) MATCH_DEV(CreateDescriptorPool);
+    if (g_fail_lvl || g_dsl_stage_retry) { // after dc_proc: desc-capture keeps these entries when it is on
+        struct DeviceData *fd = get_device_data(device);
+        if (fd && fd->fpCreateDescriptorSetLayout && !strcmp(pName, "vkCreateDescriptorSetLayout")) return (PFN_vkVoidFunction)compat_FlCreateDescriptorSetLayout;
+        if (fd && fd->fpAllocateDescriptorSets && !strcmp(pName, "vkAllocateDescriptorSets")) return (PFN_vkVoidFunction)compat_FlAllocateDescriptorSets;
+        if (fd && fd->fpCreatePipelineLayout && !strcmp(pName, "vkCreatePipelineLayout")) return (PFN_vkVoidFunction)compat_FlCreatePipelineLayout;
+    }
     MATCH_DEV(CreateGraphicsPipelines);
     MATCH_DEV(CmdSetPolygonModeEXT);
     MATCH_DEV(CreateImage);
