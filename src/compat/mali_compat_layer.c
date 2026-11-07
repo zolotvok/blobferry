@@ -1403,6 +1403,7 @@ struct DeviceData {
     PFN_vkDestroyShaderModule fpDestroyShaderModule;
     PFN_vkCreateGraphicsPipelines fpCreateGraphicsPipelines;
     PFN_vkCreateComputePipelines fpCreateComputePipelines;
+    PFN_vkCreateDescriptorPool fpCreateDescriptorPool; // MALI_COMPAT_DESC_POOL_SCALE
     PFN_vkDestroyPipeline fpDestroyPipeline;
     PFN_vkCreatePipelineLayout fpCreatePipelineLayout;
     PFN_vkDestroyPipelineLayout fpDestroyPipelineLayout;
@@ -4056,6 +4057,52 @@ done:
 // -----------------------------------------------------------------------------
 // Device Level Interceptions
 // -----------------------------------------------------------------------------
+// A failing shader module / compute pipeline leaves its SPIR-V as /root/mali-fail-<hash>.spv (first 32 only).
+// [game/doom_eternal, Claude Opus 5.5] 2026-11-06
+// MALI_COMPAT_DESC_POOL_SCALE=<n> (2..64): every vkCreateDescriptorPool gets maxSets and each descriptor count x n.
+// DOOM Eternal (idDescriptorSetFrameAllocator, DOOMEternalx64vk.exe 0x141c17da0) creates one pool per frame bank with
+// maxSets 512 and {UB 512, SSBO 192, storage image 16, sampled image 512, sampler 16, UTB 16, STB 16}, but its own
+// allocator admits up to 4096 sets and 8x those counts per bank (limits 0x143985e54.., checked at 0x141c18639..86af).
+// Desktop drivers do not enforce pool type counts; the vendor driver does, vkAllocateDescriptorSets fails and the
+// engine asserts (int3 at 0x141c18809). Costs only pool memory. [game/doom_eternal, Claude Opus 5.5] 2026-11-06
+static uint32_t g_desc_pool_scale;
+static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDescriptorPool(VkDevice device, const VkDescriptorPoolCreateInfo *pCreateInfo,
+    const VkAllocationCallbacks *pAllocator, VkDescriptorPool *pPool) {
+    struct DeviceData *d = get_device_data(device);
+    VkDescriptorPoolCreateInfo ci = *pCreateInfo;
+    VkDescriptorPoolSize sizes[64];
+    uint32_t k = g_desc_pool_scale;
+    if (k > 1 && ci.poolSizeCount <= 64) {
+        for (uint32_t i = 0; i < ci.poolSizeCount; i++) {
+            sizes[i] = pCreateInfo->pPoolSizes[i];
+            // inline uniform block counts are bytes: keep them (the IUB pNext struct caps the bindings anyway)
+            if (sizes[i].type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) sizes[i].descriptorCount *= k;
+        }
+        ci.pPoolSizes = sizes;
+        ci.maxSets *= k;
+    }
+    VkResult r = d->fpCreateDescriptorPool(device, &ci, pAllocator, pPool);
+    static atomic_uint logged;
+    if (k > 1 && atomic_fetch_add(&logged, 1) < 4)
+        fprintf(stderr, "mali-compat: desc-pool-scale x%u: maxSets %u -> %u, %u sizes, flags 0x%x, result %d\n", k,
+                pCreateInfo->maxSets, ci.maxSets, ci.poolSizeCount, (unsigned)ci.flags, r);
+    if (r != VK_SUCCESS && k > 1) { // fall back to the app's own sizes rather than fail
+        r = d->fpCreateDescriptorPool(device, pCreateInfo, pAllocator, pPool);
+        fprintf(stderr, "mali-compat: desc-pool-scale: scaled pool failed, app sizes -> %d\n", r);
+    }
+    return r;
+}
+
+static bool g_fail_log; // MALI_COMPAT_FAIL_LOG=1: also hook vkCreateComputePipelines to log its failures
+static void fail_spv_dump(const uint32_t *code, size_t bytes, uint32_t hash) {
+    static atomic_uint n;
+    if (!code || !bytes || atomic_fetch_add(&n, 1) >= 32) return;
+    char path[64];
+    snprintf(path, sizeof path, "/root/mali-fail-%08x.spv", hash);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(code, 1, bytes, f); fclose(f); }
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
     VkDevice device, const VkShaderModuleCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkShaderModule *pShaderModule) {
@@ -4083,6 +4130,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
     } else {
         r = d->fpCreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
         if (r == VK_SUCCESS && g_dump_inflight && pShaderModule) inflight_module_put(*pShaderModule, pCreateInfo->pCode, pCreateInfo->codeSize);
+    }
+    if (r != VK_SUCCESS) { // [game/doom_eternal, Claude Opus 5.5] 2026-11-06: failures were silent; keep the SPIR-V
+        uint32_t fh = spv_hash(pCreateInfo->pCode, pCreateInfo->codeSize);
+        fprintf(stderr, "mali-compat: vkCreateShaderModule FAILED: %d (spv %08x, %zu B, patched %d)\n", r, fh,
+                pCreateInfo->codeSize, patched_bytes != 0);
+        fail_spv_dump(pCreateInfo->pCode, pCreateInfo->codeSize, fh);
     }
     if (r == VK_SUCCESS && (g_gpu_time || g_dc_on || g_ct) && pShaderModule) hash_put(g_module_hash, (uint64_t)*pShaderModule, &hash, NULL, 1, mflags);
     if (r == VK_SUCCESS && g_fragdepth_fix && pShaderModule && spv_writes_fragdepth(pCreateInfo->pCode, pCreateInfo->codeSize))
@@ -5076,6 +5129,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
                                                    ct_ci ? ct_ci : pCreateInfos, pAllocator, pPipelines);
     for (uint32_t i = 0; i < 8; i++) if (ct_f2[i]) ct_f2[i]->flags = ct_f2_saved[i];
     free(ct_ci);
+    if (res != VK_SUCCESS) { // [game/doom_eternal, Claude Opus 5.5] 2026-11-06: compute failures were silent
+        for (uint32_t i = 0; i < createInfoCount; i++) {
+            const VkShaderModuleCreateInfo *sm = find_struct(pCreateInfos[i].stage.pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+            uint32_t fh[1], fst[1];
+            uint32_t fn = stage_hashes(&pCreateInfos[i].stage, 1, fh, fst);
+            fprintf(stderr, "mali-compat: vkCreateComputePipelines FAILED: %d (info %u/%u, module %p, spv %08x, entry %s, flags 0x%x)\n",
+                    res, i, createInfoCount, (void *)pCreateInfos[i].stage.module, fn ? fh[0] : 0,
+                    pCreateInfos[i].stage.pName ? pCreateInfos[i].stage.pName : "?", (unsigned)pCreateInfos[i].flags);
+            if (sm) fail_spv_dump(sm->pCode, sm->codeSize, spv_hash(sm->pCode, sm->codeSize));
+        }
+    }
     dump_inflight_done();
     for (uint32_t i = 0; i < 8; i++)
         if (wls_sm[i]) {
@@ -8270,6 +8334,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_dump_spirv = access("/root/mali-spv", W_OK) == 0;
     g_dump_inflight = access("/root/mali-spv-inflight", W_OK) == 0;
     g_log_pipelines = access("/root/mali-pipelines.txt", W_OK) == 0;
+    g_desc_pool_scale = getenv("MALI_COMPAT_DESC_POOL_SCALE") ? (uint32_t)atoi(getenv("MALI_COMPAT_DESC_POOL_SCALE")) : 0;
+    if (g_desc_pool_scale > 64) g_desc_pool_scale = 64;
+    g_fail_log = getenv("MALI_COMPAT_FAIL_LOG") && atoi(getenv("MALI_COMPAT_FAIL_LOG")) > 0;
     g_log_images = access("/root/mali-images.txt", W_OK) == 0;
     g_bc_afrc = !getenv("MALI_COMPAT_BC_AFRC") || strcmp(getenv("MALI_COMPAT_BC_AFRC"), "0") != 0;
     bool rt = getenv("MALI_COMPAT_RT_COMPRESS") && strcmp(getenv("MALI_COMPAT_RT_COMPRESS"), "0") != 0;
@@ -8771,6 +8838,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         LOAD_DEV(DestroyShaderModule);
         LOAD_DEV(CreateGraphicsPipelines);
         LOAD_DEV(CreateComputePipelines);
+        LOAD_DEV(CreateDescriptorPool);
         LOAD_DEV(DestroyPipeline);
         LOAD_DEV(CreatePipelineLayout);
         LOAD_DEV(DestroyPipelineLayout);
@@ -9076,7 +9144,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         struct DeviceData *dd = get_device_data(device);
         if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id || g_dc_on)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
     }
-    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_ct) MATCH_DEV(CreateComputePipelines);
+    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_ct || g_fail_log) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
         MATCH_DEV(CreateQueryPool);
         MATCH_DEV(DestroyQueryPool);
@@ -9086,6 +9154,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     #undef MATCH_DEV_KHR
     MATCH_DEV(DestroyDevice);
     MATCH_DEV(CreateShaderModule);
+    if (g_desc_pool_scale > 1) MATCH_DEV(CreateDescriptorPool);
     MATCH_DEV(CreateGraphicsPipelines);
     MATCH_DEV(CmdSetPolygonModeEXT);
     MATCH_DEV(CreateImage);
