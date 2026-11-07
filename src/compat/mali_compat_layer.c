@@ -71,6 +71,7 @@ static void mali_compat_log_write(const char *fmt, ...) {
 
     pthread_mutex_lock(&log_lock);
     FILE *f = fopen("/data/local/tmp/mali-compat.log", "a");
+    if (!f) f = fopen("/tmp/mali-compat.log", "a");
     if (f) {
         va_start(ap, fmt);
         vfprintf(f, fmt, ap);
@@ -1523,6 +1524,9 @@ struct DeviceData {
     PFN_vkCmdCopyAccelerationStructureKHR fpCmdCopyAccelerationStructureKHR;
     PFN_vkCmdWriteAccelerationStructuresPropertiesKHR fpCmdWriteAccelerationStructuresPropertiesKHR;
     PFN_vkGetAccelerationStructureDeviceAddressKHR fpGetAccelerationStructureDeviceAddressKHR;
+    VkBuffer rt_zero_buf;
+    VkDeviceMemory rt_zero_mem;
+    VkDeviceAddress rt_zero_bda;
     pthread_mutex_t bc_lock;
 };
 
@@ -9454,6 +9458,8 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
         }
         if (d->rt_ind_pipeline && d->fpDestroyPipeline) d->fpDestroyPipeline(device, d->rt_ind_pipeline, NULL);
         if (d->rt_ind_layout && d->fpDestroyPipelineLayout) d->fpDestroyPipelineLayout(device, d->rt_ind_layout, NULL);
+        if (d->rt_zero_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_zero_buf, NULL);
+        if (d->rt_zero_mem && d->fpFreeMemory) d->fpFreeMemory(device, d->rt_zero_mem, NULL);
         pthread_mutex_destroy(&d->bc_lock);
         destroy_staging_pool(d);
         if (d->fpDestroyDevice && device)

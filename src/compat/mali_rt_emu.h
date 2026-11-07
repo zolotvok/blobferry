@@ -3257,25 +3257,25 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
 
     /* Bounds check:
      * 1. hit_base must be non-zero (has_base).
-     * 2. If hit_size >= 32ULL: end_off must be <= hit_size.
-     * 3. If hit_size < 32ULL: table size was not provided by application (open-ended). */
+     * 2. hit_size must be >= 32ULL (has_hit_size).
+     * 3. end_off (byte_off64 + 32ULL) must be <= hit_size (within_size). */
     uint32_t c_zero64 = rt_get_const_u64(mb, 0ULL);
     uint32_t c_32_64  = rt_get_const_u64(mb, 32ULL);
 
     uint32_t has_base = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_base, hit_base, c_zero64);
 
-    uint32_t end_off = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, end_off, byte_off64, c_32_64);
-
     uint32_t has_hit_size = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_hit_size, hit_size, c_32_64);
+
+    uint32_t end_off = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, end_off, byte_off64, c_32_64);
 
     uint32_t within_size = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, within_size, end_off, hit_size);
 
     uint32_t in_bounds = rt_alloc_id(mb);
-    spv_emit_op5(b, RT_OP_SELECT, mb->t_bool, in_bounds, has_hit_size, within_size, mb->c_true);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, in_bounds, has_hit_size, within_size);
 
     uint32_t is_valid = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid, has_base, in_bounds);
@@ -3565,7 +3565,7 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
     spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, miss_within_sz, miss_end_off, miss_size);
 
     uint32_t miss_in_bounds = rt_alloc_id(mb);
-    spv_emit_op5(b, RT_OP_SELECT, mb->t_bool, miss_in_bounds, has_miss_sz, miss_within_sz, mb->c_true);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, miss_in_bounds, has_miss_sz, miss_within_sz);
 
     uint32_t run_miss = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_miss, has_miss_base, miss_in_bounds);
@@ -3771,14 +3771,10 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     uint32_t c_32_64    = rt_get_const_u64(mb, 32ULL);
     uint32_t has_rgen   = rt_alloc_id(mb);
     uint32_t has_rgen_sz= rt_alloc_id(mb);
-    uint32_t is_zero_rgen_sz = rt_alloc_id(mb);
-    uint32_t rgen_sz_ok = rt_alloc_id(mb);
     uint32_t run_rgen   = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_rgen, cur_rgen_base, c_zero64);
     spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_rgen_sz, cur_rgen_size, c_32_64);
-    spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_zero_rgen_sz, cur_rgen_size, c_zero64);
-    spv_emit_op4(b, RT_OP_LOGICAL_OR, mb->t_bool, rgen_sz_ok, has_rgen_sz, is_zero_rgen_sz);
-    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_rgen, has_rgen, rgen_sz_ok);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_rgen, has_rgen, has_rgen_sz);
 
     uint32_t lbl_do_rgen = rt_alloc_id(mb);
     spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_exit, 0u);
@@ -4492,15 +4488,98 @@ static bool rt_alloc_cmd_buffer(struct DeviceData *d,
     return true;
 }
 
+static VkDeviceAddress rt_get_zero_bda(struct DeviceData *d) {
+    if (!d) return 0ULL;
+    if (d->rt_zero_bda != 0ULL) return d->rt_zero_bda;
+
+    pthread_mutex_lock(&d->bc_lock);
+    if (d->rt_zero_bda != 0ULL) {
+        pthread_mutex_unlock(&d->bc_lock);
+        return d->rt_zero_bda;
+    }
+
+    if (!d->fpCreateBuffer || !d->fpAllocateMemory || !d->fpBindBufferMemory ||
+        !d->fpGetBufferDeviceAddress) {
+        pthread_mutex_unlock(&d->bc_lock);
+        return 0ULL;
+    }
+
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size  = 4096,
+        .usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (d->fpCreateBuffer(d->device, &bci, NULL, &buf) != VK_SUCCESS) {
+        pthread_mutex_unlock(&d->bc_lock);
+        return 0ULL;
+    }
+
+    VkMemoryRequirements req = {0};
+    d->fpGetBufferMemoryRequirements(d->device, buf, &req);
+    uint32_t mask = req.memoryTypeBits;
+    if (mask & d->coherent_types) {
+        mask &= d->coherent_types;
+    }
+    uint32_t mtype = mask ? (uint32_t)__builtin_ctz(mask) : 0u;
+
+    VkMemoryAllocateFlagsInfo mafi = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+    };
+    VkMemoryAllocateInfo mai = {
+        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext           = &mafi,
+        .allocationSize  = req.size,
+        .memoryTypeIndex = mtype,
+    };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (d->fpAllocateMemory(d->device, &mai, NULL, &mem) != VK_SUCCESS) {
+        d->fpDestroyBuffer(d->device, buf, NULL);
+        pthread_mutex_unlock(&d->bc_lock);
+        return 0ULL;
+    }
+
+    if (d->fpBindBufferMemory(d->device, buf, mem, 0) != VK_SUCCESS) {
+        d->fpFreeMemory(d->device, mem, NULL);
+        d->fpDestroyBuffer(d->device, buf, NULL);
+        pthread_mutex_unlock(&d->bc_lock);
+        return 0ULL;
+    }
+
+    if (d->fpMapMemory && d->fpUnmapMemory) {
+        void *ptr = NULL;
+        if (d->fpMapMemory(d->device, mem, 0, 4096, 0, &ptr) == VK_SUCCESS && ptr) {
+            memset(ptr, 0, 4096);
+            d->fpUnmapMemory(d->device, mem);
+        }
+    }
+
+    VkBufferDeviceAddressInfo bdai = {
+        .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = buf,
+    };
+    VkDeviceAddress bda = d->fpGetBufferDeviceAddress(d->device, &bdai);
+
+    d->rt_zero_buf = buf;
+    d->rt_zero_mem = mem;
+    d->rt_zero_bda = bda;
+
+    COMPAT_INFO("RT_EMU: initialized persistent 4KB zero scratch buffer: bda=0x%llx", (unsigned long long)bda);
+    pthread_mutex_unlock(&d->bc_lock);
+    return bda;
+}
+
 static VkDeviceAddress rt_upload_user_push_constants(struct DeviceData *d,
                                                      VkCommandBuffer cmd,
                                                      const struct RtCmdState *cs) {
-    uint8_t zero_pc[256] = {0};
-    const void *data = (cs && cs->user_pc_dirty_size > 0) ? cs->user_push_constants : zero_pc;
+    if (!cs || cs->user_pc_dirty_size == 0) {
+        return rt_get_zero_bda(d);
+    }
     VkDeviceAddress bda = 0ULL;
     if (!rt_alloc_cmd_buffer(d, cmd, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                             data, NULL, &bda)) {
-        return 0ULL;
+                             cs->user_push_constants, NULL, &bda)) {
+        return rt_get_zero_bda(d);
     }
     return bda;
 }
@@ -4594,15 +4673,30 @@ compat_CmdTraceRaysKHR(
     pc.indirect_bda    = 0ULL;
 
     static uint32_t g_trace_log_count = 0;
-    if (g_trace_log_count < 20 || (g_trace_log_count % 300) == 0) {
-        g_trace_log_count++;
+    uint32_t trace_idx = g_trace_log_count++;
+    if (trace_idx < 30 || (trace_idx % 120) == 0) {
         COMPAT_INFO("CmdTraceRays #%u: dim=%ux%ux%u rgen=%lx:sz%u:str%u miss=%lx:sz%u:str%u hit=%lx:sz%u:str%u call=%lx:sz%u:str%u pc_bda=%lx",
-                    g_trace_log_count, width, height, depth,
+                    trace_idx, width, height, depth,
                     (unsigned long)pc.rgen_base, pc.rgen_size, pc.rgen_stride,
                     (unsigned long)pc.miss_base, pc.miss_size, pc.miss_stride,
                     (unsigned long)pc.hit_base, pc.hit_size, pc.hit_stride,
                     (unsigned long)pc.call_base, pc.call_size, pc.call_stride,
                     (unsigned long)pc.push_consts_bda);
+    }
+
+    if (d->fpCmdPipelineBarrier) {
+        VkMemoryBarrier mb_bar = {
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_UNIFORM_READ_BIT,
+        };
+        d->fpCmdPipelineBarrier(commandBuffer,
+                                VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                0,
+                                1, &mb_bar,
+                                0, NULL,
+                                0, NULL);
     }
 
     rt_prepare_and_bind_megakernel(d, commandBuffer, cs, rp, &pc);
@@ -5417,6 +5511,34 @@ compat_CmdBuildAccelerationStructuresKHR(
         }
     }
     pthread_mutex_unlock(&g_rt_as_lock);
+
+    static uint32_t g_as_build_count = 0;
+    uint32_t as_idx = g_as_build_count++;
+    if (as_idx < 10 || (as_idx % 60) == 0) {
+        for (uint32_t i = 0; i < count; i++) {
+            COMPAT_INFO("CmdBuildAS #%u [%u/%u]: type=%u dst=%p src=%p geoms=%u",
+                        as_idx, i + 1, count, infos[i].type,
+                        (void *)infos[i].dstAccelerationStructure,
+                        (void *)infos[i].srcAccelerationStructure,
+                        infos[i].geometryCount);
+        }
+    }
+
+    if (d->fpCmdPipelineBarrier) {
+        VkMemoryBarrier pre_mb = {
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext         = NULL,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
+        };
+        d->fpCmdPipelineBarrier(commandBuffer,
+                                VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                0,
+                                1, &pre_mb,
+                                0, NULL,
+                                0, NULL);
+    }
 
     d->fpCmdBuildAccelerationStructuresKHR(commandBuffer, count, infos, ppBuildRangeInfos);
 
