@@ -5,11 +5,14 @@
 # Usage: bridge/build-bridge.sh build|zip|install-driver|deploy   (needs build-libhybris.sh install done; deploy logs to ../adb-device-changes.txt)
 set -eu
 B=$(cd "$(dirname "$0")" && pwd)
-SR=$B/../panvk-kbase-android/work/sysroot-bookworm-arm64
+ROOT=$B/..
+[ -d "$ROOT/panvk-kbase-android" ] || ROOT=$B/../../..
+SR=$ROOT/panvk-kbase-android/work/sysroot-bookworm-arm64
 NDK=$HOME/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin
 GCCDIR=$(ls -d "$SR"/usr/lib/gcc/aarch64-linux-gnu/*/ | head -1)
 T="--target=aarch64-linux-gnu --sysroot=$SR --gcc-install-dir=$GCCDIR --ld-path=$NDK/ld.lld"
 LIBDIR=$B/build/libhybris-install/usr/lib/hybris
+[ -d "$LIBDIR" ] || LIBDIR=$ROOT/bridge/build/libhybris-install/usr/lib/hybris
 OUT=$B/build/mali_bridge
 STAGE=$OUT/stage/usr/lib/mali_bridge
 LINK="-L$LIBDIR -lhybris-common -Wl,-rpath,/usr/lib/hybris"
@@ -19,7 +22,7 @@ case ${1:-build} in
     clang $T -O2 -Wall -fPIC -shared -fvisibility=hidden -Wl,-soname,libvulkan_mali_bridge.so -Wl,-Bsymbolic -Wl,--no-undefined -Wl,-z,nodelete \
       "$B/src/icd/mali_bridge_icd.c" -o "$STAGE/libvulkan_mali_bridge.so" $LINK
     clang $T -O2 -Wall -fPIC -shared -fvisibility=hidden -Wl,-soname,libVkLayer_droiddeck_mali_compat.so -Wl,-Bsymbolic -Wl,--no-undefined -Wl,-z,nodelete \
-      -I"$B/src/compat" -I"$B/../panvk-kbase-android/work/mesa/include" \
+      -I"$B/src/compat" -I"$ROOT/panvk-kbase-android/work/mesa/include" \
       "$B/src/compat/mali_compat_layer.c" -o "$STAGE/libVkLayer_droiddeck_mali_compat.so" -lpthread
     "$B/gen-capabilities.sh" "$(git -C "$B" rev-parse --short HEAD)" "$STAGE/libVkLayer_droiddeck_mali_compat.so" "$OUT/stage/usr/share/blobferry/capabilities.json"
     clang $T -O2 -Wall "$B/test/hal-probe.c" -o "$OUT/hal-probe" $LINK
@@ -27,14 +30,15 @@ case ${1:-build} in
     clang $T -O2 -Wall -fPIC -shared "$B/test/segv-report.c" -o "$STAGE/segv-report.so"   # LD_PRELOAD crash reporter (no gdb in the guest)
     cp "$OUT/icd-threads" "$STAGE/icd-threads"   # test tools ride along in /usr/lib/mali_bridge (no new rootfs dirs)
     clang $T -O2 -Wall "$B/test/img-probe.c" -o "$STAGE/img-probe" -lvulkan   # which dma-buf image create infos the HAL takes
-    clang $T -O2 -Wall -I"$B/../panvk-kbase-android/work/mesa/include" "$B/test/map-probe.c" -o "$STAGE/map-probe" -lvulkan   # can the vendor mappings be moved (placed maps)
+    clang $T -O2 -Wall -I"$ROOT/panvk-kbase-android/work/mesa/include" "$B/test/map-probe.c" -o "$STAGE/map-probe" -lvulkan   # can the vendor mappings be moved (placed maps)
     clang $T -O2 -Wall "$B/test/bc-probe.c" -o "$STAGE/bc-probe" -lvulkan   # does the compat layer decode BC uploads
     clang $T -O2 -Wall -I"$B/test" "$B/test/pushdesc-probe.c" -o "$STAGE/pushdesc-probe" -lvulkan   # push-descriptor UBO in vkd3d's root-CBV layout
     clang $T -O2 -Wall -I"$B/test" "$B/test/xfb-probe.c" -o "$STAGE/xfb-probe" -lvulkan   # cost of stream output (GS + transform feedback)
     clang $T -O2 -Wall "$B/test/session-probe.c" -o "$STAGE/session-probe" -lvulkan   # what gamescope / Steam need from the bridge
     clang $T -O2 -Wall "$B/test/export-probe.c" -o "$STAGE/export-probe" -lvulkan   # does a GPU write reach an exported dma-buf
-    clang $T -O2 -Wall -I"$B/../panvk-kbase-android/work/mesa/include" "$B/test/afrc-probe.c" -o "$STAGE/afrc-probe" -lvulkan   # AFRC rates for the BC shadow formats
+    clang $T -O2 -Wall -I"$ROOT/panvk-kbase-android/work/mesa/include" "$B/test/afrc-probe.c" -o "$STAGE/afrc-probe" -lvulkan   # AFRC rates for the BC shadow formats
     clang $T -O2 -Wall "$B/test/spv-compile-probe.c" -o "$STAGE/spv-compile-probe" -lvulkan   # does the vendor compiler take a compute .spv (abort in a forked child)
+    clang $T -O2 -Wall "$B/test/rt-pipe-smoke.c" -o "$STAGE/rt-pipe-smoke" -lvulkan   # VK_KHR_ray_tracing_pipeline megakernel smoke test
     "$B/test/robust-probe-build.sh" >/dev/null   # WD2 vendor robustness probe (builds into build/robust-probe/, shaders via glslangValidator)
     # vkprobe.exe: an x86-64 Windows program for Proton (llvm-mingw in tools-llvm-mingw; Vulkan headers from the sysroot)
     MINGW=$(ls "$B"/../tools-llvm-mingw/llvm-mingw-*/bin/x86_64-w64-mingw32-clang 2>/dev/null | head -1)

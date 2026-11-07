@@ -5,11 +5,16 @@
 # [tests, Claude Sonnet 5.5] 2026-11-01
 set -eu
 B=$(cd "$(dirname "$0")/.." && pwd)
-SR=$B/../panvk-kbase-android/work/sysroot-bookworm-arm64
+if [ -d "$B/../panvk-kbase-android" ]; then
+  ROOT_DIR=$(cd "$B/.." && pwd)
+else
+  ROOT_DIR=$(cd "$B/../../.." && pwd)
+fi
+SR=$ROOT_DIR/panvk-kbase-android/work/sysroot-bookworm-arm64
 NDK=$HOME/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin
 GCCDIR=$(ls -d "$SR"/usr/lib/gcc/aarch64-linux-gnu/*/ | head -1)
 T="--target=aarch64-linux-gnu --sysroot=$SR --gcc-install-dir=$GCCDIR --ld-path=$NDK/ld.lld"
-INC="-I$B/../panvk-kbase-android/work/mesa/include -I$B/test"
+INC="-I$ROOT_DIR/panvk-kbase-android/work/mesa/include -I$B/test"
 OUT=$B/build/robust-probe; mkdir -p "$OUT"
 for v in utb stb ubo ssbo wild; do
   glslangValidator -V --target-env vulkan1.2 -S comp -D$(echo $v | tr a-z A-Z)=1 --vn rp_$v -o "$B/test/shaders/robust-probe-$v.h" "$B/test/shaders/robust-probe.comp" > /dev/null

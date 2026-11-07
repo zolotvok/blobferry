@@ -94,7 +94,7 @@ static bool g_dump_spirv, g_dump_inflight, g_log_pipelines, g_log_images; // che
 // device/feature/extension reporting code advertises VK_KHR_ray_tracing_pipeline + rayTracingPipeline when
 // g_rt_pipeline && rt_pipeline_emulation_available(). Keep src/compat/capabilities.json.in ("rt_pipeline") in step.
 static bool g_rt_pipeline;
-static bool rt_pipeline_emulation_available(void) { return false; }
+static bool rt_pipeline_emulation_available(void) { return true; }
 static bool g_bc_afrc = true; // MALI_COMPAT_BC_AFRC=0 turns the fixed-rate BC shadows off
 static void dump_spirv(const uint32_t *orig, size_t orig_bytes, const uint32_t *patched, size_t patched_bytes) {
     static _Atomic int n;
@@ -1490,6 +1490,12 @@ struct DeviceData {
     struct DcFns *dcf;  // desc-capture-1 driver entry points, NULL when off
     struct CtDev *ct;   // cover-trim (MALI_COMPAT_COVER_TRIM), NULL when off
     struct SdDev *sd;   // sync-diag next/driver entry points, NULL when off
+    VkPipelineLayout rt_ind_layout;
+    VkPipeline rt_ind_pipeline;
+    PFN_vkCmdDispatchIndirect fpCmdDispatchIndirect;
+    PFN_vkCmdSetDescriptorBufferOffsetsEXT fpCmdSetDescriptorBufferOffsetsEXT;
+    PFN_vkCmdBindDescriptorSets fpCmdBindDescriptorSets;
+    pthread_mutex_t bc_lock;
 };
 
 #define MAX_INSTANCES 32
@@ -2713,8 +2719,11 @@ static void destroy_staging_pool(struct DeviceData *d) {
     }
 }
 
+static void rt_reset_cmd_state(VkCommandBuffer cmd, bool remove);
+
 // Begin/reset: staging buffers back to the pool, tracked state cleared; the entry stays. Free: the entry goes.
 static void reset_cmd_data(struct DeviceData *dev_data, VkCommandBuffer cmd, bool remove) {
+    if (g_rt_pipeline) rt_reset_cmd_state(cmd, remove);
     pthread_mutex_lock(&g_cmdbuf_mutex);
     struct CmdBufData **pp = &g_cmdbufs[handle_bucket((uint64_t)(uintptr_t)cmd, CMDBUF_BUCKETS)];
     while (*pp && (*pp)->cmdbuf != cmd) pp = &(*pp)->next;
@@ -2842,6 +2851,8 @@ static VkResult init_bc_compute(struct DeviceData *d) {
     return VK_SUCCESS;
 }
 
+#include "mali_rt_emu.h"
+
 // -----------------------------------------------------------------------------
 // Intercepted Vulkan Entry Points
 // -----------------------------------------------------------------------------
@@ -2904,8 +2915,14 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2 *pFeatures) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
     struct unlinked u = unlink_struct(pFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT);
+    struct unlinked u_rtp  = g_rt_pipeline ? unlink_struct(pFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR) : (struct unlinked){0};
+    struct unlinked u_rtm1 = g_rt_pipeline ? unlink_struct(pFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR) : (struct unlinked){0};
+    struct unlinked u_plgh = g_rt_pipeline ? unlink_struct(pFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_LIBRARY_GROUP_HANDLES_FEATURES_EXT) : (struct unlinked){0};
     if (inst && inst->fpGetPhysicalDeviceFeatures2)
         inst->fpGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
+    relink(u_plgh);
+    relink(u_rtm1);
+    relink(u_rtp);
     relink(u);
 
     pFeatures->features.textureCompressionBC = VK_TRUE;
@@ -2964,6 +2981,20 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFeatures2(
             v12->storageBuffer8BitAccess = VK_TRUE;
             v12->uniformAndStorageBuffer8BitAccess = VK_TRUE;
             v12->storagePushConstant8 = VK_TRUE;
+        } else if (g_rt_pipeline && header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR) {
+            VkPhysicalDeviceRayTracingPipelineFeaturesKHR *rtp = (VkPhysicalDeviceRayTracingPipelineFeaturesKHR *)header;
+            rtp->rayTracingPipeline = VK_TRUE;
+            rtp->rayTracingPipelineShaderGroupHandleCaptureReplay = VK_FALSE;
+            rtp->rayTracingPipelineShaderGroupHandleCaptureReplayMixed = VK_FALSE;
+            rtp->rayTracingPipelineTraceRaysIndirect = VK_TRUE;
+            rtp->rayTraversalPrimitiveCulling = VK_TRUE;
+        } else if (g_rt_pipeline && header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR) {
+            VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR *rtm1 = (VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR *)header;
+            rtm1->rayTracingMaintenance1 = VK_TRUE;
+            rtm1->rayTracingPipelineTraceRaysIndirect2 = VK_TRUE;
+        } else if (g_rt_pipeline && header->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_LIBRARY_GROUP_HANDLES_FEATURES_EXT) {
+            VkPhysicalDevicePipelineLibraryGroupHandlesFeaturesEXT *plgh = (VkPhysicalDevicePipelineLibraryGroupHandlesFeaturesEXT *)header;
+            plgh->pipelineLibraryGroupHandles = VK_TRUE;
         }
         header = header->pNext;
     }
@@ -3058,10 +3089,24 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
     struct unlinked u = unlink_struct(pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT);
     struct unlinked ud = g_drm_on ? unlink_struct(pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT)
                                   : (struct unlinked){0};
+    struct unlinked urtp = g_rt_pipeline ? unlink_struct(pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR)
+                                         : (struct unlinked){0};
     if (inst && inst->fpGetPhysicalDeviceProperties2)
         inst->fpGetPhysicalDeviceProperties2(physicalDevice, pProperties);
+    relink(urtp);
     relink(ud);
     relink(u);
+    if (urtp.node) {
+        VkPhysicalDeviceRayTracingPipelinePropertiesKHR *rtpp = (VkPhysicalDeviceRayTracingPipelinePropertiesKHR *)urtp.node;
+        rtpp->shaderGroupHandleSize              = RT_GROUP_HANDLE_SIZE;
+        rtpp->maxRayRecursionDepth               = 2;
+        rtpp->maxShaderGroupStride               = 4096;
+        rtpp->shaderGroupBaseAlignment           = 64;
+        rtpp->shaderGroupHandleCaptureReplaySize = RT_GROUP_HANDLE_SIZE;
+        rtpp->maxRayDispatchInvocationCount      = 67108864u;
+        rtpp->shaderGroupHandleAlignment         = RT_GROUP_HANDLE_SIZE;
+        rtpp->maxRayHitAttributeSize             = 64;
+    }
     if (ud.node) {
         VkPhysicalDeviceDrmPropertiesEXT *drm = (VkPhysicalDeviceDrmPropertiesEXT *)ud.node;
         drm->hasPrimary = drm->hasRender = VK_TRUE;
@@ -3085,7 +3130,8 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
             VkPhysicalDeviceSubgroupProperties *s = (VkPhysicalDeviceSubgroupProperties *)h;
             s->supportedStages |= (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
                                    VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_GEOMETRY_BIT |
-                                   VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
+                                   VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT |
+                                   (g_rt_pipeline ? RT_SHADER_STAGE_MASK : 0));
             s->supportedOperations |= (VK_SUBGROUP_FEATURE_BASIC_BIT |
                                        VK_SUBGROUP_FEATURE_VOTE_BIT |
                                        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
@@ -3098,7 +3144,8 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceProperties2(
             VkPhysicalDeviceVulkan11Properties *v11 = (VkPhysicalDeviceVulkan11Properties *)h;
             v11->subgroupSupportedStages |= (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
                                              VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_GEOMETRY_BIT |
-                                             VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
+                                             VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT |
+                                             (g_rt_pipeline ? RT_SHADER_STAGE_MASK : 0));
             v11->subgroupSupportedOperations |= (VK_SUBGROUP_FEATURE_BASIC_BIT |
                                                  VK_SUBGROUP_FEATURE_VOTE_BIT |
                                                  VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
@@ -3403,7 +3450,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_EnumerateDeviceExtensionProperties(
     VkResult res = inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, NULL);
     if (res != VK_SUCCESS) return res;
 
-    VkExtensionProperties *all = (VkExtensionProperties *)malloc((count + 4) * sizeof(VkExtensionProperties));
+    VkExtensionProperties *all = (VkExtensionProperties *)malloc((count + 12) * sizeof(VkExtensionProperties));
     if (!all) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
     res = inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, all);
@@ -3443,6 +3490,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_EnumerateDeviceExtensionProperties(
         strncpy(all[count].extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME, VK_MAX_EXTENSION_NAME_SIZE);
         all[count].specVersion = 1;
         count++;
+    }
+    if (g_rt_pipeline && rt_pipeline_emulation_available()) {
+        static const struct { const char *name; uint32_t ver; } rt_exts[] = {
+            { "VK_KHR_ray_tracing_pipeline",          1 },
+            { "VK_KHR_pipeline_library",              1 },
+            { "VK_KHR_ray_tracing_maintenance1",      1 },
+            { "VK_EXT_pipeline_library_group_handles", 1 },
+            { "VK_KHR_deferred_host_operations",      4 },
+        };
+        for (size_t e = 0; e < sizeof(rt_exts) / sizeof(rt_exts[0]); e++) {
+            bool found = false;
+            for (uint32_t i = 0; i < count; i++) {
+                if (!strcmp(all[i].extensionName, rt_exts[e].name)) { found = true; break; }
+            }
+            if (!found) {
+                strncpy(all[count].extensionName, rt_exts[e].name, VK_MAX_EXTENSION_NAME_SIZE);
+                all[count].specVersion = rt_exts[e].ver;
+                count++;
+            }
+        }
     }
 
     if (!pProperties) {
@@ -4231,6 +4298,11 @@ static void fail_spv_dump(const uint32_t *code, size_t bytes, uint32_t hash) {
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
     VkDevice device, const VkShaderModuleCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkShaderModule *pShaderModule) {
+    if (g_rt_pipeline && pCreateInfo && pShaderModule &&
+        rt_is_ray_tracing_spirv(pCreateInfo->pCode, pCreateInfo->codeSize)) {
+        *pShaderModule = rt_register_shader_module(device, pCreateInfo->pCode, pCreateInfo->codeSize);
+        return *pShaderModule ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     struct DeviceData *d = get_device_data(device);
     uint32_t hash = 0, mflags = 0, cnt[4];
     if (g_gpu_time || g_dump_hash_count || g_vs_scan || g_dc_on || g_ct) {
@@ -4900,6 +4972,7 @@ static bool async_destroy(VkPipeline p) {
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_DestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks *a) {
+    if (g_rt_pipeline && rt_destroy_pipeline(get_device_data(device), pipeline, a)) return;
     if (async_destroy(pipeline)) return;
     get_device_data(device)->fpDestroyPipeline(device, pipeline, a);
 }
@@ -5890,6 +5963,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
     if (mod.usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) {
         mod.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
+    if (g_rt_pipeline) {
+        if (mod.usage & VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR) {
+            mod.usage &= ~VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR;
+            mod.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        }
+        if (mod.usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT)) {
+            mod.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        }
+    }
 
     VkResult r = d->fpCreateBuffer(device, &mod, pAllocator, pBuffer);
     if (g_dc_on && r == VK_SUCCESS) dc_buf_create(d, *pBuffer, &mod);
@@ -6322,6 +6406,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_FreeMemory(
 // State tracking for the restore after a BC decode (see struct PushRec). Graphics binds are passed straight on.
 static VKAPI_ATTR void VKAPI_CALL compat_CmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint bindPoint,
                                                          VkPipeline pipeline) {
+    if (g_rt_pipeline && rt_cmd_bind_pipeline(commandBuffer, bindPoint, pipeline)) return;
     struct CmdBufData *c = cmd_data(commandBuffer);
     VkPipeline drv = pipeline;
     if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
@@ -6364,6 +6449,7 @@ static void push_record(struct CmdBufData *c, VkPipelineLayout layout, VkShaderS
 static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
                                                           VkShaderStageFlags stages, uint32_t offset, uint32_t size,
                                                           const void *pValues) {
+    if (g_rt_pipeline) rt_cmd_push_constants(commandBuffer, layout, &stages, offset, size, pValues);
     pc2_count(PC2_V1);
     struct CmdBufData *c = cmd_data(commandBuffer);
     if (!c) {
@@ -6377,6 +6463,16 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants(VkCommandBuffer comman
 // vkCmdPushConstants2 / vkCmdPushConstants2KHR (pc2-restore-1): recorded like v1. A push with layout VK_NULL_HANDLE
 // (layout given as VkPipelineLayoutCreateInfo in pNext) or past 256 bytes is not recorded, only counted.
 static void push2_common(VkCommandBuffer commandBuffer, const VkPushConstantsInfo *info, bool khr) {
+    VkPushConstantsInfo mod_info;
+    if (g_rt_pipeline && info) {
+        VkShaderStageFlags rt_stages = info->stageFlags;
+        rt_cmd_push_constants(commandBuffer, info->layout, &rt_stages, info->offset, info->size, info->pValues);
+        if (rt_stages != info->stageFlags) {
+            mod_info = *info;
+            mod_info.stageFlags = rt_stages;
+            info = &mod_info;
+        }
+    }
     pc2_count(PC2_V2);
     struct CmdBufData *c = cmd_data(commandBuffer);
     struct DeviceData *d = c ? c->dev : get_device_data_by_cmd(commandBuffer);
@@ -8204,6 +8300,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushDescriptorSetKHR(VkCommandBuffer
             c->gt_src = w[i].pImageInfo[0].imageView;
             break;
         }
+    if (g_rt_pipeline && bp == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) bp = VK_PIPELINE_BIND_POINT_COMPUTE;
     struct PushDescRec *r = !c ? NULL : bp == VK_PIPELINE_BIND_POINT_COMPUTE ? &c->cpd
                           : bp == VK_PIPELINE_BIND_POINT_GRAPHICS ? &c->gpd : NULL;
     if (g_dc_on) dc_push_writes(c, bp, layout, set, count, w, false);
@@ -8612,8 +8709,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     }
     pthread_mutex_unlock(&g_table_mutex);
 
-    if (g_rt_pipeline && !rt_pipeline_emulation_available())
-        fprintf(stderr, "mali-compat: RT pipeline (VK_KHR_ray_tracing_pipeline emulation) requested: not implemented in this build (ray query: supported)\n");
+    if (g_rt_pipeline) {
+        fprintf(stderr, "mali-compat: RT pipeline (VK_KHR_ray_tracing_pipeline -> VK_KHR_ray_query megakernel) enabled\n");
+    }
     LOG("created VkInstance %p (key=%p)", (void *)*pInstance, *pInstance ? *(void **)*pInstance : NULL);
     return VK_SUCCESS;
 }
@@ -8671,18 +8769,54 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     // Mask spoofed features before calling down
     VkDeviceCreateInfo mod_ci = *pCreateInfo;
     // VK_EXT_map_memory_placed is the layer's own: keep its name and feature struct away from the driver.
-    const char **ext_names = malloc((pCreateInfo->enabledExtensionCount + 4) * sizeof *ext_names);
+    const char **ext_names = malloc((pCreateInfo->enabledExtensionCount + 12) * sizeof *ext_names);
     if (!ext_names) return VK_ERROR_OUT_OF_HOST_MEMORY;
     mod_ci.enabledExtensionCount = 0;
     bool div_ext = false, div_khr = false;
+    bool drv_has_rq = false, drv_has_as = false, drv_has_dho = false, drv_has_plib = false;
+    if (g_rt_pipeline && inst && inst->fpEnumerateDeviceExtensionProperties) {
+        uint32_t n = 0;
+        inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &n, NULL);
+        VkExtensionProperties *props = n ? malloc(n * sizeof *props) : NULL;
+        if (props && inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &n, props) >= 0) {
+            for (uint32_t i = 0; i < n; i++) {
+                drv_has_rq   |= !strcmp(props[i].extensionName, "VK_KHR_ray_query");
+                drv_has_as   |= !strcmp(props[i].extensionName, "VK_KHR_acceleration_structure");
+                drv_has_dho  |= !strcmp(props[i].extensionName, "VK_KHR_deferred_host_operations");
+                drv_has_plib |= !strcmp(props[i].extensionName, "VK_KHR_pipeline_library");
+            }
+        }
+        free(props);
+    }
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
         const char *e = pCreateInfo->ppEnabledExtensionNames[i];
         if (!strcmp(e, "VK_EXT_vertex_attribute_divisor")) { div_ext = true; continue; } // the vendor has only KHR
         div_khr |= !strcmp(e, "VK_KHR_vertex_attribute_divisor");
         if (g_drm_on && !strcmp(e, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME)) continue; // the layer's (properties only)
+        if (g_rt_pipeline) {
+            if (!strcmp(e, "VK_KHR_ray_tracing_pipeline") ||
+                !strcmp(e, "VK_KHR_ray_tracing_maintenance1") ||
+                !strcmp(e, "VK_EXT_pipeline_library_group_handles")) continue;
+            if (!strcmp(e, "VK_KHR_pipeline_library") && !drv_has_plib) continue;
+            if (!strcmp(e, "VK_KHR_deferred_host_operations") && !drv_has_dho) continue;
+        }
         if (strcmp(e, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME)) ext_names[mod_ci.enabledExtensionCount++] = e;
     }
     if (div_ext && !div_khr) ext_names[mod_ci.enabledExtensionCount++] = "VK_KHR_vertex_attribute_divisor";
+    if (g_rt_pipeline) {
+        const char *need_rt[3] = {
+            drv_has_dho ? "VK_KHR_deferred_host_operations" : NULL,
+            drv_has_as  ? "VK_KHR_acceleration_structure"   : NULL,
+            drv_has_rq  ? "VK_KHR_ray_query"                : NULL,
+        };
+        for (int k = 0; k < 3; k++) {
+            if (!need_rt[k]) continue;
+            bool have = false;
+            for (uint32_t i = 0; i < mod_ci.enabledExtensionCount; i++)
+                have |= !strcmp(ext_names[i], need_rt[k]);
+            if (!have) ext_names[mod_ci.enabledExtensionCount++] = need_rt[k];
+        }
+    }
     // BC shadows get fixed-rate compression (AFRC) and the image log queries compression: both need
     // VK_EXT_image_compression_control and its feature. Enabled when the driver has it. [Claude Opus 5.5]
     bool want_icc = false;
@@ -8741,6 +8875,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     }
     mod_ci.ppEnabledExtensionNames = ext_names;
     struct unlinked placed_feat = unlink_struct(&mod_ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT);
+    struct unlinked u_rtp_dev  = g_rt_pipeline ? unlink_struct(&mod_ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR) : (struct unlinked){0};
+    struct unlinked u_rtm1_dev = g_rt_pipeline ? unlink_struct(&mod_ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR) : (struct unlinked){0};
+    struct unlinked u_plgh_dev = g_rt_pipeline ? unlink_struct(&mod_ci, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_LIBRARY_GROUP_HANDLES_FEATURES_EXT) : (struct unlinked){0};
+    VkPhysicalDeviceRayQueryFeaturesKHR rq_feat = {
+        .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+        .rayQuery = VK_TRUE,
+    };
+    VkPhysicalDeviceRayQueryFeaturesKHR *app_rq = (VkPhysicalDeviceRayQueryFeaturesKHR *)
+        find_struct(mod_ci.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR);
+    VkBool32 saved_app_rq = app_rq ? app_rq->rayQuery : VK_FALSE;
+    if (g_rt_pipeline && drv_has_rq) {
+        if (app_rq) app_rq->rayQuery = VK_TRUE;
+        else { rq_feat.pNext = (void *)mod_ci.pNext; mod_ci.pNext = &rq_feat; }
+    }
     // VkPhysicalDeviceFeatures in declaration order (55 VkBool32). The old table lacked fillModeNonSolid and depthBounds, so
     // every name from idx 13 on was shifted by two: the logged "wideLines (13)", "largePoints (14)", "pipelineStatisticsQuery
     // (22)", "fragmentStoresAndAtomics (24)", "shaderFloat64 (37)", "shaderInt64 (38)" were really fillModeNonSolid,
@@ -8926,9 +9074,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         }
     }
     VkResult res = fpCreateDevice(physicalDevice, &mod_ci, pAllocator, pDevice);
+    if (app_rq) app_rq->rayQuery = saved_app_rq;
     if (app_ct) app_ct->conditionalRendering = app_ct_saved;
     if (app_div) app_div->vertexAttributeInstanceRateZeroDivisor = app_zero_div;
     if (app_icc) app_icc->imageCompressionControl = app_icc_saved;
+    relink(u_plgh_dev);
+    relink(u_rtm1_dev);
+    relink(u_rtp_dev);
     relink(placed_feat);
 
     // Restore mutated pNext fields
@@ -9058,6 +9210,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT);
         d->descriptor_buffer = dbf && dbf->descriptorBuffer;
         d->fpCmdBindDescriptorBuffersEXT = (PFN_vkCmdBindDescriptorBuffersEXT)fpGetDeviceProcAddr(*pDevice, "vkCmdBindDescriptorBuffersEXT");
+        d->fpCmdSetDescriptorBufferOffsetsEXT = (PFN_vkCmdSetDescriptorBufferOffsetsEXT)fpGetDeviceProcAddr(*pDevice, "vkCmdSetDescriptorBufferOffsetsEXT");
+        d->fpCmdBindDescriptorSets = (PFN_vkCmdBindDescriptorSets)fpGetDeviceProcAddr(*pDevice, "vkCmdBindDescriptorSets");
+        d->fpCmdDispatchIndirect = (PFN_vkCmdDispatchIndirect)fpGetDeviceProcAddr(*pDevice, "vkCmdDispatchIndirect");
+        pthread_mutex_init(&d->bc_lock, NULL);
         d->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdPushDescriptorSetKHR");
         if (!d->fpCmdPushDescriptorSetKHR)
             d->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdPushDescriptorSet");
@@ -9157,6 +9313,9 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
             }
             if (d->bc_layout) d->fpDestroyPipelineLayout(device, d->bc_layout, NULL);
         }
+        if (d->rt_ind_pipeline && d->fpDestroyPipeline) d->fpDestroyPipeline(device, d->rt_ind_pipeline, NULL);
+        if (d->rt_ind_layout && d->fpDestroyPipelineLayout) d->fpDestroyPipelineLayout(device, d->rt_ind_layout, NULL);
+        pthread_mutex_destroy(&d->bc_lock);
         destroy_staging_pool(d);
         if (d->fpDestroyDevice && device)
             d->fpDestroyDevice(device, pAllocator);
@@ -9321,7 +9480,31 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     }
     if (!strcmp(pName, "vkCmdPushDescriptorSetKHR") || !strcmp(pName, "vkCmdPushDescriptorSet")) {
         struct DeviceData *dd = get_device_data(device);
-        if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id || g_dc_on)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
+        if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id || g_dc_on || g_rt_pipeline)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
+    }
+    if (g_rt_pipeline) {
+        if (!strcmp(pName, "vkCreateRayTracingPipelinesKHR")) return (PFN_vkVoidFunction)compat_CreateRayTracingPipelinesKHR;
+        if (!strcmp(pName, "vkGetRayTracingShaderGroupHandlesKHR")) return (PFN_vkVoidFunction)compat_GetRayTracingShaderGroupHandlesKHR;
+        if (!strcmp(pName, "vkGetRayTracingCaptureReplayShaderGroupHandlesKHR")) return (PFN_vkVoidFunction)compat_GetRayTracingCaptureReplayShaderGroupHandlesKHR;
+        if (!strcmp(pName, "vkGetRayTracingShaderGroupStackSizeKHR")) return (PFN_vkVoidFunction)compat_GetRayTracingShaderGroupStackSizeKHR;
+        if (!strcmp(pName, "vkCmdSetRayTracingPipelineStackSizeKHR")) return (PFN_vkVoidFunction)compat_CmdSetRayTracingPipelineStackSizeKHR;
+        if (!strcmp(pName, "vkCmdTraceRaysKHR")) return (PFN_vkVoidFunction)compat_CmdTraceRaysKHR;
+        if (!strcmp(pName, "vkCmdTraceRaysIndirectKHR")) return (PFN_vkVoidFunction)compat_CmdTraceRaysIndirectKHR;
+        if (!strcmp(pName, "vkCmdTraceRaysIndirect2KHR")) return (PFN_vkVoidFunction)compat_CmdTraceRaysIndirect2KHR;
+        if (!strcmp(pName, "vkCreateDeferredHostOperationsKHR")) return (PFN_vkVoidFunction)compat_CreateDeferredHostOperationsKHR;
+        if (!strcmp(pName, "vkDestroyDeferredHostOperationKHR")) return (PFN_vkVoidFunction)compat_DestroyDeferredHostOperationKHR;
+        if (!strcmp(pName, "vkGetDeferredHostOperationMaxConcurrencyKHR")) return (PFN_vkVoidFunction)compat_GetDeferredHostOperationMaxConcurrencyKHR;
+        if (!strcmp(pName, "vkGetDeferredHostOperationResultKHR")) return (PFN_vkVoidFunction)compat_GetDeferredHostOperationResultKHR;
+        if (!strcmp(pName, "vkDeferredHostOperationJoinKHR")) return (PFN_vkVoidFunction)compat_DeferredHostOperationJoinKHR;
+        if (!strcmp(pName, "vkDestroyShaderModule")) return (PFN_vkVoidFunction)compat_DestroyShaderModule;
+        if (!strcmp(pName, "vkDestroyPipeline")) return (PFN_vkVoidFunction)compat_DestroyPipeline;
+        if (!strcmp(pName, "vkCreateDescriptorSetLayout")) return (PFN_vkVoidFunction)compat_RtCreateDescriptorSetLayout;
+        if (!strcmp(pName, "vkCreatePipelineLayout")) return (PFN_vkVoidFunction)compat_RtCreatePipelineLayout;
+        if (!strcmp(pName, "vkCmdBindDescriptorSets")) return (PFN_vkVoidFunction)compat_RtCmdBindDescriptorSets;
+        if (!strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT")) {
+            struct DeviceData *dd = get_device_data(device);
+            if (dd && dd->fpCmdSetDescriptorBufferOffsetsEXT) return (PFN_vkVoidFunction)compat_RtCmdSetDescriptorBufferOffsetsEXT;
+        }
     }
     if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_ct || g_fail_log) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
@@ -9443,6 +9626,27 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
     MATCH_DEV2(ResetCommandBuffer);
     MATCH_DEV2(BeginCommandBuffer);
     MATCH_DEV2(FreeCommandBuffers);
+    if (g_rt_pipeline) {
+        MATCH_DEV2(CreateRayTracingPipelinesKHR);
+        MATCH_DEV2(GetRayTracingShaderGroupHandlesKHR);
+        MATCH_DEV2(GetRayTracingCaptureReplayShaderGroupHandlesKHR);
+        MATCH_DEV2(GetRayTracingShaderGroupStackSizeKHR);
+        MATCH_DEV2(CmdSetRayTracingPipelineStackSizeKHR);
+        MATCH_DEV2(CmdTraceRaysKHR);
+        MATCH_DEV2(CmdTraceRaysIndirectKHR);
+        MATCH_DEV2(CmdTraceRaysIndirect2KHR);
+        MATCH_DEV2(CreateDeferredHostOperationsKHR);
+        MATCH_DEV2(DestroyDeferredHostOperationKHR);
+        MATCH_DEV2(GetDeferredHostOperationMaxConcurrencyKHR);
+        MATCH_DEV2(GetDeferredHostOperationResultKHR);
+        MATCH_DEV2(DeferredHostOperationJoinKHR);
+        MATCH_DEV2(DestroyShaderModule);
+        MATCH_DEV2(DestroyPipeline);
+        if (!strcmp(pName, "vkCreateDescriptorSetLayout")) return (PFN_vkVoidFunction)compat_RtCreateDescriptorSetLayout;
+        if (!strcmp(pName, "vkCreatePipelineLayout")) return (PFN_vkVoidFunction)compat_RtCreatePipelineLayout;
+        if (!strcmp(pName, "vkCmdBindDescriptorSets")) return (PFN_vkVoidFunction)compat_RtCmdBindDescriptorSets;
+        if (!strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT")) return (PFN_vkVoidFunction)compat_RtCmdSetDescriptorBufferOffsetsEXT;
+    }
     #undef MATCH_DEV2
 
     struct InstanceData *inst = get_instance_data(instance);
