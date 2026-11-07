@@ -3485,15 +3485,15 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     uint32_t i2_call_b = rt_alloc_id(mb), i2_call_s = rt_alloc_id(mb);
     uint32_t i2_w = rt_alloc_id(mb), i2_h = rt_alloc_id(mb), i2_d = rt_alloc_id(mb), i2_sz = rt_alloc_id(mb);
     rt_emit_psb_load_u64(mb, b, i2_rgen_b, ind_bda, 0u);
-    rt_emit_psb_load_u64(mb, b, i2_miss_b, ind_bda, 24u);
-    rt_emit_psb_load_u32(mb, b, i2_miss_s, ind_bda, 40u);
-    rt_emit_psb_load_u64(mb, b, i2_hit_b,  ind_bda, 48u);
-    rt_emit_psb_load_u32(mb, b, i2_hit_s,  ind_bda, 64u);
-    rt_emit_psb_load_u64(mb, b, i2_call_b, ind_bda, 72u);
-    rt_emit_psb_load_u32(mb, b, i2_call_s, ind_bda, 88u);
-    rt_emit_psb_load_u32(mb, b, i2_w,      ind_bda, 96u);
-    rt_emit_psb_load_u32(mb, b, i2_h,      ind_bda, 100u);
-    rt_emit_psb_load_u32(mb, b, i2_d,      ind_bda, 104u);
+    rt_emit_psb_load_u64(mb, b, i2_miss_b, ind_bda, 16u);
+    rt_emit_psb_load_u32(mb, b, i2_miss_s, ind_bda, 32u);
+    rt_emit_psb_load_u64(mb, b, i2_hit_b,  ind_bda, 40u);
+    rt_emit_psb_load_u32(mb, b, i2_hit_s,  ind_bda, 56u);
+    rt_emit_psb_load_u64(mb, b, i2_call_b, ind_bda, 64u);
+    rt_emit_psb_load_u32(mb, b, i2_call_s, ind_bda, 80u);
+    rt_emit_psb_load_u32(mb, b, i2_w,      ind_bda, 88u);
+    rt_emit_psb_load_u32(mb, b, i2_h,      ind_bda, 92u);
+    rt_emit_psb_load_u32(mb, b, i2_d,      ind_bda, 96u);
     spv_emit_op5(b, RT_OP_COMPOSITE_CONSTRUCT, mb->t_v3u32, i2_sz, i2_w, i2_h, i2_d);
     spv_emit_op2(b, RT_OP_STORE, mb->g_rgen_base,   i2_rgen_b);
     spv_emit_op2(b, RT_OP_STORE, mb->g_miss_base,   i2_miss_b);
@@ -4456,7 +4456,7 @@ static void rt_dispatch_indirect_common(
         rt_alloc_cmd_buffer(d, commandBuffer, 16,
                             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                             NULL, &ind_buf, &dst_bda)) {
-        uint64_t src_bda = indirectDeviceAddress + (indirect_mode == 2 ? 96ULL : 0ULL);
+        uint64_t src_bda = indirectDeviceAddress + (indirect_mode == 2 ? 88ULL : 0ULL);
         uint64_t setup_pc[2] = { src_bda, dst_bda };
 
         d->fpCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, d->rt_ind_pipeline);

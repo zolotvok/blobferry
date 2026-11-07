@@ -3186,6 +3186,27 @@ static inline bool is_yuv_nv12(VkFormat f) {
     return f == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM || f == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
 }
 
+static inline bool is_rtas_vbo_format(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32B32_SFLOAT:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16_SNORM:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_SNORM:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R8G8_SNORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFormatProperties(
     VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties *pFormatProperties) {
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
@@ -3197,9 +3218,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFormatProperties(
                                                     VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                                                     VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
                                                     VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT);
-        return;
-    }
-    if (panvk_format_is_bc(format)) {
+    } else if (panvk_format_is_bc(format)) {
         VkFormat decoded = panvk_bc_decoded_format(format);
         inst->fpGetPhysicalDeviceFormatProperties(physicalDevice, decoded, pFormatProperties);
         pFormatProperties->linearTilingFeatures = 0;
@@ -3208,9 +3227,12 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFormatProperties(
                                                    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                                                    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                                                    VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
-        return;
+    } else {
+        inst->fpGetPhysicalDeviceFormatProperties(physicalDevice, format, pFormatProperties);
     }
-    inst->fpGetPhysicalDeviceFormatProperties(physicalDevice, format, pFormatProperties);
+    if (g_rt_pipeline && is_rtas_vbo_format(format)) {
+        pFormatProperties->bufferFeatures |= VK_FORMAT_FEATURE_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
+    }
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFormatProperties2(
@@ -3224,9 +3246,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFormatProperties2(
                                                                      VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                                                                      VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
                                                                      VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT);
-        return;
-    }
-    if (panvk_format_is_bc(format)) {
+    } else if (panvk_format_is_bc(format)) {
         VkFormat decoded = panvk_bc_decoded_format(format);
         inst->fpGetPhysicalDeviceFormatProperties2(physicalDevice, decoded, pFormatProperties);
         pFormatProperties->formatProperties.linearTilingFeatures = 0;
@@ -3235,9 +3255,16 @@ static VKAPI_ATTR void VKAPI_CALL compat_GetPhysicalDeviceFormatProperties2(
                                                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                                                                     VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                                                                     VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
-        return;
+    } else {
+        inst->fpGetPhysicalDeviceFormatProperties2(physicalDevice, format, pFormatProperties);
     }
-    inst->fpGetPhysicalDeviceFormatProperties2(physicalDevice, format, pFormatProperties);
+    if (g_rt_pipeline && is_rtas_vbo_format(format)) {
+        pFormatProperties->formatProperties.bufferFeatures |= VK_FORMAT_FEATURE_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
+        VkFormatProperties3 *p3 = (VkFormatProperties3 *)find_struct(pFormatProperties->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3);
+        if (p3) {
+            p3->bufferFeatures |= (VkFormatFeatureFlags2)VK_FORMAT_FEATURE_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
+        }
+    }
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL compat_GetPhysicalDeviceImageFormatProperties(
