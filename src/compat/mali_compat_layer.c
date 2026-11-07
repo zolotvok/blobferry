@@ -58,7 +58,7 @@ static void relink(struct unlinked u) {
     if (u.prev) u.prev->pNext = u.node;
 }
 
-#define LOG(...) do { if (g_debug) { fprintf(stderr, "mali-compat: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
+#define LOG(...) do { if (g_debug) { fprintf(stderr, "mali-compat: " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } } while (0)
 
 // -----------------------------------------------------------------------------
 // SPIR-V Stripper / Patcher (ClipDistance / CullDistance)

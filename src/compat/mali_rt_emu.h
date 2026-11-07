@@ -760,6 +760,13 @@ struct RtDedupType {
     uint32_t res_id;
 };
 
+struct RtDedupTypeN {
+    uint32_t op;
+    uint32_t opnd_count;
+    uint32_t opnds[16];
+    uint32_t res_id;
+};
+
 struct RtDedupConstU32 {
     uint32_t type_id;
     uint32_t val;
@@ -791,6 +798,9 @@ struct RtMegaBuilder {
     uint32_t               dedup_type_count;
     struct RtDedupConstU32 dedup_consts[512];
     uint32_t               dedup_const_count;
+    struct RtDedupTypeN    dedup_complex_types[512];
+    uint32_t               dedup_complex_type_count;
+    uint32_t               t_sampler;
 
     /* Interface variable IDs for OpEntryPoint GLCompute %main */
     uint32_t iface_vars[1024];
@@ -1032,6 +1042,38 @@ static uint32_t rt_find_or_emit_type(struct RtMegaBuilder *mb, uint32_t op,
     return id;
 }
 
+static uint32_t rt_find_or_emit_complex_type(struct RtMegaBuilder *mb, uint32_t op,
+                                             const uint32_t *opnds, uint32_t opnd_count) {
+    for (uint32_t i = 0; i < mb->dedup_complex_type_count; i++) {
+        if (mb->dedup_complex_types[i].op == op &&
+            mb->dedup_complex_types[i].opnd_count == opnd_count) {
+            bool match = true;
+            for (uint32_t k = 0; k < opnd_count; k++) {
+                if (mb->dedup_complex_types[i].opnds[k] != opnds[k]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return mb->dedup_complex_types[i].res_id;
+        }
+    }
+    uint32_t id = rt_alloc_id(mb);
+    spv_emit_word(&mb->types_consts_globals, ((2u + opnd_count) << 16) | op);
+    spv_emit_word(&mb->types_consts_globals, id);
+    for (uint32_t k = 0; k < opnd_count; k++) {
+        spv_emit_word(&mb->types_consts_globals, opnds[k]);
+    }
+    mb->type_meta[id].op = op;
+    if (mb->dedup_complex_type_count < 512) {
+        struct RtDedupTypeN *d = &mb->dedup_complex_types[mb->dedup_complex_type_count++];
+        d->op = op;
+        d->opnd_count = opnd_count;
+        for (uint32_t k = 0; k < opnd_count && k < 16; k++) d->opnds[k] = opnds[k];
+        d->res_id = id;
+    }
+    return id;
+}
+
 static uint32_t rt_get_const_u32(struct RtMegaBuilder *mb, uint32_t val) {
     for (uint32_t i = 0; i < mb->dedup_const_count; i++) {
         if (mb->dedup_consts[i].type_id == mb->t_u32 && mb->dedup_consts[i].val == val) {
@@ -1137,15 +1179,13 @@ static void rt_mega_init_preamble(struct RtMegaBuilder *mb) {
     mb->t_accel_struct = rt_find_or_emit_type(mb, RT_OP_TYPE_ACCEL_STRUCT_KHR, 0, 0, 0);
 
     /* Function types */
-    mb->t_fn_void = rt_alloc_id(mb);
-    spv_emit_op2(&mb->types_consts_globals, RT_OP_TYPE_FUNCTION, mb->t_fn_void, mb->t_void);
+    mb->t_fn_void = rt_find_or_emit_complex_type(mb, RT_OP_TYPE_FUNCTION, &mb->t_void, 1);
 
-    mb->t_fn_u32_void = rt_alloc_id(mb);
-    spv_emit_op3(&mb->types_consts_globals, RT_OP_TYPE_FUNCTION, mb->t_fn_u32_void, mb->t_void, mb->t_u32);
+    uint32_t fn_u32_void_opnds[2] = { mb->t_void, mb->t_u32 };
+    mb->t_fn_u32_void = rt_find_or_emit_complex_type(mb, RT_OP_TYPE_FUNCTION, fn_u32_void_opnds, 2);
 
-    mb->t_fn_report_hit = rt_alloc_id(mb);
-    spv_emit_op4(&mb->types_consts_globals, RT_OP_TYPE_FUNCTION, mb->t_fn_report_hit,
-                 mb->t_bool, mb->t_f32, mb->t_u32);
+    uint32_t fn_rep_opnds[3] = { mb->t_bool, mb->t_f32, mb->t_u32 };
+    mb->t_fn_report_hit = rt_find_or_emit_complex_type(mb, RT_OP_TYPE_FUNCTION, fn_rep_opnds, 3);
 
     /* Pointer types */
     mb->t_ptr_input_v3u32   = rt_find_or_emit_type(mb, RT_OP_TYPE_POINTER, RT_SC_INPUT, mb->t_v3u32, 0);
@@ -1938,23 +1978,63 @@ static bool rt_parse_and_emit_stage_globals(struct RtMegaBuilder *mb,
                 break;
             }
 
-            case RT_OP_TYPE_RUNTIME_ARRAY:
-            case RT_OP_TYPE_SAMPLER:
-            case RT_OP_TYPE_SAMPLED_IMAGE:
-            case RT_OP_TYPE_IMAGE:
             case RT_OP_TYPE_FUNCTION: {
+                uint32_t orig_id = code[i + 1];
+                uint32_t opnds[16];
+                uint32_t opnd_count = (wc > 2) ? (wc - 2) : 0;
+                for (uint32_t k = 0; k < opnd_count && k < 16; k++) {
+                    uint32_t opnd = code[i + 2 + k];
+                    opnds[k] = (opnd < bound) ? sp->remap[opnd] : opnd;
+                }
+                uint32_t mid = rt_find_or_emit_complex_type(mb, RT_OP_TYPE_FUNCTION, opnds, opnd_count);
+                sp->remap[orig_id]    = mid;
+                sp->remap_d1[orig_id] = mid;
+                break;
+            }
+
+            case RT_OP_TYPE_SAMPLER: {
+                uint32_t orig_id = code[i + 1];
+                if (mb->t_sampler == 0) {
+                    mb->t_sampler = rt_find_or_emit_complex_type(mb, RT_OP_TYPE_SAMPLER, NULL, 0);
+                }
+                sp->remap[orig_id]    = mb->t_sampler;
+                sp->remap_d1[orig_id] = mb->t_sampler;
+                break;
+            }
+
+            case RT_OP_TYPE_SAMPLED_IMAGE: {
+                uint32_t orig_id  = code[i + 1];
+                uint32_t img_orig = code[i + 2];
+                uint32_t opnds[1] = { (img_orig < bound) ? sp->remap[img_orig] : img_orig };
+                uint32_t mid = rt_find_or_emit_complex_type(mb, RT_OP_TYPE_SAMPLED_IMAGE, opnds, 1);
+                sp->remap[orig_id]    = mid;
+                sp->remap_d1[orig_id] = mid;
+                break;
+            }
+
+            case RT_OP_TYPE_IMAGE: {
+                uint32_t orig_id = code[i + 1];
+                uint32_t opnds[8];
+                uint32_t opnd_count = (wc > 2) ? (wc - 2) : 0;
+                uint32_t smp_orig = code[i + 2];
+                opnds[0] = (smp_orig < bound) ? sp->remap[smp_orig] : smp_orig;
+                for (uint32_t k = 1; k < opnd_count && k < 8; k++) {
+                    opnds[k] = code[i + 2 + k]; /* Dim, Depth, Arrayed, MS, Sampled, Format are literals */
+                }
+                uint32_t mid = rt_find_or_emit_complex_type(mb, RT_OP_TYPE_IMAGE, opnds, opnd_count);
+                sp->remap[orig_id]    = mid;
+                sp->remap_d1[orig_id] = mid;
+                break;
+            }
+
+            case RT_OP_TYPE_RUNTIME_ARRAY: {
                 uint32_t orig_id = code[i + 1];
                 uint32_t mid     = sp->remap[orig_id];
                 spv_emit_word(&mb->types_consts_globals, code[i]);
                 spv_emit_word(&mb->types_consts_globals, mid);
                 for (uint32_t k = 2; k < wc; k++) {
                     uint32_t opnd = code[i + k];
-                    if (op == RT_OP_TYPE_IMAGE && k > 2) {
-                        /* Literal operands on OpTypeImage */
-                        spv_emit_word(&mb->types_consts_globals, opnd);
-                    } else {
-                        spv_emit_word(&mb->types_consts_globals, (opnd < bound) ? sp->remap[opnd] : opnd);
-                    }
+                    spv_emit_word(&mb->types_consts_globals, (opnd < bound) ? sp->remap[opnd] : opnd);
                 }
                 mb->type_meta[mid].op = op;
                 break;
@@ -2049,6 +2129,56 @@ static bool rt_parse_and_emit_stage_globals(struct RtMegaBuilder *mb,
                 uint32_t mid     = sp->remap[orig_id];
                 sp->id_type[orig_id] = code[i + 1];
                 spv_emit_op2(&mb->types_consts_globals, RT_OP_CONSTANT_NULL, rtype, mid);
+                break;
+            }
+
+            case RT_OP_SPEC_CONSTANT_OP: {
+                if (wc < 4) break;
+                uint32_t rtype_orig = code[i + 1];
+                uint32_t orig_id    = code[i + 2];
+                uint32_t spec_op    = code[i + 3]; /* Literal opcode: DO NOT REMAP! */
+                uint32_t rtype      = (rtype_orig < bound) ? sp->remap[rtype_orig] : rtype_orig;
+                uint32_t mid        = sp->remap[orig_id];
+                sp->id_type[orig_id] = code[i + 1];
+
+                /* Constant fold if operands are known constants */
+                bool folded = false;
+                if (wc == 6 && (spec_op == 170u /* OpIEqual */ || spec_op == 171u /* OpINotEqual */)) {
+                    uint32_t op0 = code[i + 4];
+                    uint32_t op1 = code[i + 5];
+                    if (op0 < bound && op1 < bound && sp->is_const_u32[op0] && sp->is_const_u32[op1]) {
+                        bool eq = (sp->const_u32_val[op0] == sp->const_u32_val[op1]);
+                        bool val = (spec_op == 170u) ? eq : !eq;
+                        spv_emit_op2(&mb->types_consts_globals,
+                                     val ? RT_OP_CONSTANT_TRUE : RT_OP_CONSTANT_FALSE,
+                                     rtype, mid);
+                        folded = true;
+                    }
+                }
+
+                if (!folded) {
+                    spv_emit_word(&mb->types_consts_globals, (wc << 16) | RT_OP_SPEC_CONSTANT_OP);
+                    spv_emit_word(&mb->types_consts_globals, rtype);
+                    spv_emit_word(&mb->types_consts_globals, mid);
+                    spv_emit_word(&mb->types_consts_globals, spec_op);
+
+                    for (uint32_t k = 4; k < wc; k++) {
+                        uint32_t opnd = code[i + k];
+                        bool is_lit = false;
+                        if (spec_op == RT_OP_VECTOR_SHUFFLE && k >= 6) {
+                            is_lit = true;
+                        } else if (spec_op == RT_OP_COMPOSITE_EXTRACT && k >= 5) {
+                            is_lit = true;
+                        } else if (spec_op == RT_OP_COMPOSITE_INSERT && k >= 6) {
+                            is_lit = true;
+                        }
+                        if (is_lit) {
+                            spv_emit_word(&mb->types_consts_globals, opnd);
+                        } else {
+                            spv_emit_word(&mb->types_consts_globals, (opnd < bound) ? sp->remap[opnd] : opnd);
+                        }
+                    }
+                }
                 break;
             }
 
@@ -3804,7 +3934,7 @@ compat_CreateRayTracingPipelinesKHR(
         /* Count stages & groups from this createInfo + linked libraries */
         uint32_t total_stages = ci->stageCount;
         uint32_t total_groups = ci->groupCount;
-        if (ci->pLibraryInfo) {
+        if (ci->pLibraryInfo && ci->pLibraryInfo->libraryCount > 0 && ci->pLibraryInfo->pLibraries) {
             for (uint32_t l = 0; l < ci->pLibraryInfo->libraryCount; l++) {
                 struct RtPipeline *lib = rt_lookup_pipeline(ci->pLibraryInfo->pLibraries[l]);
                 if (lib) {
@@ -3814,6 +3944,9 @@ compat_CreateRayTracingPipelinesKHR(
                 }
             }
         }
+
+        COMPAT_INFO("CRTP [%u/%u]: stages=%u groups=%u layout=%p libInfo=%p",
+                    i + 1, createInfoCount, ci->stageCount, ci->groupCount, (void *)ci->layout, (void *)ci->pLibraryInfo);
 
         struct RtPipeline *rp = (struct RtPipeline *)calloc(1, sizeof(*rp));
         if (!rp) {
@@ -3837,12 +3970,18 @@ compat_CreateRayTracingPipelinesKHR(
         /* 1. Copy local stages */
         bool stage_ok = true;
         for (uint32_t s = 0; s < ci->stageCount; s++) {
+            COMPAT_INFO("CRTP [%u/%u]:   stage %u: stage=0x%x module=%p pName=%s spec=%p",
+                        i + 1, createInfoCount, s, ci->pStages[s].stage, (void *)ci->pStages[s].module,
+                        ci->pStages[s].pName ? ci->pStages[s].pName : "(null)",
+                        (void *)ci->pStages[s].pSpecializationInfo);
             if (!rt_copy_stage_from_create_info(&ci->pStages[s], &rp->stages[rp->stage_count])) {
+                COMPAT_INFO("CRTP [%u/%u]:     stage %u copy FAILED", i + 1, createInfoCount, s);
                 stage_ok = false;
                 break;
             }
             rp->stage_count++;
         }
+        COMPAT_INFO("CRTP [%u/%u]: copied %u stages, stage_ok=%d", i + 1, createInfoCount, rp->stage_count, (int)stage_ok);
 
         /* 2. Build local group handles from ci->pGroups */
         for (uint32_t g = 0; g < ci->groupCount && stage_ok; g++) {
@@ -3866,7 +4005,7 @@ compat_CreateRayTracingPipelinesKHR(
         }
 
         /* 3. Append stages and group handles from linked pipeline libraries */
-        if (ci->pLibraryInfo && stage_ok) {
+        if (ci->pLibraryInfo && ci->pLibraryInfo->libraryCount > 0 && ci->pLibraryInfo->pLibraries && stage_ok) {
             for (uint32_t l = 0; l < ci->pLibraryInfo->libraryCount; l++) {
                 struct RtPipeline *lib = rt_lookup_pipeline(ci->pLibraryInfo->pLibraries[l]);
                 if (!lib) continue;
@@ -3884,20 +4023,24 @@ compat_CreateRayTracingPipelinesKHR(
         }
 
         /* 4. If executable pipeline (!is_library), build and compile the GLCompute megakernel */
+        COMPAT_INFO("CRTP [%u/%u]: building megakernel (is_lib=%d, stage_ok=%d, stages=%u)...",
+                    i + 1, createInfoCount, (int)is_library, (int)stage_ok, rp->stage_count);
         if (!is_library && stage_ok && rp->stage_count > 0) {
             size_t mega_words = 0;
             uint32_t *mega_spv = rt_build_megakernel_spirv(rp->stages, rp->stage_count, &mega_words);
+            COMPAT_INFO("CRTP [%u/%u]: megakernel SPIR-V built (%zu words, %p)",
+                        i + 1, createInfoCount, mega_words, (void *)mega_spv);
             if (mega_spv && mega_words > 5) {
                 const char *dump_dir = getenv("MALI_COMPAT_DUMP_RT_SPV");
-                if (dump_dir && dump_dir[0]) {
-                    char path[512];
-                    uint64_t h = spv_hash(mega_spv, mega_words * 4);
-                    snprintf(path, sizeof(path), "%s/rt_mega_%016llx.spv", dump_dir, (unsigned long long)h);
-                    FILE *fp = fopen(path, "wb");
-                    if (fp) {
-                        fwrite(mega_spv, 4, mega_words, fp);
-                        fclose(fp);
-                    }
+                if (!dump_dir || !dump_dir[0]) dump_dir = "/tmp";
+                char path[512];
+                uint64_t h = spv_hash(mega_spv, mega_words * 4);
+                snprintf(path, sizeof(path), "%s/rt_mega_p%u_%016llx.spv", dump_dir, i, (unsigned long long)h);
+                FILE *fp = fopen(path, "wb");
+                if (fp) {
+                    fwrite(mega_spv, 4, mega_words, fp);
+                    fclose(fp);
+                    COMPAT_INFO("CRTP [%u/%u]: dumped megakernel to %s", i + 1, createInfoCount, path);
                 }
 
                 VkShaderModuleCreateInfo smci = {
@@ -3905,7 +4048,9 @@ compat_CreateRayTracingPipelinesKHR(
                     .codeSize = mega_words * sizeof(uint32_t),
                     .pCode    = mega_spv,
                 };
+                COMPAT_INFO("CRTP [%u/%u]: calling fpCreateShaderModule...", i + 1, createInfoCount);
                 VkResult sm_res = d->fpCreateShaderModule(device, &smci, pAllocator, &rp->compute_module);
+                COMPAT_INFO("CRTP [%u/%u]: fpCreateShaderModule result=%d module=%p", i + 1, createInfoCount, sm_res, (void *)rp->compute_module);
                 free(mega_spv);
 
                 if (sm_res == VK_SUCCESS && rp->compute_module) {
@@ -3929,8 +4074,10 @@ compat_CreateRayTracingPipelinesKHR(
                         },
                         .layout = rp->layout,
                     };
+                    COMPAT_INFO("CRTP [%u/%u]: calling fpCreateComputePipelines...", i + 1, createInfoCount);
                     VkResult cp_res = d->fpCreateComputePipelines(device, pipelineCache, 1, &cpci,
                                                                   pAllocator, &rp->compute_pipeline);
+                    COMPAT_INFO("CRTP [%u/%u]: fpCreateComputePipelines result=%d pipe=%p", i + 1, createInfoCount, cp_res, (void *)rp->compute_pipeline);
                     if (cp_res != VK_SUCCESS) {
                         COMPAT_INFO("RT megakernel vkCreateComputePipelines failed (%d) for %u stages / %u groups",
                                     cp_res, rp->stage_count, rp->group_count);
