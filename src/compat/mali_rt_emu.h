@@ -59,6 +59,8 @@
 #define RT_CAP_RAY_QUERY_KHR                         4472u
 #define RT_CAP_RAY_TRAVERSAL_PRIMITIVE_CULLING_KHR   4478u
 #define RT_CAP_RAY_TRACING_KHR                       4479u
+#define RT_CAP_RAY_TRACING_NV                        5337u
+#define RT_CAP_RAY_TRACING_MOTION_BLUR_NV            5340u
 #define RT_CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES     5347u
 
 /* Decorations */
@@ -942,7 +944,9 @@ static uint32_t rt_alloc_id(struct RtMegaBuilder *mb) {
 static void rt_add_cap(struct RtMegaBuilder *mb, uint32_t cap) {
     if (cap == RT_CAP_RAY_TRACING_KHR ||
         cap == RT_CAP_RAY_TRACING_PROVISIONAL_KHR ||
-        cap == RT_CAP_RAY_QUERY_PROVISIONAL_KHR) {
+        cap == RT_CAP_RAY_QUERY_PROVISIONAL_KHR ||
+        cap == RT_CAP_RAY_TRACING_NV ||
+        cap == RT_CAP_RAY_TRACING_MOTION_BLUR_NV) {
         return;
     }
     for (uint32_t i = 0; i < mb->emitted_cap_count; i++) {

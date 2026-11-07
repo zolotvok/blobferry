@@ -40,12 +40,12 @@
 static const uint32_t spv_rgen[] = {
     0x07230203, 0x00010500, 0x00000000, 0x00000040, 0x00000000,
     (2u << 16) | 17, 1,       /* OpCapability Shader */
-    (2u << 16) | 17, 5337,    /* OpCapability RayTracingKHR */
-    (9u << 16) | 10,          /* OpExtension "SPV_KHR_ray_tracing" */
+    (2u << 16) | 17, 4479,    /* OpCapability RayTracingKHR */
+    (6u << 16) | 10,          /* OpExtension "SPV_KHR_ray_tracing" */
     0x5f565053, 0x5f52484b, 0x5f796172, 0x63617274, 0x00676e69,
     (3u << 16) | 14, 0, 1,    /* OpMemoryModel Logical GLSL450 */
-    /* OpEntryPoint RayGenerationKHR(5313) %1 "main" %2(LaunchId) %3(Payload) */
-    (7u << 16) | 15, 5313, 1, 0x6e69616d, 0x00000000, 2, 3,
+    /* OpEntryPoint RayGenerationKHR(5313) %1 "main" %2(LaunchId) %3(Payload) %4(TLAS) %5(out_buf) */
+    (9u << 16) | 15, 5313, 1, 0x6e69616d, 0x00000000, 2, 3, 4, 5,
     /* Decorations */
     (4u << 16) | 71, 2, 11, 5319, /* OpDecorate %2 BuiltIn LaunchIdKHR(5319) */
     (4u << 16) | 71, 3, 30, 0,    /* OpDecorate %3 Location 0 */
@@ -60,7 +60,7 @@ static const uint32_t spv_rgen[] = {
     (2u << 16) | 19, 6,           /* OpTypeVoid %6 */
     (3u << 16) | 33, 7, 6,        /* OpTypeFunction %7 %6 */
     (4u << 16) | 21, 8, 32, 0,    /* OpTypeInt %8 32 0 (uint) */
-    (4u << 16) | 22, 9, 32,       /* OpTypeFloat %9 32 (float) */
+    (3u << 16) | 22, 9, 32,       /* OpTypeFloat %9 32 (float) */
     (4u << 16) | 23, 10, 8, 3,    /* OpTypeVector %10 %8 3 (uvec3) */
     (4u << 16) | 23, 11, 9, 3,    /* OpTypeVector %11 %9 3 (vec3) */
     (2u << 16) | 5341, 12,        /* OpTypeAccelerationStructureKHR %12 */
@@ -117,8 +117,8 @@ static const uint32_t spv_rgen[] = {
 static const uint32_t spv_rchit[] = {
     0x07230203, 0x00010500, 0x00000000, 0x00000020, 0x00000000,
     (2u << 16) | 17, 1,       /* OpCapability Shader */
-    (2u << 16) | 17, 5337,    /* OpCapability RayTracingKHR */
-    (9u << 16) | 10,          /* OpExtension "SPV_KHR_ray_tracing" */
+    (2u << 16) | 17, 4479,    /* OpCapability RayTracingKHR */
+    (6u << 16) | 10,          /* OpExtension "SPV_KHR_ray_tracing" */
     0x5f565053, 0x5f52484b, 0x5f796172, 0x63617274, 0x00676e69,
     (3u << 16) | 14, 0, 1,    /* OpMemoryModel Logical GLSL450 */
     /* OpEntryPoint ClosestHitKHR(5316) %1 "main" %2(Payload) %3(ShaderRecord) */
@@ -155,8 +155,8 @@ static const uint32_t spv_rchit[] = {
 static const uint32_t spv_rmiss[] = {
     0x07230203, 0x00010500, 0x00000000, 0x00000010, 0x00000000,
     (2u << 16) | 17, 1,       /* OpCapability Shader */
-    (2u << 16) | 17, 5337,    /* OpCapability RayTracingKHR */
-    (9u << 16) | 10,          /* OpExtension "SPV_KHR_ray_tracing" */
+    (2u << 16) | 17, 4479,    /* OpCapability RayTracingKHR */
+    (6u << 16) | 10,          /* OpExtension "SPV_KHR_ray_tracing" */
     0x5f565053, 0x5f52484b, 0x5f796172, 0x63617274, 0x00676e69,
     (3u << 16) | 14, 0, 1,    /* OpMemoryModel Logical GLSL450 */
     /* OpEntryPoint MissKHR(5317) %1 "main" %2(Payload) */
