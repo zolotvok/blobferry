@@ -1,0 +1,1 @@
+{"blobferry_version": "@VERSION@", "layer_md5": "@LAYER_MD5@", "ray_query": "supported", "rt_pipeline": "not_implemented", "dxr": "not_implemented"}

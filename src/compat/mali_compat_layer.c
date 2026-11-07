@@ -86,6 +86,15 @@ static void relink(struct unlinked u) {
 // Debug aid: when /root/mali-spv exists, every module the patcher changes is written there as NNN-orig.spv and
 // NNN-patched.spv (first 1000), for spirv-val on the PC. [Claude Opus 5.5]
 static bool g_dump_spirv, g_dump_inflight, g_log_pipelines, g_log_images; // checked once, in vkCreateInstance
+
+// MALI_COMPAT_RT_PIPELINE=1 (the app's "Ray tracing: DX12 games (DXR)" switch) [keeper, Claude Sonnet 5.5] 2026-11-07.
+// Hook for the future VK_KHR_ray_tracing_pipeline emulation (DXR needs it; the vendor driver has ray query only).
+// Today the emulation does not exist: rt_pipeline_emulation_available() is false, the key only logs one line per instance
+// and changes nothing (no extension, no feature). When the emulation lands it plugs in here: it returns true, and the
+// device/feature/extension reporting code advertises VK_KHR_ray_tracing_pipeline + rayTracingPipeline when
+// g_rt_pipeline && rt_pipeline_emulation_available(). Keep src/compat/capabilities.json.in ("rt_pipeline") in step.
+static bool g_rt_pipeline;
+static bool rt_pipeline_emulation_available(void) { return false; }
 static bool g_bc_afrc = true; // MALI_COMPAT_BC_AFRC=0 turns the fixed-rate BC shadows off
 static void dump_spirv(const uint32_t *orig, size_t orig_bytes, const uint32_t *patched, size_t patched_bytes) {
     static _Atomic int n;
@@ -8458,6 +8467,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_fail_lvl = g_fail_log ? atoi(getenv("MALI_COMPAT_FAIL_LOG")) : 0;
     g_dsl_stage_retry = getenv("MALI_COMPAT_DSL_STAGE_RETRY") && atoi(getenv("MALI_COMPAT_DSL_STAGE_RETRY")) > 0;
     g_log_images = access("/root/mali-images.txt", W_OK) == 0;
+    g_rt_pipeline = getenv("MALI_COMPAT_RT_PIPELINE") && strcmp(getenv("MALI_COMPAT_RT_PIPELINE"), "0") != 0;
     g_bc_afrc = !getenv("MALI_COMPAT_BC_AFRC") || strcmp(getenv("MALI_COMPAT_BC_AFRC"), "0") != 0;
     bool rt = getenv("MALI_COMPAT_RT_COMPRESS") && strcmp(getenv("MALI_COMPAT_RT_COMPRESS"), "0") != 0;
     if (rt && !g_rt_compress) rt_keep_load(); // once per process: DXVK creates several instances
@@ -8602,6 +8612,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     }
     pthread_mutex_unlock(&g_table_mutex);
 
+    if (g_rt_pipeline && !rt_pipeline_emulation_available())
+        fprintf(stderr, "mali-compat: RT pipeline (VK_KHR_ray_tracing_pipeline emulation) requested: not implemented in this build (ray query: supported)\n");
     LOG("created VkInstance %p (key=%p)", (void *)*pInstance, *pInstance ? *(void **)*pInstance : NULL);
     return VK_SUCCESS;
 }

@@ -26,13 +26,14 @@ if [ -n "${BLOBFERRY_VERSION:-}" ]; then
     V=$BLOBFERRY_VERSION
 fi
 OUT=$B/build/dist/blobferry-$V
-rm -rf "$OUT" && mkdir -p "$OUT/rootfs/usr/lib/mali_bridge" "$OUT/rootfs/usr/share/vulkan/implicit_layer.d" "$OUT/rootfs/usr/lib/hybris" \
+rm -rf "$OUT" && mkdir -p "$OUT/rootfs/usr/lib/mali_bridge" "$OUT/rootfs/usr/share/vulkan/implicit_layer.d" "$OUT/rootfs/usr/share/blobferry" "$OUT/rootfs/usr/lib/hybris" \
                            "$OUT/licenses/libhybris" "$OUT/licenses/vulkan-wsi-layer"
 for f in libvulkan_mali_bridge.so libVkLayer_droiddeck_mali_compat.so libVkLayer_window_system_integration.so \
          mali_bridge_icd.json VkLayer_droiddeck_mali_compat.json VkLayer_window_system_integration.json; do
     cp "$S/usr/lib/mali_bridge/$f" "$OUT/rootfs/usr/lib/mali_bridge/"
 done
 cp "$S"/usr/share/vulkan/implicit_layer.d/*.json "$OUT/rootfs/usr/share/vulkan/implicit_layer.d/"
+"$B/gen-capabilities.sh" "$V" "$S/usr/lib/mali_bridge/libVkLayer_droiddeck_mali_compat.so" "$OUT/rootfs/usr/share/blobferry/capabilities.json"
 cp -P "$H"/libhybris-common.so* "$OUT/rootfs/usr/lib/hybris/"
 mkdir -p "$OUT/rootfs/usr/lib/hybris/libhybris/linker" && cp "$H/libhybris/linker/q.so" "$OUT/rootfs/usr/lib/hybris/libhybris/linker/"
 rm -f "$OUT/rootfs/usr/lib/hybris/"*.la

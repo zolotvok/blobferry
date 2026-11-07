@@ -21,6 +21,7 @@ case ${1:-build} in
     clang $T -O2 -Wall -fPIC -shared -fvisibility=hidden -Wl,-soname,libVkLayer_droiddeck_mali_compat.so -Wl,-Bsymbolic -Wl,--no-undefined -Wl,-z,nodelete \
       -I"$B/src/compat" -I"$B/../panvk-kbase-android/work/mesa/include" \
       "$B/src/compat/mali_compat_layer.c" -o "$STAGE/libVkLayer_droiddeck_mali_compat.so" -lpthread
+    "$B/gen-capabilities.sh" "$(git -C "$B" rev-parse --short HEAD)" "$STAGE/libVkLayer_droiddeck_mali_compat.so" "$OUT/stage/usr/share/blobferry/capabilities.json"
     clang $T -O2 -Wall "$B/test/hal-probe.c" -o "$OUT/hal-probe" $LINK
     clang $T -O2 -Wall -pthread "$B/test/icd-threads.c" -o "$OUT/icd-threads" -lvulkan
     clang $T -O2 -Wall -fPIC -shared "$B/test/segv-report.c" -o "$STAGE/segv-report.so"   # LD_PRELOAD crash reporter (no gdb in the guest)
