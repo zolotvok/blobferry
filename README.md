@@ -189,6 +189,16 @@ paths with `-ffile-prefix-map`, see `build-wsi.sh`). DroidDeck's `tools/build_lo
 
 ## Switches
 
+**Source of truth: [`src/compat/options.json`](src/compat/options.json)**, shipped inside `usr/share/blobferry/capabilities.json` as the
+`options` array (merged by `gen-capabilities.sh`). It lists every switch the bridge honours (78 keys: `MALI_COMPAT_*`,
+`MALI_WSI_*`, `MALI_BRIDGE_*`, `ENABLE_/DISABLE_MALI_COMPAT|WSI`) with `type` (bool, int, hex, enum, string, list), `default`,
+`values` (allowed values or range), `category` (compat-sync, memory, perf, rt, workaround, diagnostics, wsi, icd), `status`
+(stable, experimental, debug-only; the app hides debug-only by default), `description`, `games` (games where the key is a measured
+winner, with the value) and `min_layer` (the commit whose layer first reads the key; a manifest ships with the layer that reads
+all its keys). `test/options-drift-check.sh` fails when the code reads a key the manifest lacks or the manifest lists a key no
+code reads. The tables below are the long-form notes; when they disagree with the manifest, the manifest is right. A new switch
+needs an `options.json` entry in the same commit.
+
 Environment variables, read when a process creates its Vulkan instance. Unset or `0` means off unless noted.
 `<names>` is a comma-separated list of process-name prefixes (`/proc/self/comm`).
 
