@@ -21,6 +21,12 @@
 #ifndef MALI_RT_EMU_H
 #define MALI_RT_EMU_H
 
+#include <link.h>
+#include <elf.h>
+
+/* Forward declarations */
+static void rt_patch_fex_thunks(void);
+
 /* ── SPIR-V Constants for RT Lowering ─────────────────────────────────────── */
 #define RT_SPV_MAGIC                                 0x07230203u
 
@@ -3775,6 +3781,8 @@ compat_CreateRayTracingPipelinesKHR(
     VkPipeline                                 *pPipelines)
 {
     (void)deferredOperation;
+    rt_patch_fex_thunks();
+    COMPAT_TRACE("compat_CreateRayTracingPipelinesKHR: count=%u", createInfoCount);
     struct DeviceData *d = get_device_data(device);
     if (!d || !pCreateInfos || !pPipelines) return VK_ERROR_INITIALIZATION_FAILED;
 
@@ -3962,8 +3970,11 @@ compat_GetRayTracingShaderGroupHandlesKHR(
     void                                       *pData)
 {
     (void)device;
+    rt_patch_fex_thunks();
     if (!pData) return VK_ERROR_INITIALIZATION_FAILED;
     struct RtPipeline *rp = rt_lookup_pipeline(pipeline);
+    COMPAT_TRACE("compat_GetRayTracingShaderGroupHandlesKHR: pipeline=%p firstGroup=%u groupCount=%u dataSize=%zu pData=%p (rp=%p, rp->group_count=%u)",
+                 (void *)pipeline, firstGroup, groupCount, dataSize, pData, (void *)rp, rp ? rp->group_count : 0);
     if (!rp) {
         memset(pData, 0, dataSize);
         return VK_SUCCESS;
@@ -4149,6 +4160,9 @@ compat_CmdTraceRaysKHR(
     uint32_t                                    height,
     uint32_t                                    depth)
 {
+    rt_patch_fex_thunks();
+    COMPAT_TRACE("compat_CmdTraceRaysKHR: cmd=%p width=%u height=%u depth=%u",
+                 (void *)commandBuffer, width, height, depth);
     if (width == 0 || height == 0 || depth == 0) return;
     struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
     if (!d) return;
@@ -4416,6 +4430,135 @@ compat_DeferredHostOperationJoinKHR(
 {
     (void)device; (void)operation;
     return VK_SUCCESS;
+}
+
+/* ── FEX Thunk Function Pointer Patching ─────────────────────────────────── */
+
+struct FexThunkMapping {
+    const char *sym_name;
+    uintptr_t fallback_offset;
+    void *func_ptr;
+};
+
+struct FexThunkFinder {
+    uintptr_t base_addr;
+    char path[512];
+    bool found;
+};
+
+static int rt_fex_phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    struct FexThunkFinder *finder = (struct FexThunkFinder *)data;
+    if (info->dlpi_name && strstr(info->dlpi_name, "libvulkan-host.so")) {
+        finder->base_addr = (uintptr_t)info->dlpi_addr;
+        strncpy(finder->path, info->dlpi_name, sizeof(finder->path) - 1);
+        finder->found = true;
+        return 1;
+    }
+    return 0;
+}
+
+static void rt_patch_fex_thunks(void) {
+    static _Atomic int s_patched = 0;
+    if (atomic_exchange(&s_patched, 1) != 0) return;
+
+    struct FexThunkFinder finder = {0};
+    dl_iterate_phdr(rt_fex_phdr_cb, &finder);
+
+    if (!finder.found) {
+        FILE *fp = fopen("/proc/self/maps", "r");
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "libvulkan-host.so")) {
+                    uintptr_t start = 0;
+                    if (sscanf(line, "%lx-", &start) == 1) {
+                        finder.base_addr = start;
+                        char *slash = strchr(line, '/');
+                        if (slash) {
+                            char *nl = strchr(slash, '\n');
+                            if (nl) *nl = '\0';
+                            strncpy(finder.path, slash, sizeof(finder.path) - 1);
+                        }
+                        finder.found = true;
+                        break;
+                    }
+                }
+            }
+            fclose(fp);
+        }
+    }
+
+    if (!finder.found) {
+        COMPAT_INFO("FEX thunk patch: libvulkan-host.so not found in process (native run)");
+        return;
+    }
+
+    COMPAT_INFO("FEX thunk patch: detected libvulkan-host.so at base %p (path: %s)",
+                (void *)finder.base_addr, finder.path);
+
+    struct FexThunkMapping targets[] = {
+        { "fexldr_ptr_libvulkan_vkGetRayTracingShaderGroupHandlesKHR", 0xbb098, (void *)compat_GetRayTracingShaderGroupHandlesKHR },
+        { "fexldr_ptr_libvulkan_vkGetRayTracingShaderGroupHandlesNV",  0xbb0a0, (void *)compat_GetRayTracingShaderGroupHandlesKHR },
+        { "fexldr_ptr_libvulkan_vkCmdTraceRaysKHR",                    0xbb8d0, (void *)compat_CmdTraceRaysKHR },
+        { "fexldr_ptr_libvulkan_vkCreateRayTracingPipelinesKHR",        0xbb8d8, (void *)compat_CreateRayTracingPipelinesKHR },
+        { "fexldr_ptr_libvulkan_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR", 0xbb8e0, (void *)compat_GetRayTracingCaptureReplayShaderGroupHandlesKHR },
+        { "fexldr_ptr_libvulkan_vkCmdTraceRaysIndirectKHR",            0xbb8e8, (void *)compat_CmdTraceRaysIndirectKHR },
+        { "fexldr_ptr_libvulkan_vkCmdTraceRaysIndirect2KHR",           0xbacc0, (void *)compat_CmdTraceRaysIndirect2KHR },
+        { "fexldr_ptr_libvulkan_vkGetRayTracingShaderGroupStackSizeKHR", 0xbb8f0, (void *)compat_GetRayTracingShaderGroupStackSizeKHR },
+        { "fexldr_ptr_libvulkan_vkCmdSetRayTracingPipelineStackSizeKHR", 0xbb8f8, (void *)compat_CmdSetRayTracingPipelineStackSizeKHR },
+    };
+    size_t num_targets = sizeof(targets) / sizeof(targets[0]);
+
+    const char *open_path = finder.path[0] ? finder.path : "/usr/local/lib/fex-emu/HostThunks/libvulkan-host.so";
+    int fd = open(open_path, O_RDONLY);
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size > (off_t)sizeof(Elf64_Ehdr)) {
+            void *map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+            if (map != MAP_FAILED) {
+                Elf64_Ehdr *ehdr = (Elf64_Ehdr *)map;
+                if (ehdr->e_ident[EI_MAG0] == ELFMAG0 && ehdr->e_ident[EI_MAG1] == ELFMAG1 &&
+                    ehdr->e_ident[EI_MAG2] == ELFMAG2 && ehdr->e_ident[EI_MAG3] == ELFMAG3) {
+                    Elf64_Shdr *shdrs = (Elf64_Shdr *)((uint8_t *)map + ehdr->e_shoff);
+                    Elf64_Shdr *symtab = NULL, *strtab = NULL;
+                    for (int i = 0; i < ehdr->e_shnum; i++) {
+                        if (shdrs[i].sh_type == SHT_SYMTAB && shdrs[i].sh_link < ehdr->e_shnum) {
+                            symtab = &shdrs[i];
+                            strtab = &shdrs[shdrs[i].sh_link];
+                            break;
+                        }
+                    }
+                    if (symtab && strtab) {
+                        const char *strpool = (const char *)map + strtab->sh_offset;
+                        Elf64_Sym *syms = (Elf64_Sym *)((uint8_t *)map + symtab->sh_offset);
+                        int count = symtab->sh_size / sizeof(Elf64_Sym);
+                        for (int i = 0; i < count; i++) {
+                            const char *sym_name = strpool + syms[i].st_name;
+                            for (size_t t = 0; t < num_targets; t++) {
+                                if (strstr(sym_name, targets[t].sym_name)) {
+                                    targets[t].fallback_offset = syms[i].st_value;
+                                    break;
+                                }
+                            }
+                        }
+                        COMPAT_INFO("FEX thunk patch: resolved symbol offsets dynamically from %s", open_path);
+                    }
+                }
+                munmap(map, st.st_size);
+            }
+        }
+        close(fd);
+    }
+
+    for (size_t t = 0; t < num_targets; t++) {
+        if (!targets[t].fallback_offset) continue;
+        void **slot = (void **)(finder.base_addr + targets[t].fallback_offset);
+        void *old_val = *slot;
+        *slot = targets[t].func_ptr;
+        COMPAT_INFO("FEX thunk patched: %s @ %p [offset 0x%lx] (%p -> %p)",
+                    targets[t].sym_name, (void *)slot, (unsigned long)targets[t].fallback_offset, old_val, targets[t].func_ptr);
+    }
 }
 
 /* ── Layer Integration Wrappers ───────────────────────────────────────────── */

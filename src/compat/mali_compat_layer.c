@@ -8711,6 +8711,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
 
     if (g_rt_pipeline) {
         fprintf(stderr, "mali-compat: RT pipeline (VK_KHR_ray_tracing_pipeline -> VK_KHR_ray_query megakernel) enabled\n");
+        rt_patch_fex_thunks();
     }
     LOG("created VkInstance %p (key=%p)", (void *)*pInstance, *pInstance ? *(void **)*pInstance : NULL);
     return VK_SUCCESS;
@@ -9483,8 +9484,9 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         if (dd && dd->fpCmdPushDescriptorSetKHR && (g_gpu_time || g_vendor_id || g_dc_on || g_rt_pipeline)) return (PFN_vkVoidFunction)compat_CmdPushDescriptorSetKHR;
     }
     if (g_rt_pipeline) {
-        if (!strcmp(pName, "vkCreateRayTracingPipelinesKHR")) return (PFN_vkVoidFunction)compat_CreateRayTracingPipelinesKHR;
-        if (!strcmp(pName, "vkGetRayTracingShaderGroupHandlesKHR")) return (PFN_vkVoidFunction)compat_GetRayTracingShaderGroupHandlesKHR;
+        rt_patch_fex_thunks();
+        if (!strcmp(pName, "vkCreateRayTracingPipelinesKHR") || !strcmp(pName, "vkCreateRayTracingPipelinesNV")) return (PFN_vkVoidFunction)compat_CreateRayTracingPipelinesKHR;
+        if (!strcmp(pName, "vkGetRayTracingShaderGroupHandlesKHR") || !strcmp(pName, "vkGetRayTracingShaderGroupHandlesNV")) return (PFN_vkVoidFunction)compat_GetRayTracingShaderGroupHandlesKHR;
         if (!strcmp(pName, "vkGetRayTracingCaptureReplayShaderGroupHandlesKHR")) return (PFN_vkVoidFunction)compat_GetRayTracingCaptureReplayShaderGroupHandlesKHR;
         if (!strcmp(pName, "vkGetRayTracingShaderGroupStackSizeKHR")) return (PFN_vkVoidFunction)compat_GetRayTracingShaderGroupStackSizeKHR;
         if (!strcmp(pName, "vkCmdSetRayTracingPipelineStackSizeKHR")) return (PFN_vkVoidFunction)compat_CmdSetRayTracingPipelineStackSizeKHR;
@@ -9627,8 +9629,11 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
     MATCH_DEV2(BeginCommandBuffer);
     MATCH_DEV2(FreeCommandBuffers);
     if (g_rt_pipeline) {
+        rt_patch_fex_thunks();
         MATCH_DEV2(CreateRayTracingPipelinesKHR);
         MATCH_DEV2(GetRayTracingShaderGroupHandlesKHR);
+        if (!strcmp(pName, "vkCreateRayTracingPipelinesNV")) return (PFN_vkVoidFunction)compat_CreateRayTracingPipelinesKHR;
+        if (!strcmp(pName, "vkGetRayTracingShaderGroupHandlesNV")) return (PFN_vkVoidFunction)compat_GetRayTracingShaderGroupHandlesKHR;
         MATCH_DEV2(GetRayTracingCaptureReplayShaderGroupHandlesKHR);
         MATCH_DEV2(GetRayTracingShaderGroupStackSizeKHR);
         MATCH_DEV2(CmdSetRayTracingPipelineStackSizeKHR);
@@ -9691,4 +9696,85 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(
     VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount, VkLayerProperties *pProperties) {
     (void)physicalDevice;
     return vkEnumerateInstanceLayerProperties(pPropertyCount, pProperties);
+}
+
+/* ── Exported RT Entry Points (for FEX dlsym global resolution fallback) ──── */
+
+EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetRayTracingShaderGroupHandlesKHR(
+    VkDevice device, VkPipeline pipeline, uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void *pData)
+{
+    rt_patch_fex_thunks();
+    return compat_GetRayTracingShaderGroupHandlesKHR(device, pipeline, firstGroup, groupCount, dataSize, pData);
+}
+
+EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetRayTracingShaderGroupHandlesNV(
+    VkDevice device, VkPipeline pipeline, uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void *pData)
+{
+    rt_patch_fex_thunks();
+    return compat_GetRayTracingShaderGroupHandlesKHR(device, pipeline, firstGroup, groupCount, dataSize, pData);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdTraceRaysKHR(
+    VkCommandBuffer commandBuffer,
+    const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+    const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+    const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+    const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+    uint32_t width, uint32_t height, uint32_t depth)
+{
+    rt_patch_fex_thunks();
+    compat_CmdTraceRaysKHR(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable,
+                           pHitShaderBindingTable, pCallableShaderBindingTable, width, height, depth);
+}
+
+EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRayTracingPipelinesKHR(
+    VkDevice device, VkDeferredOperationKHR deferredOperation, VkPipelineCache pipelineCache,
+    uint32_t createInfoCount, const VkRayTracingPipelineCreateInfoKHR *pCreateInfos,
+    const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines)
+{
+    rt_patch_fex_thunks();
+    return compat_CreateRayTracingPipelinesKHR(device, deferredOperation, pipelineCache,
+                                               createInfoCount, pCreateInfos, pAllocator, pPipelines);
+}
+
+EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(
+    VkDevice device, VkPipeline pipeline, uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void *pData)
+{
+    rt_patch_fex_thunks();
+    return compat_GetRayTracingCaptureReplayShaderGroupHandlesKHR(device, pipeline, firstGroup,
+                                                                 groupCount, dataSize, pData);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdTraceRaysIndirectKHR(
+    VkCommandBuffer commandBuffer,
+    const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+    const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+    const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+    const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+    VkDeviceAddress indirectDeviceAddress)
+{
+    rt_patch_fex_thunks();
+    compat_CmdTraceRaysIndirectKHR(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable,
+                                   pHitShaderBindingTable, pCallableShaderBindingTable, indirectDeviceAddress);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdTraceRaysIndirect2KHR(
+    VkCommandBuffer commandBuffer, VkDeviceAddress indirectDeviceAddress)
+{
+    rt_patch_fex_thunks();
+    compat_CmdTraceRaysIndirect2KHR(commandBuffer, indirectDeviceAddress);
+}
+
+EXPORT VKAPI_ATTR VkDeviceSize VKAPI_CALL vkGetRayTracingShaderGroupStackSizeKHR(
+    VkDevice device, VkPipeline pipeline, uint32_t group, VkShaderGroupShaderKHR groupShader)
+{
+    rt_patch_fex_thunks();
+    return compat_GetRayTracingShaderGroupStackSizeKHR(device, pipeline, group, groupShader);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRayTracingPipelineStackSizeKHR(
+    VkCommandBuffer commandBuffer, uint32_t pipelineStackSize)
+{
+    rt_patch_fex_thunks();
+    compat_CmdSetRayTracingPipelineStackSizeKHR(commandBuffer, pipelineStackSize);
 }
