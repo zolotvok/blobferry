@@ -19,6 +19,9 @@ Picture complete and responsive, Oblivion launched from it and ran its menu at ~
 the files into its Linux runtime at every session start, and "Mali system driver (bridge)" appears on its Runtime
 driver page. No adb or zip import is needed. The steps below are for building and testing Blobferry itself.
 
+**Download:** [v0.2.0 pre-release](https://github.com/zolotvok/blobferry/releases/tag/v0.2.0): the DroidDeck Mali APK
+(bundles Blobferry 8c3863e) and the Blobferry zip, each with a `.sha256`.
+
 ## How it works
 
 ```
