@@ -1522,6 +1522,7 @@ struct DeviceData {
     PFN_vkCmdCopyAccelerationStructureKHR fpCmdCopyAccelerationStructureKHR;
     PFN_vkCmdWriteAccelerationStructuresPropertiesKHR fpCmdWriteAccelerationStructuresPropertiesKHR;
     PFN_vkGetAccelerationStructureDeviceAddressKHR fpGetAccelerationStructureDeviceAddressKHR;
+    PFN_vkGetAccelerationStructureBuildSizesKHR fpGetAccelerationStructureBuildSizesKHR;
     VkBuffer rt_zero_buf;
     VkDeviceMemory rt_zero_mem;
     VkDeviceAddress rt_zero_bda;
@@ -1530,6 +1531,10 @@ struct DeviceData {
     VkDeviceAddress rt_ring_bda;
     void *rt_ring_ptr;
     _Atomic uint32_t rt_ring_offset;
+    VkBuffer rt_scratch_buf;
+    VkDeviceMemory rt_scratch_mem;
+    VkDeviceAddress rt_scratch_bda;
+    _Atomic uint32_t rt_scratch_offset;
     pthread_mutex_t bc_lock;
 };
 
@@ -9383,6 +9388,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         d->fpCmdCopyAccelerationStructureKHR = (PFN_vkCmdCopyAccelerationStructureKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdCopyAccelerationStructureKHR");
         d->fpCmdWriteAccelerationStructuresPropertiesKHR = (PFN_vkCmdWriteAccelerationStructuresPropertiesKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdWriteAccelerationStructuresPropertiesKHR");
         d->fpGetAccelerationStructureDeviceAddressKHR = (PFN_vkGetAccelerationStructureDeviceAddressKHR)fpGetDeviceProcAddr(*pDevice, "vkGetAccelerationStructureDeviceAddressKHR");
+        d->fpGetAccelerationStructureBuildSizesKHR = (PFN_vkGetAccelerationStructureBuildSizesKHR)fpGetDeviceProcAddr(*pDevice, "vkGetAccelerationStructureBuildSizesKHR");
         pthread_mutex_init(&d->bc_lock, NULL);
         d->fpCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdPushDescriptorSetKHR");
         if (!d->fpCmdPushDescriptorSetKHR)
@@ -9492,6 +9498,8 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
             if (d->rt_ring_ptr && d->fpUnmapMemory) d->fpUnmapMemory(device, d->rt_ring_mem);
             d->fpFreeMemory(device, d->rt_ring_mem, NULL);
         }
+        if (d->rt_scratch_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_scratch_buf, NULL);
+        if (d->rt_scratch_mem && d->fpFreeMemory) d->fpFreeMemory(device, d->rt_scratch_mem, NULL);
         pthread_mutex_destroy(&d->bc_lock);
         destroy_staging_pool(d);
         if (d->fpDestroyDevice && device)
@@ -9689,6 +9697,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         if (!strcmp(pName, "vkCmdCopyAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_CmdCopyAccelerationStructureKHR;
         if (!strcmp(pName, "vkCmdWriteAccelerationStructuresPropertiesKHR")) return (PFN_vkVoidFunction)compat_CmdWriteAccelerationStructuresPropertiesKHR;
         if (!strcmp(pName, "vkGetAccelerationStructureDeviceAddressKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureDeviceAddressKHR;
+        if (!strcmp(pName, "vkGetAccelerationStructureBuildSizesKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureBuildSizesKHR;
     }
     if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_ct || g_fail_log) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
@@ -9839,6 +9848,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
         if (!strcmp(pName, "vkCmdCopyAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_CmdCopyAccelerationStructureKHR;
         if (!strcmp(pName, "vkCmdWriteAccelerationStructuresPropertiesKHR")) return (PFN_vkVoidFunction)compat_CmdWriteAccelerationStructuresPropertiesKHR;
         if (!strcmp(pName, "vkGetAccelerationStructureDeviceAddressKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureDeviceAddressKHR;
+        if (!strcmp(pName, "vkGetAccelerationStructureBuildSizesKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureBuildSizesKHR;
     }
     #undef MATCH_DEV2
 
@@ -10023,4 +10033,15 @@ EXPORT VKAPI_ATTR VkDeviceAddress VKAPI_CALL vkGetAccelerationStructureDeviceAdd
 {
     rt_patch_fex_thunks();
     return compat_GetAccelerationStructureDeviceAddressKHR(device, pInfo);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkGetAccelerationStructureBuildSizesKHR(
+    VkDevice device,
+    VkAccelerationStructureBuildTypeKHR buildType,
+    const VkAccelerationStructureBuildGeometryInfoKHR *pBuildInfo,
+    const uint32_t *pMaxPrimitiveCounts,
+    VkAccelerationStructureBuildSizesInfoKHR *pSizeInfo)
+{
+    rt_patch_fex_thunks();
+    compat_GetAccelerationStructureBuildSizesKHR(device, buildType, pBuildInfo, pMaxPrimitiveCounts, pSizeInfo);
 }

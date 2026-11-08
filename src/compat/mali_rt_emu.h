@@ -5136,6 +5136,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdBuildAccelerationStructuresKHR(VkCom
 static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyAccelerationStructureKHR(VkCommandBuffer, const VkCopyAccelerationStructureInfoKHR*);
 static VKAPI_ATTR void VKAPI_CALL compat_CmdWriteAccelerationStructuresPropertiesKHR(VkCommandBuffer, uint32_t, const VkAccelerationStructureKHR*, VkQueryType, VkQueryPool, uint32_t);
 static VKAPI_ATTR VkDeviceAddress VKAPI_CALL compat_GetAccelerationStructureDeviceAddressKHR(VkDevice, const VkAccelerationStructureDeviceAddressInfoKHR*);
+static VKAPI_ATTR void VKAPI_CALL compat_GetAccelerationStructureBuildSizesKHR(VkDevice, VkAccelerationStructureBuildTypeKHR, const VkAccelerationStructureBuildGeometryInfoKHR*, const uint32_t*, VkAccelerationStructureBuildSizesInfoKHR*);
 
 struct FexThunkMapping {
     const char *sym_name;
@@ -5216,6 +5217,7 @@ static void rt_patch_fex_thunks(void) {
         { "fexldr_ptr_libvulkan_vkCmdCopyAccelerationStructureKHR",    0, (void *)compat_CmdCopyAccelerationStructureKHR },
         { "fexldr_ptr_libvulkan_vkCmdWriteAccelerationStructuresPropertiesKHR", 0, (void *)compat_CmdWriteAccelerationStructuresPropertiesKHR },
         { "fexldr_ptr_libvulkan_vkGetAccelerationStructureDeviceAddressKHR", 0, (void *)compat_GetAccelerationStructureDeviceAddressKHR },
+        { "fexldr_ptr_libvulkan_vkGetAccelerationStructureBuildSizesKHR",    0, (void *)compat_GetAccelerationStructureBuildSizesKHR },
     };
     size_t num_targets = sizeof(targets) / sizeof(targets[0]);
 
@@ -5634,6 +5636,94 @@ compat_DestroyAccelerationStructureKHR(
     }
 }
 
+#define RT_AS_SCRATCH_SIZE (64 * 1024 * 1024)
+
+static bool rt_ensure_as_scratch_buffer(struct DeviceData *d) {
+    if (!d) return false;
+    if (d->rt_scratch_bda) return true;
+    if (!d->fpCreateBuffer || !d->fpGetBufferMemoryRequirements ||
+        !d->fpAllocateMemory || !d->fpBindBufferMemory || !d->fpGetBufferDeviceAddress) {
+        return false;
+    }
+
+    pthread_mutex_lock(&d->bc_lock);
+    if (d->rt_scratch_bda) {
+        pthread_mutex_unlock(&d->bc_lock);
+        return true;
+    }
+
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size  = RT_AS_SCRATCH_SIZE,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+    };
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (d->fpCreateBuffer(d->device, &bci, NULL, &buf) != VK_SUCCESS) {
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (d->fpCreateBuffer(d->device, &bci, NULL, &buf) != VK_SUCCESS) {
+            pthread_mutex_unlock(&d->bc_lock);
+            COMPAT_INFO("rt_ensure_as_scratch_buffer: vkCreateBuffer failed for 64MB scratch");
+            return false;
+        }
+    }
+
+    VkMemoryRequirements req = {0};
+    d->fpGetBufferMemoryRequirements(d->device, buf, &req);
+    uint32_t mask = req.memoryTypeBits;
+    uint32_t mtype = mask ? (uint32_t)__builtin_ctz(mask) : 0u;
+
+    VkMemoryAllocateFlagsInfo mafi = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+    };
+    VkMemoryAllocateInfo mai = {
+        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext           = &mafi,
+        .allocationSize  = req.size,
+        .memoryTypeIndex = mtype,
+    };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (d->fpAllocateMemory(d->device, &mai, NULL, &mem) != VK_SUCCESS) {
+        d->fpDestroyBuffer(d->device, buf, NULL);
+        pthread_mutex_unlock(&d->bc_lock);
+        COMPAT_INFO("rt_ensure_as_scratch_buffer: vkAllocateMemory failed for 64MB scratch");
+        return false;
+    }
+
+    if (d->fpBindBufferMemory(d->device, buf, mem, 0) != VK_SUCCESS) {
+        d->fpFreeMemory(d->device, mem, NULL);
+        d->fpDestroyBuffer(d->device, buf, NULL);
+        pthread_mutex_unlock(&d->bc_lock);
+        COMPAT_INFO("rt_ensure_as_scratch_buffer: vkBindBufferMemory failed");
+        return false;
+    }
+
+    VkBufferDeviceAddressInfo bdai = {
+        .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = buf,
+    };
+    VkDeviceAddress bda = d->fpGetBufferDeviceAddress(d->device, &bdai);
+    if (!bda) {
+        d->fpFreeMemory(d->device, mem, NULL);
+        d->fpDestroyBuffer(d->device, buf, NULL);
+        pthread_mutex_unlock(&d->bc_lock);
+        COMPAT_INFO("rt_ensure_as_scratch_buffer: fpGetBufferDeviceAddress returned 0");
+        return false;
+    }
+
+    d->rt_scratch_buf = buf;
+    d->rt_scratch_mem = mem;
+    d->rt_scratch_bda = bda;
+    atomic_store(&d->rt_scratch_offset, 0u);
+    pthread_mutex_unlock(&d->bc_lock);
+
+    COMPAT_INFO("rt_ensure_as_scratch_buffer: 64MB persistent AS scratch allocated at BDA 0x%llx",
+                (unsigned long long)bda);
+    return true;
+}
+
 static VKAPI_ATTR void VKAPI_CALL
 compat_CmdBuildAccelerationStructuresKHR(
     VkCommandBuffer                                         commandBuffer,
@@ -5658,6 +5748,14 @@ compat_CmdBuildAccelerationStructuresKHR(
     uint32_t count = (infos == stack_infos && infoCount > 8) ? 8 : infoCount;
     memcpy(infos, pInfos, count * sizeof(*infos));
 
+    bool has_safe_scratch = rt_ensure_as_scratch_buffer(d);
+    VkDeviceAddress safe_scratch_bda = d->rt_scratch_bda;
+    uint32_t slice_size = 2 * 1024 * 1024;
+    if (count > 32) {
+        slice_size = (RT_AS_SCRATCH_SIZE / count) & ~0xffffu;
+        if (slice_size < 65536) slice_size = 65536;
+    }
+
     pthread_mutex_lock(&g_rt_as_lock);
     for (uint32_t i = 0; i < count; i++) {
         VkAccelerationStructureKHR dst = infos[i].dstAccelerationStructure;
@@ -5665,6 +5763,7 @@ compat_CmdBuildAccelerationStructuresKHR(
         if (track) {
             if (track->built_type == RT_AS_TYPE_UNBUILT) {
                 track->built_type = infos[i].type;
+                infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             } else if (track->built_type != infos[i].type) {
                 COMPAT_INFO("RT_EMU: AS %p mutated type %u -> %u! Allocating clean driver handle.",
                            (void *)track->orig_handle, (unsigned)track->built_type, (unsigned)infos[i].type);
@@ -5680,6 +5779,7 @@ compat_CmdBuildAccelerationStructuresKHR(
                     d->fpCreateAccelerationStructureKHR(track->device, &ci, NULL, &new_h) == VK_SUCCESS) {
                     track->active_handle = new_h;
                     track->built_type    = infos[i].type;
+                    infos[i].mode        = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
                 }
             }
             if (track->active_handle) {
@@ -5692,6 +5792,13 @@ compat_CmdBuildAccelerationStructuresKHR(
             if (src_t && src_t->active_handle) {
                 infos[i].srcAccelerationStructure = src_t->active_handle;
             }
+        } else if (infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
+            infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        }
+
+        if (has_safe_scratch && safe_scratch_bda) {
+            uint64_t offset = ((uint64_t)i * slice_size) % (RT_AS_SCRATCH_SIZE - slice_size);
+            infos[i].scratchData.deviceAddress = safe_scratch_bda + offset;
         }
     }
     pthread_mutex_unlock(&g_rt_as_lock);
@@ -5700,11 +5807,12 @@ compat_CmdBuildAccelerationStructuresKHR(
     uint32_t as_idx = g_as_build_count++;
     if (as_idx < 10 || (as_idx % 60) == 0) {
         for (uint32_t i = 0; i < count; i++) {
-            COMPAT_INFO("CmdBuildAS #%u [%u/%u]: type=%u dst=%p src=%p geoms=%u",
-                        as_idx, i + 1, count, infos[i].type,
+            COMPAT_INFO("CmdBuildAS #%u [%u/%u]: type=%u mode=%u dst=%p src=%p geoms=%u scratch=0x%llx",
+                        as_idx, i + 1, count, infos[i].type, infos[i].mode,
                         (void *)infos[i].dstAccelerationStructure,
                         (void *)infos[i].srcAccelerationStructure,
-                        infos[i].geometryCount);
+                        infos[i].geometryCount,
+                        (unsigned long long)infos[i].scratchData.deviceAddress);
         }
     }
 
@@ -5843,6 +5951,30 @@ compat_GetAccelerationStructureDeviceAddressKHR(
     pthread_mutex_unlock(&g_rt_as_lock);
 
     return d->fpGetAccelerationStructureDeviceAddressKHR(device, &info);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+compat_GetAccelerationStructureBuildSizesKHR(
+    VkDevice                                            device,
+    VkAccelerationStructureBuildTypeKHR                 buildType,
+    const VkAccelerationStructureBuildGeometryInfoKHR  *pBuildInfo,
+    const uint32_t                                     *pMaxPrimitiveCounts,
+    VkAccelerationStructureBuildSizesInfoKHR           *pSizeInfo)
+{
+    struct DeviceData *d = get_device_data(device);
+    if (!d || !d->fpGetAccelerationStructureBuildSizesKHR || !pSizeInfo) return;
+
+    d->fpGetAccelerationStructureBuildSizesKHR(device, buildType, pBuildInfo, pMaxPrimitiveCounts, pSizeInfo);
+
+    if (pSizeInfo->updateScratchSize < pSizeInfo->buildScratchSize) {
+        pSizeInfo->updateScratchSize = pSizeInfo->buildScratchSize;
+    }
+
+    #define PAD_64K(sz) (((sz) + 0xffffULL) & ~0xffffULL)
+    pSizeInfo->accelerationStructureSize = PAD_64K(pSizeInfo->accelerationStructureSize);
+    pSizeInfo->buildScratchSize          = PAD_64K(pSizeInfo->buildScratchSize);
+    pSizeInfo->updateScratchSize         = PAD_64K(pSizeInfo->updateScratchSize);
+    #undef PAD_64K
 }
 
 #endif /* MALI_RT_EMU_H */
