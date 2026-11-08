@@ -29,11 +29,12 @@ static void rt_patch_fex_thunks(void);
 
 /* ── Valid Mali GPU Device Address Range & Safety Checks ─────────────────── */
 /* In Mali kbase CSF on 64-bit Linux/Android, all /mali_gmc GPU device allocations
- * reside strictly below 0x6000000000ULL (384 GB). Addresses >= 0x6000000000ULL are
- * in CPU user space / [anon:FEXAllocator] PROT_NONE pages and will unconditionally
- * crash the Mali MMU with a Level 1 translation fault (0x1002c1).
- * Addresses < 0x10000ULL (64 KB) are NULL/near-null pointers. */
-#define RT_MIN_VALID_GPU_BDA                         0x10000ULL
+ * reside strictly in [0x4000000000ULL, 0x6000000000ULL) (256 GB to 384 GB, BASE_MEM_FIRST_FREE_ADDRESS).
+ * Addresses < 0x4000000000ULL are NULL/near-null pointers or CPU 32-bit/guest memory.
+ * Addresses >= 0x6000000000ULL are in CPU user space / [anon:FEXAllocator] PROT_NONE pages.
+ * Any GPU MMU dereference outside this range unconditionally crashes the GPU with
+ * a Level 1 translation fault (0x1002c1 / 0x55002c1). */
+#define RT_MIN_VALID_GPU_BDA                         0x4000000000ULL
 #define RT_MAX_VALID_GPU_BDA                         0x6000000000ULL
 
 static inline bool rt_is_invalid_gpu_bda(VkDeviceAddress addr) {
@@ -4898,7 +4899,7 @@ compat_CmdTraceRaysKHR(
     memset(&pc, 0, sizeof(pc));
     if (pRaygenShaderBindingTable) {
         VkDeviceAddress addr = pRaygenShaderBindingTable->deviceAddress;
-        if (rt_is_invalid_gpu_bda(addr)) {
+        if (rt_is_invalid_gpu_bda(addr) || addr == 0ULL) {
             pc.rgen_base   = rt_get_zero_bda(d);
             pc.rgen_stride = 0;
             pc.rgen_size   = 0;
@@ -4910,7 +4911,7 @@ compat_CmdTraceRaysKHR(
     }
     if (pMissShaderBindingTable) {
         VkDeviceAddress addr = pMissShaderBindingTable->deviceAddress;
-        if (rt_is_invalid_gpu_bda(addr)) {
+        if (rt_is_invalid_gpu_bda(addr) || addr == 0ULL) {
             pc.miss_base   = rt_get_zero_bda(d);
             pc.miss_stride = 0;
             pc.miss_size   = 0;
@@ -4922,7 +4923,7 @@ compat_CmdTraceRaysKHR(
     }
     if (pHitShaderBindingTable) {
         VkDeviceAddress addr = pHitShaderBindingTable->deviceAddress;
-        if (rt_is_invalid_gpu_bda(addr)) {
+        if (rt_is_invalid_gpu_bda(addr) || addr == 0ULL) {
             pc.hit_base    = rt_get_zero_bda(d);
             pc.hit_stride  = 0;
             pc.hit_size    = 0;
@@ -4934,7 +4935,7 @@ compat_CmdTraceRaysKHR(
     }
     if (pCallableShaderBindingTable) {
         VkDeviceAddress addr = pCallableShaderBindingTable->deviceAddress;
-        if (rt_is_invalid_gpu_bda(addr)) {
+        if (rt_is_invalid_gpu_bda(addr) || addr == 0ULL) {
             pc.call_base   = rt_get_zero_bda(d);
             pc.call_stride = 0;
             pc.call_size   = 0;
@@ -5077,7 +5078,7 @@ static void rt_dispatch_indirect_common(
     memset(&pc, 0, sizeof(pc));
     if (pRaygenShaderBindingTable) {
         VkDeviceAddress addr = pRaygenShaderBindingTable->deviceAddress;
-        if (rt_is_invalid_gpu_bda(addr)) {
+        if (rt_is_invalid_gpu_bda(addr) || addr == 0ULL) {
             pc.rgen_base   = rt_get_zero_bda(d);
             pc.rgen_stride = 0;
             pc.rgen_size   = 0;
@@ -5089,7 +5090,7 @@ static void rt_dispatch_indirect_common(
     }
     if (pMissShaderBindingTable) {
         VkDeviceAddress addr = pMissShaderBindingTable->deviceAddress;
-        if (rt_is_invalid_gpu_bda(addr)) {
+        if (rt_is_invalid_gpu_bda(addr) || addr == 0ULL) {
             pc.miss_base   = rt_get_zero_bda(d);
             pc.miss_stride = 0;
             pc.miss_size   = 0;
@@ -5101,7 +5102,7 @@ static void rt_dispatch_indirect_common(
     }
     if (pHitShaderBindingTable) {
         VkDeviceAddress addr = pHitShaderBindingTable->deviceAddress;
-        if (rt_is_invalid_gpu_bda(addr)) {
+        if (rt_is_invalid_gpu_bda(addr) || addr == 0ULL) {
             pc.hit_base    = rt_get_zero_bda(d);
             pc.hit_stride  = 0;
             pc.hit_size    = 0;
@@ -5113,7 +5114,7 @@ static void rt_dispatch_indirect_common(
     }
     if (pCallableShaderBindingTable) {
         VkDeviceAddress addr = pCallableShaderBindingTable->deviceAddress;
-        if (rt_is_invalid_gpu_bda(addr)) {
+        if (rt_is_invalid_gpu_bda(addr) || addr == 0ULL) {
             pc.call_base   = rt_get_zero_bda(d);
             pc.call_stride = 0;
             pc.call_size   = 0;
@@ -6091,6 +6092,7 @@ compat_CmdBuildAccelerationStructuresKHR(
                     rt_is_invalid_gpu_bda(inst_bda + (uint64_t)prim_off)) {
                     inst->data.deviceAddress = rt_get_zero_bda(d);
                     all_ranges[idx].primitiveCount = 0;
+                    all_ranges[idx].primitiveOffset = 0;
                 } else if (inst->arrayOfPointers == VK_FALSE && prim_cnt > 0) {
                     void *host_base = rt_resolve_gpu_bda_to_host(inst_bda + prim_off, sizeof(VkAccelerationStructureInstanceKHR));
                     if (host_base) {
@@ -6109,11 +6111,41 @@ compat_CmdBuildAccelerationStructuresKHR(
                                 bad_refs++;
                             }
                         }
-                        if (bad_refs > 0) {
-                            COMPAT_INFO("RT_EMU: sanitized %u invalid BLAS refs (mask=0) in TLAS build #%u (inst_bda=0x%llx, host=%p)",
-                                        bad_refs, as_idx, (unsigned long long)inst_bda, host_base);
+                        if (bad_refs > 0 || as_idx < 10 || (as_idx % 120) == 0) {
+                            COMPAT_INFO("RT_EMU: TLAS build #%u instances=%u bad_refs=%u (inst_bda=0x%llx, host=%p)",
+                                        as_idx, prim_cnt, bad_refs, (unsigned long long)inst_bda, host_base);
                         }
                         cache_maintenance(host_base, (VkDeviceSize)prim_cnt * sizeof(VkAccelerationStructureInstanceKHR), false);
+                    }
+                } else if (inst->arrayOfPointers == VK_TRUE && prim_cnt > 0) {
+                    void *ptr_base = rt_resolve_gpu_bda_to_host(inst_bda + prim_off, sizeof(VkDeviceAddress));
+                    if (ptr_base) {
+                        VkDeviceAddress *ptr_arr = (VkDeviceAddress *)ptr_base;
+                        uint32_t bad_refs = 0;
+                        for (uint32_t k = 0; k < prim_cnt; k++) {
+                            VkDeviceAddress inst_elem_bda = ptr_arr[k];
+                            if (inst_elem_bda == 0ULL || rt_is_invalid_gpu_bda(inst_elem_bda)) {
+                                ptr_arr[k] = rt_get_zero_bda(d);
+                                bad_refs++;
+                                continue;
+                            }
+                            void *elem_host = rt_resolve_gpu_bda_to_host(inst_elem_bda, sizeof(VkAccelerationStructureInstanceKHR));
+                            if (elem_host) {
+                                VkAccelerationStructureInstanceKHR *one_inst = (VkAccelerationStructureInstanceKHR *)elem_host;
+                                VkDeviceAddress as_ref = one_inst->accelerationStructureReference;
+                                if (as_ref == 0ULL || rt_is_invalid_gpu_bda(as_ref)) {
+                                    one_inst->mask = 0;
+                                    one_inst->accelerationStructureReference = rt_get_zero_bda(d);
+                                    bad_refs++;
+                                }
+                                cache_maintenance(elem_host, sizeof(VkAccelerationStructureInstanceKHR), false);
+                            }
+                        }
+                        if (bad_refs > 0 || as_idx < 10 || (as_idx % 120) == 0) {
+                            COMPAT_INFO("RT_EMU: TLAS build #%u (array of ptrs) instances=%u bad_refs=%u (inst_bda=0x%llx, host=%p)",
+                                        as_idx, prim_cnt, bad_refs, (unsigned long long)inst_bda, ptr_base);
+                        }
+                        cache_maintenance(ptr_base, (VkDeviceSize)prim_cnt * sizeof(VkDeviceAddress), false);
                     }
                 }
             }
