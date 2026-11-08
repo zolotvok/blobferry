@@ -3120,27 +3120,50 @@ static void rt_emit_invoke_rcall_fn(struct RtMegaBuilder *mb,
     uint32_t off64     = rt_alloc_id(mb);
     spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, off64, off32);
 
+    /* Call record size: max(call_stride, 32ULL) */
+    uint32_t stride64  = rt_alloc_id(mb);
+    spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, stride64, stride32);
+    uint32_t is_cstride_ge32 = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, is_cstride_ge32, stride64, c_32_64);
+    uint32_t call_rec_sz = rt_alloc_id(mb);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, call_rec_sz, is_cstride_ge32, stride64, c_32_64);
+
     uint32_t end_off   = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, end_off, off64, c_32_64);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, end_off, off64, call_rec_sz);
     uint32_t in_bounds = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, in_bounds, end_off, call_size);
 
-    uint32_t run_call  = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_call, has_call, in_bounds);
+    uint32_t is_valid_call_addr = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid_call_addr, has_call, in_bounds);
+
+    uint32_t calc_call_rec = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_call_rec, call_base, off64);
+
+    uint32_t safe_call_hdr = rt_alloc_id(mb);
+    uint32_t pc_bda = rt_alloc_id(mb);
+    spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, pc_bda, mb->g_push_consts_bda);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_call_hdr, is_valid_call_addr, calc_call_rec, pc_bda);
+
+    uint32_t loaded_call_magic = rt_alloc_id(mb);
+    rt_emit_psb_load_u32(mb, b, loaded_call_magic, safe_call_hdr, 0u);
+
+    uint32_t c_magic = rt_get_const_u32(mb, RT_GROUP_HANDLE_MAGIC);
+    uint32_t is_call_magic_ok = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_call_magic_ok, loaded_call_magic, c_magic);
+
+    uint32_t run_call = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_call, is_valid_call_addr, is_call_magic_ok);
 
     spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_exit, 0u);
     spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, run_call, lbl_valid, lbl_exit);
 
     spv_emit_op1(b, RT_OP_LABEL, lbl_valid);
-    uint32_t rec_base = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, rec_base, call_base, off64);
-
     uint32_t srb_bda  = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, srb_bda, rec_base, c_32_64);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, srb_bda, calc_call_rec, c_32_64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_cur_record_bda, srb_bda);
 
     uint32_t rcall_id = rt_alloc_id(mb);
-    rt_emit_psb_load_u32(mb, b, rcall_id, rec_base, 8u);
+    rt_emit_psb_load_u32(mb, b, rcall_id, calc_call_rec, 8u);
 
     rt_emit_stage_switch_inline(mb, b, rcall_id, stages, parses, stage_count,
                                 VK_SHADER_STAGE_CALLABLE_BIT_KHR, 0);
@@ -3255,21 +3278,29 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
     spv_emit_op4(b, RT_OP_IMUL,     mb->t_u32, byte_off32, hit_idx, hit_stride);
     spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, byte_off64, byte_off32);
 
+    /* Record size: max(hit_stride, 32ULL) */
+    uint32_t c_zero64     = rt_get_const_u64(mb, 0ULL);
+    uint32_t c_32_64      = rt_get_const_u64(mb, 32ULL);
+    uint32_t hit_stride64 = rt_alloc_id(mb);
+    spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, hit_stride64, hit_stride);
+
+    uint32_t is_stride_ge32 = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, is_stride_ge32, hit_stride64, c_32_64);
+    uint32_t rec_sz = rt_alloc_id(mb);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, rec_sz, is_stride_ge32, hit_stride64, c_32_64);
+
     /* Bounds check:
      * 1. hit_base must be non-zero (has_base).
-     * 2. hit_size must be >= 32ULL (has_hit_size).
-     * 3. end_off (byte_off64 + 32ULL) must be <= hit_size (within_size). */
-    uint32_t c_zero64 = rt_get_const_u64(mb, 0ULL);
-    uint32_t c_32_64  = rt_get_const_u64(mb, 32ULL);
-
+     * 2. hit_size must be >= rec_sz (has_hit_size).
+     * 3. end_off (byte_off64 + rec_sz) must be <= hit_size (within_size). */
     uint32_t has_base = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_base, hit_base, c_zero64);
 
     uint32_t has_hit_size = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_hit_size, hit_size, c_32_64);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_hit_size, hit_size, rec_sz);
 
     uint32_t end_off = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, end_off, byte_off64, c_32_64);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, end_off, byte_off64, rec_sz);
 
     uint32_t within_size = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, within_size, end_off, hit_size);
@@ -3277,17 +3308,33 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
     uint32_t in_bounds = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, in_bounds, has_hit_size, within_size);
 
-    uint32_t is_valid = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid, has_base, in_bounds);
+    uint32_t is_valid_addr = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid_addr, has_base, in_bounds);
 
     uint32_t calc_base = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_base, hit_base, byte_off64);
+
+    /* Magic check:
+     * Safely load offset 0 (magic) by reading from calc_base if is_valid_addr, else pc_bda.
+     * Check if magic == RT_GROUP_HANDLE_MAGIC (0x52544748). */
+    uint32_t safe_hdr_bda = rt_alloc_id(mb);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_hdr_bda, is_valid_addr, calc_base, pc_bda);
+
+    uint32_t loaded_magic = rt_alloc_id(mb);
+    rt_emit_psb_load_u32(mb, b, loaded_magic, safe_hdr_bda, 0u);
+
+    uint32_t c_magic = rt_get_const_u32(mb, RT_GROUP_HANDLE_MAGIC);
+    uint32_t is_magic_ok = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_magic_ok, loaded_magic, c_magic);
+
+    uint32_t is_valid = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid, is_valid_addr, is_magic_ok);
 
     uint32_t rec_base = rt_alloc_id(mb);
     spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, rec_base, is_valid, calc_base, c_zero64);
 
     /* If valid: local root arguments are at calc_base + 32ULL.
-     * If invalid / missing: fallback to pc_bda (valid 256-byte scratch buffer of zeroes).
+     * If invalid / missing / bad magic: fallback to pc_bda (valid 256-byte scratch buffer of zeroes).
      * NEVER set g_cur_record_bda to 0ULL! */
     uint32_t calc_srb = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_srb, calc_base, c_32_64);
@@ -3555,11 +3602,19 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
     spv_emit_op4(b, RT_OP_IMUL,     mb->t_u32, miss_off32,  miss_idx, miss_stride);
     spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, miss_off64,  miss_off32);
 
+    /* Miss record size: max(miss_stride, 32ULL) */
+    uint32_t miss_stride64 = rt_alloc_id(mb);
+    spv_emit_op3(b, RT_OP_UCONVERT, mb->t_u64, miss_stride64, miss_stride);
+    uint32_t is_mstride_ge32 = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, is_mstride_ge32, miss_stride64, c_32_64);
+    uint32_t miss_rec_sz = rt_alloc_id(mb);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, miss_rec_sz, is_mstride_ge32, miss_stride64, c_32_64);
+
     uint32_t miss_end_off = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, miss_end_off, miss_off64, c_32_64);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, miss_end_off, miss_off64, miss_rec_sz);
 
     uint32_t has_miss_sz = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_miss_sz, miss_size, c_32_64);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_miss_sz, miss_size, miss_rec_sz);
 
     uint32_t miss_within_sz = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, miss_within_sz, miss_end_off, miss_size);
@@ -3567,22 +3622,37 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
     uint32_t miss_in_bounds = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, miss_in_bounds, has_miss_sz, miss_within_sz);
 
+    uint32_t is_valid_miss_addr = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid_miss_addr, has_miss_base, miss_in_bounds);
+
+    uint32_t calc_miss_rec = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_miss_rec, miss_base, miss_off64);
+
+    uint32_t safe_miss_hdr = rt_alloc_id(mb);
+    uint32_t pc_bda = rt_alloc_id(mb);
+    spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, pc_bda, mb->g_push_consts_bda);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_miss_hdr, is_valid_miss_addr, calc_miss_rec, pc_bda);
+
+    uint32_t loaded_miss_magic = rt_alloc_id(mb);
+    rt_emit_psb_load_u32(mb, b, loaded_miss_magic, safe_miss_hdr, 0u);
+
+    uint32_t c_magic = rt_get_const_u32(mb, RT_GROUP_HANDLE_MAGIC);
+    uint32_t is_miss_magic_ok = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_miss_magic_ok, loaded_miss_magic, c_magic);
+
     uint32_t run_miss = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_miss, has_miss_base, miss_in_bounds);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_miss, is_valid_miss_addr, is_miss_magic_ok);
 
     spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_after_miss, 0u);
     spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, run_miss, lbl_do_miss, lbl_after_miss);
 
     spv_emit_op1(b, RT_OP_LABEL, lbl_do_miss);
-    uint32_t miss_rec = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, miss_rec, miss_base, miss_off64);
-
     uint32_t msrb_bda  = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, msrb_bda, miss_rec, c_32_64);
+    spv_emit_op4(b, RT_OP_IADD, mb->t_u64, msrb_bda, calc_miss_rec, c_32_64);
     spv_emit_op2(b, RT_OP_STORE, mb->g_cur_record_bda, msrb_bda);
 
     uint32_t rmiss_id = rt_alloc_id(mb);
-    rt_emit_psb_load_u32(mb, b, rmiss_id, miss_rec, 8u);
+    rt_emit_psb_load_u32(mb, b, rmiss_id, calc_miss_rec, 8u);
     rt_emit_stage_switch_inline(mb, b, rmiss_id, stages, parses, stage_count,
                                 VK_SHADER_STAGE_MISS_BIT_KHR, depth);
     spv_emit_op1(b, RT_OP_BRANCH, lbl_after_miss);
@@ -3776,9 +3846,23 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_rgen_sz, cur_rgen_size, c_32_64);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_rgen, has_rgen, has_rgen_sz);
 
+    /* Magic check for raygen handle */
+    uint32_t safe_rgen_hdr = rt_alloc_id(mb);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_rgen_hdr, run_rgen, cur_rgen_base, pc_bda);
+
+    uint32_t loaded_rgen_magic = rt_alloc_id(mb);
+    rt_emit_psb_load_u32(mb, b, loaded_rgen_magic, safe_rgen_hdr, 0u);
+
+    uint32_t c_magic = rt_get_const_u32(mb, RT_GROUP_HANDLE_MAGIC);
+    uint32_t is_rgen_magic_ok = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_rgen_magic_ok, loaded_rgen_magic, c_magic);
+
+    uint32_t final_run_rgen = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, final_run_rgen, run_rgen, is_rgen_magic_ok);
+
     uint32_t lbl_do_rgen = rt_alloc_id(mb);
     spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_exit, 0u);
-    spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, run_rgen, lbl_do_rgen, lbl_exit);
+    spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, final_run_rgen, lbl_do_rgen, lbl_exit);
 
     spv_emit_op1(b, RT_OP_LABEL, lbl_do_rgen);
     uint32_t rgen_srb = rt_alloc_id(mb);
@@ -4733,16 +4817,20 @@ compat_CmdTraceRaysKHR(
     }
 
     if (d->fpCmdPipelineBarrier) {
-        VkMemoryBarrier mb_bar = {
+        VkMemoryBarrier full_barrier = {
             .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_UNIFORM_READ_BIT,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                             VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
         };
         d->fpCmdPipelineBarrier(commandBuffer,
-                                VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 0,
-                                1, &mb_bar,
+                                1, &full_barrier,
                                 0, NULL,
                                 0, NULL);
     }
@@ -4759,13 +4847,13 @@ compat_CmdTraceRaysKHR(
     if (d->fpCmdPipelineBarrier) {
         VkMemoryBarrier post_bar = {
             .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                              VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
         };
         d->fpCmdPipelineBarrier(commandBuffer,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 0,
                                 1, &post_bar,
                                 0, NULL,
@@ -4881,6 +4969,25 @@ static void rt_dispatch_indirect_common(
     uint32_t ind_off = 0;
     void *ind_ptr = NULL;
     VkDeviceAddress dst_bda = rt_ring_alloc(d, 64, 64, &ind_ptr, &ind_off);
+    if (d->fpCmdPipelineBarrier) {
+        VkMemoryBarrier full_barrier = {
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                             VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+        };
+        d->fpCmdPipelineBarrier(commandBuffer,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                0,
+                                1, &full_barrier,
+                                0, NULL,
+                                0, NULL);
+    }
+
     if (d->rt_ind_pipeline && d->fpCmdDispatchIndirect && dst_bda && d->rt_ring_buf) {
         uint64_t src_bda = indirectDeviceAddress + (indirect_mode == 2 ? 88ULL : 0ULL);
         uint64_t setup_pc[2] = { src_bda, dst_bda };
@@ -4909,13 +5016,13 @@ static void rt_dispatch_indirect_common(
     if (d->fpCmdPipelineBarrier) {
         VkMemoryBarrier post_bar = {
             .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                              VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
         };
         d->fpCmdPipelineBarrier(commandBuffer,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 0, 1, &post_bar, 0, NULL, 0, NULL);
     }
 
@@ -5605,12 +5712,16 @@ compat_CmdBuildAccelerationStructuresKHR(
         VkMemoryBarrier pre_mb = {
             .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext         = NULL,
-            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                             VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                             VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
         };
         d->fpCmdPipelineBarrier(commandBuffer,
-                                VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 0,
                                 1, &pre_mb,
                                 0, NULL,
@@ -5623,11 +5734,15 @@ compat_CmdBuildAccelerationStructuresKHR(
         VkMemoryBarrier mb = {
             .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext         = NULL,
-            .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
+            .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                             VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                             VK_ACCESS_UNIFORM_READ_BIT,
         };
         d->fpCmdPipelineBarrier(commandBuffer,
-                                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 0,
                                 1, &mb,

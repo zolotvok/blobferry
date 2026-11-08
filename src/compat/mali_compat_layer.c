@@ -7891,7 +7891,7 @@ static VKAPI_ATTR void VKAPI_CALL sd_CmdPipelineBarrier(VkCommandBuffer cmd, VkP
         dst = rt_remap_stage(dst);
     }
     if (c && !c->sd_pass) sd_hist(src, dst);
-    if (!c || c->sd_pass || !w) {
+    if (!c || c->sd_pass || (!w && !g_rt_pipeline)) {
         if (c && c->sd_pass && w) SD_CNT(SDC_INPASS);
         next(cmd, src, dst, dep, nm, m, nb, b, ni, im);
         return;
@@ -7899,10 +7899,11 @@ static VKAPI_ATTR void VKAPI_CALL sd_CmdPipelineBarrier(VkCommandBuffer cmd, VkP
     VkPipelineStageFlags s2 = src | ((w & FBM_SRC) ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : 0);
     VkPipelineStageFlags d2 = dst | ((w & FBM_DST) ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : 0);
     SD_CNT(SDC_WIDEN);
-    if (!(w & FBM_ACC)) { next(cmd, s2, d2, dep, nm, m, nb, b, ni, im); return; } // stages only
-    VkMemoryBarrier ms[33], *mw = nm < 33 ? ms : malloc((nm + 1) * sizeof *mw);
-    VkBufferMemoryBarrier bs[32], *bw = nb <= 32 ? bs : malloc(nb * sizeof *bw);
-    VkImageMemoryBarrier is[32], *iw = ni <= 32 ? is : malloc(ni * sizeof *iw);
+    if (!(w & FBM_ACC) && !g_rt_pipeline) { next(cmd, s2, d2, dep, nm, m, nb, b, ni, im); return; } // stages only
+    uint32_t extra = (w & FBM_ACC) ? 1 : 0;
+    VkMemoryBarrier ms[33], *mw = (nm + extra) <= 33 ? ms : malloc((nm + extra) * sizeof *mw);
+    VkBufferMemoryBarrier bs[32], *bw = nb <= 32 ? bs : malloc((nb ? nb : 1) * sizeof *bw);
+    VkImageMemoryBarrier is[32], *iw = ni <= 32 ? is : malloc((ni ? ni : 1) * sizeof *iw);
     if (!mw || !bw || !iw) { // out of memory: the stage widening only
         if (mw != ms) free(mw);
         if (bw != bs) free(bw);
@@ -7910,11 +7911,34 @@ static VKAPI_ATTR void VKAPI_CALL sd_CmdPipelineBarrier(VkCommandBuffer cmd, VkP
         next(cmd, s2, d2, dep, nm, m, nb, b, ni, im);
         return;
     }
-    for (uint32_t i = 0; i < nm; i++) { mw[i] = m[i]; mw[i].srcAccessMask |= SD_ACC; mw[i].dstAccessMask |= SD_ACC; }
-    mw[nm] = (VkMemoryBarrier){VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, SD_ACC, SD_ACC};
-    for (uint32_t i = 0; i < nb; i++) { bw[i] = b[i]; bw[i].srcAccessMask |= SD_ACC; bw[i].dstAccessMask |= SD_ACC; }
-    for (uint32_t i = 0; i < ni; i++) { iw[i] = im[i]; iw[i].srcAccessMask |= SD_ACC; iw[i].dstAccessMask |= SD_ACC; }
-    next(cmd, s2, d2, dep & ~VK_DEPENDENCY_BY_REGION_BIT, nm + 1, mw, nb, bw, ni, iw);
+    for (uint32_t i = 0; i < nm; i++) {
+        mw[i] = m[i];
+        if (w & FBM_ACC) { mw[i].srcAccessMask |= SD_ACC; mw[i].dstAccessMask |= SD_ACC; }
+        if (g_rt_pipeline) {
+            mw[i].srcAccessMask = rt_remap_access(mw[i].srcAccessMask);
+            mw[i].dstAccessMask = rt_remap_access(mw[i].dstAccessMask);
+        }
+    }
+    if (extra) {
+        mw[nm] = (VkMemoryBarrier){VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, SD_ACC, SD_ACC};
+    }
+    for (uint32_t i = 0; i < nb; i++) {
+        bw[i] = b[i];
+        if (w & FBM_ACC) { bw[i].srcAccessMask |= SD_ACC; bw[i].dstAccessMask |= SD_ACC; }
+        if (g_rt_pipeline) {
+            bw[i].srcAccessMask = rt_remap_access(bw[i].srcAccessMask);
+            bw[i].dstAccessMask = rt_remap_access(bw[i].dstAccessMask);
+        }
+    }
+    for (uint32_t i = 0; i < ni; i++) {
+        iw[i] = im[i];
+        if (w & FBM_ACC) { iw[i].srcAccessMask |= SD_ACC; iw[i].dstAccessMask |= SD_ACC; }
+        if (g_rt_pipeline) {
+            iw[i].srcAccessMask = rt_remap_access(iw[i].srcAccessMask);
+            iw[i].dstAccessMask = rt_remap_access(iw[i].dstAccessMask);
+        }
+    }
+    next(cmd, s2, d2, (w & FBM_ACC) ? (dep & ~VK_DEPENDENCY_BY_REGION_BIT) : dep, nm + extra, mw, nb, bw, ni, iw);
     if (mw != ms) free(mw);
     if (bw != bs) free(bw);
     if (iw != is) free(iw);
