@@ -5817,7 +5817,7 @@ compat_DestroyAccelerationStructureKHR(
     }
 }
 
-#define RT_AS_SCRATCH_SIZE (64 * 1024 * 1024)
+#define RT_AS_SCRATCH_SIZE (128 * 1024 * 1024)
 
 static bool rt_ensure_as_scratch_buffer(struct DeviceData *d) {
     if (!d) return false;
@@ -6313,15 +6313,23 @@ compat_GetAccelerationStructureBuildSizesKHR(
 
     d->fpGetAccelerationStructureBuildSizesKHR(device, buildType, pBuildInfo, pMaxPrimitiveCounts, pSizeInfo);
 
+    /* Mali proprietary CSF driver underestimates scratch and AS storage
+     * requirements for complex geometry and TLAS builds, causing hardware
+     * MMU translation faults (0x5002c3 / 0x45003c3) past buffer bounds.
+     * Scale up with ample headroom and pad to 64KB. */
+    VkDeviceSize as_sz  = (pSizeInfo->accelerationStructureSize * 3ULL) / 2ULL + (2ULL * 1024 * 1024);
+    VkDeviceSize scr_sz = (pSizeInfo->buildScratchSize * 2ULL) + (4ULL * 1024 * 1024);
+    VkDeviceSize upd_sz = (pSizeInfo->updateScratchSize * 2ULL) + (4ULL * 1024 * 1024);
+
+    #define PAD_64K(sz) (((sz) + 0xffffULL) & ~0xffffULL)
+    pSizeInfo->accelerationStructureSize = PAD_64K(as_sz);
+    pSizeInfo->buildScratchSize          = PAD_64K(scr_sz);
+    pSizeInfo->updateScratchSize         = PAD_64K(upd_sz);
+    #undef PAD_64K
+
     if (pSizeInfo->updateScratchSize < pSizeInfo->buildScratchSize) {
         pSizeInfo->updateScratchSize = pSizeInfo->buildScratchSize;
     }
-
-    #define PAD_64K(sz) (((sz) + 0xffffULL) & ~0xffffULL)
-    pSizeInfo->accelerationStructureSize = PAD_64K(pSizeInfo->accelerationStructureSize);
-    pSizeInfo->buildScratchSize          = PAD_64K(pSizeInfo->buildScratchSize);
-    pSizeInfo->updateScratchSize         = PAD_64K(pSizeInfo->updateScratchSize);
-    #undef PAD_64K
 }
 
 #endif /* MALI_RT_EMU_H */
