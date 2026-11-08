@@ -67,6 +67,15 @@ static void mali_compat_log_write(const char *fmt, ...) {
     fputc('\n', stderr);
     fflush(stderr);
     va_end(ap);
+
+    FILE *f = fopen("/tmp/mali-compat.log", "a");
+    if (!f) f = fopen("/data/local/tmp/mali-compat.log", "a");
+    if (f) {
+        va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        fputc('\n', f);
+        fclose(f);
+    }
     pthread_mutex_unlock(&log_lock);
 }
 

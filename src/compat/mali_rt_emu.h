@@ -4415,6 +4415,8 @@ compat_CmdSetRayTracingPipelineStackSizeKHR(
 /* ── TraceRays Dispatch Execution & Persistent Ring Buffer ─────────────────── */
 
 #define RT_RING_SIZE (4u * 1024u * 1024u)
+#define RT_RING_SLOT_SIZE 256u
+#define RT_RING_NUM_SLOTS (RT_RING_SIZE / RT_RING_SLOT_SIZE) /* 16384 slots */
 
 static bool rt_ensure_ring_buffer(struct DeviceData *d) {
     if (!d) return false;
@@ -4515,11 +4517,14 @@ static VkDeviceAddress rt_ring_alloc(struct DeviceData *d,
                                      void **out_ptr,
                                      uint32_t *out_offset) {
     if (!rt_ensure_ring_buffer(d)) return 0ULL;
-    if (align < 64u) align = 64u;
-    uint32_t aligned_size = (byte_size + align - 1u) & ~(align - 1u);
-    uint32_t max_span = RT_RING_SIZE - aligned_size;
-    uint32_t off = atomic_fetch_add(&d->rt_ring_offset, aligned_size);
-    off = off % max_span;
+    (void)align;
+    uint32_t slots_needed = (byte_size + RT_RING_SLOT_SIZE - 1u) / RT_RING_SLOT_SIZE;
+    if (slots_needed == 0u) slots_needed = 1u;
+    if (slots_needed > RT_RING_NUM_SLOTS) return 0ULL;
+    uint32_t max_first_slot = RT_RING_NUM_SLOTS - slots_needed;
+    uint32_t raw_slot = atomic_fetch_add(&d->rt_ring_offset, slots_needed);
+    uint32_t slot = raw_slot % (max_first_slot + 1u);
+    uint32_t off = slot * RT_RING_SLOT_SIZE;
     if (out_ptr) {
         *out_ptr = (void *)((uintptr_t)d->rt_ring_ptr + off);
     }
