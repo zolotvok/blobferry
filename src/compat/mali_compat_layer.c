@@ -2891,6 +2891,52 @@ static VkResult init_bc_compute(struct DeviceData *d) {
     return VK_SUCCESS;
 }
 
+// -----------------------------------------------------------------------------
+// Placed memory tracking & cache maintenance forward definitions for RT emu
+// -----------------------------------------------------------------------------
+struct MemInfo {
+    VkDeviceMemory memory;
+    VkDeviceSize size;
+    uint32_t type;
+    void *orig;   // driver's mapping address while placed, else NULL
+    void *placed; // where the mapping lives for the app
+    size_t map_size;
+    uint32_t heap; // counted in g_heap_usage[heap] (BUDGET_NO_HEAP = not counted)
+    uint64_t va;   // memlog: last mapped base (pointer - offset), 0 = never mapped
+    struct MemInfo *next;
+};
+#define MEM_BUCKETS 4096
+static struct MemInfo *g_mem[MEM_BUCKETS];
+static pthread_mutex_t g_mem_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t mem_bucket(VkDeviceMemory m) {
+    uint64_t v = (uint64_t)(uintptr_t)m;
+    return (uint32_t)((v ^ (v >> 17) ^ (v >> 33)) % MEM_BUCKETS);
+}
+
+// Called with g_mem_mutex held.
+static struct MemInfo *mem_find(VkDeviceMemory m) {
+    for (struct MemInfo *e = g_mem[mem_bucket(m)]; e; e = e->next)
+        if (e->memory == m) return e;
+    return NULL;
+}
+
+static void cache_maintenance(void *addr, VkDeviceSize size, bool invalidate) {
+#if defined(__aarch64__)
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uintptr_t line = 4u << ((ctr >> 16) & 0xf); // DminLine, in bytes
+    uintptr_t p = (uintptr_t)addr & ~(line - 1), end = (uintptr_t)addr + size;
+    for (; p < end; p += line) {
+        if (invalidate) __asm__ volatile("dc civac, %0" ::"r"(p) : "memory");
+        else __asm__ volatile("dc cvac, %0" ::"r"(p) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+#else
+    (void)addr, (void)size, (void)invalidate; // only the host test harness builds this file elsewhere
+#endif
+}
+
 #include "mali_rt_emu.h"
 
 // -----------------------------------------------------------------------------
@@ -6056,33 +6102,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
 // hit anything else (test/map-probe.c: CPU and GPU see the same data through the moved mapping, also after a remap).
 // The driver's flush/invalidate work on its own address, so for moved mappings the layer does the cache maintenance.
 // -----------------------------------------------------------------------------
-struct MemInfo {
-    VkDeviceMemory memory;
-    VkDeviceSize size;
-    uint32_t type;
-    void *orig;   // driver's mapping address while placed, else NULL
-    void *placed; // where the mapping lives for the app
-    size_t map_size;
-    uint32_t heap; // counted in g_heap_usage[heap] (BUDGET_NO_HEAP = not counted)
-    uint64_t va;   // memlog: last mapped base (pointer - offset), 0 = never mapped
-    struct MemInfo *next;
-};
-#define MEM_BUCKETS 4096
-static struct MemInfo *g_mem[MEM_BUCKETS];
-static pthread_mutex_t g_mem_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static uint32_t mem_bucket(VkDeviceMemory m) {
-    uint64_t v = (uint64_t)(uintptr_t)m;
-    return (uint32_t)((v ^ (v >> 17) ^ (v >> 33)) % MEM_BUCKETS);
-}
-
-// Called with g_mem_mutex held.
-static struct MemInfo *mem_find(VkDeviceMemory m) {
-    for (struct MemInfo *e = g_mem[mem_bucket(m)]; e; e = e->next)
-        if (e->memory == m) return e;
-    return NULL;
-}
-
 static void mem_add(VkDeviceMemory m, VkDeviceSize size, uint32_t type, uint32_t heap) {
     struct MemInfo *e = calloc(1, sizeof *e);
     if (!e) return; // no entry = never counted, so the free does not subtract either
@@ -6121,22 +6140,6 @@ static bool placed_move_back(struct MemInfo *e) {
         return false;
     }
     return true;
-}
-
-static void cache_maintenance(void *addr, VkDeviceSize size, bool invalidate) {
-#if defined(__aarch64__)
-    uint64_t ctr;
-    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
-    uintptr_t line = 4u << ((ctr >> 16) & 0xf); // DminLine, in bytes
-    uintptr_t p = (uintptr_t)addr & ~(line - 1), end = (uintptr_t)addr + size;
-    for (; p < end; p += line) {
-        if (invalidate) __asm__ volatile("dc civac, %0" ::"r"(p) : "memory");
-        else __asm__ volatile("dc cvac, %0" ::"r"(p) : "memory");
-    }
-    __asm__ volatile("dsb ish" ::: "memory");
-#else
-    (void)addr, (void)size, (void)invalidate; // only the host test harness builds this file elsewhere
-#endif
 }
 
 // memlog: M/U events with the allocation's size/type/heap; the va is kept for the F event.

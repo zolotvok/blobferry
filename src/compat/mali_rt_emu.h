@@ -67,6 +67,37 @@ static inline bool rt_is_host_address_accessible(const void *addr, size_t size) 
     return false;
 }
 
+/* Resolves a GPU BDA to a valid, host-accessible CPU pointer.
+ * Works for both direct SAME_VA mappings and FEX/Wine placed mappings (where memory was moved to e->placed). */
+static inline void *rt_resolve_gpu_bda_to_host(VkDeviceAddress bda, size_t size) {
+    if (rt_is_invalid_gpu_bda(bda) || size == 0) return NULL;
+    /* 1. Direct SAME_VA check */
+    if (rt_is_host_address_accessible((const void *)bda, size)) {
+        return (void *)bda;
+    }
+    /* 2. Placed mappings lookup */
+    pthread_mutex_lock(&g_mem_mutex);
+    for (uint32_t b = 0; b < MEM_BUCKETS; b++) {
+        for (struct MemInfo *e = g_mem[b]; e; e = e->next) {
+            if (e->placed && e->orig && e->map_size >= size) {
+                uintptr_t orig_start = (uintptr_t)e->orig;
+                uintptr_t orig_end   = orig_start + e->map_size;
+                if ((uintptr_t)bda >= orig_start && ((uintptr_t)bda + size) <= orig_end) {
+                    uintptr_t offset = (uintptr_t)bda - orig_start;
+                    void *host_ptr = (char *)e->placed + offset;
+                    pthread_mutex_unlock(&g_mem_mutex);
+                    if (rt_is_host_address_accessible(host_ptr, size)) {
+                        return host_ptr;
+                    }
+                    return NULL;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_mem_mutex);
+    return NULL;
+}
+
 /* ── SPIR-V Constants for RT Lowering ─────────────────────────────────────── */
 #define RT_SPV_MAGIC                                 0x07230203u
 
@@ -6026,62 +6057,60 @@ compat_CmdBuildAccelerationStructuresKHR(
                 memset(&all_ranges[idx], 0, sizeof(all_ranges[idx]));
             }
 
-            if (infos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) {
-                if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
-                    VkAccelerationStructureGeometryTrianglesDataKHR *tri = &all_geoms[idx].geometry.triangles;
-                    if (rt_is_invalid_gpu_bda(tri->transformData.deviceAddress)) {
-                        tri->transformData.deviceAddress = 0ULL;
-                    }
-                    if (tri->transformData.deviceAddress == 0ULL) {
-                        all_ranges[idx].transformOffset = 0;
-                    }
-                    if (rt_is_invalid_gpu_bda(tri->vertexData.deviceAddress) || tri->vertexData.deviceAddress == 0ULL) {
-                        tri->vertexData.deviceAddress = rt_get_zero_bda(d);
-                        if (tri->vertexStride < 12) tri->vertexStride = 12;
-                    }
-                    if (tri->indexType != VK_INDEX_TYPE_NONE_KHR && rt_is_invalid_gpu_bda(tri->indexData.deviceAddress)) {
-                        tri->indexType = VK_INDEX_TYPE_NONE_KHR;
-                        tri->indexData.deviceAddress = 0ULL;
-                    }
-                } else if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
-                    VkAccelerationStructureGeometryAabbsDataKHR *aabb = &all_geoms[idx].geometry.aabbs;
-                    if (rt_is_invalid_gpu_bda(aabb->data.deviceAddress) || aabb->data.deviceAddress == 0ULL) {
-                        aabb->data.deviceAddress = rt_get_zero_bda(d);
-                        if (aabb->stride < 24) aabb->stride = 24;
-                    }
+            if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+                VkAccelerationStructureGeometryTrianglesDataKHR *tri = &all_geoms[idx].geometry.triangles;
+                if (rt_is_invalid_gpu_bda(tri->transformData.deviceAddress)) {
+                    tri->transformData.deviceAddress = 0ULL;
                 }
-            } else if (infos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
-                if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
-                    VkAccelerationStructureGeometryInstancesDataKHR *inst = &all_geoms[idx].geometry.instances;
-                    VkDeviceAddress inst_bda = inst->data.deviceAddress;
-                    if (rt_is_invalid_gpu_bda(inst_bda) || inst_bda == 0ULL) {
-                        inst->data.deviceAddress = rt_get_zero_bda(d);
-                        all_ranges[idx].primitiveCount = 0;
-                    } else if (inst->arrayOfPointers == VK_FALSE && all_ranges[idx].primitiveCount > 0) {
-                        uint32_t prim_cnt = all_ranges[idx].primitiveCount;
-                        uint32_t prim_off = all_ranges[idx].primitiveOffset;
-                        uintptr_t host_base = (uintptr_t)inst_bda + prim_off;
-                        if (rt_is_host_address_accessible((const void *)host_base, sizeof(VkAccelerationStructureInstanceKHR))) {
-                            VkAccelerationStructureInstanceKHR *inst_arr = (VkAccelerationStructureInstanceKHR *)host_base;
-                            uint32_t bad_refs = 0;
-                            for (uint32_t k = 0; k < prim_cnt; k++) {
-                                if ((k & 63u) == 0 && k > 0) {
-                                    if (!rt_is_host_address_accessible((const void *)&inst_arr[k], sizeof(VkAccelerationStructureInstanceKHR))) {
-                                        break;
-                                    }
-                                }
-                                VkDeviceAddress as_ref = inst_arr[k].accelerationStructureReference;
-                                if (rt_is_invalid_gpu_bda(as_ref)) {
-                                    inst_arr[k].mask = 0;
-                                    inst_arr[k].accelerationStructureReference = rt_get_zero_bda(d);
-                                    bad_refs++;
+                if (tri->transformData.deviceAddress == 0ULL) {
+                    all_ranges[idx].transformOffset = 0;
+                }
+                if (rt_is_invalid_gpu_bda(tri->vertexData.deviceAddress) || tri->vertexData.deviceAddress == 0ULL) {
+                    tri->vertexData.deviceAddress = rt_get_zero_bda(d);
+                    if (tri->vertexStride < 12) tri->vertexStride = 12;
+                }
+                if (tri->indexType != VK_INDEX_TYPE_NONE_KHR && rt_is_invalid_gpu_bda(tri->indexData.deviceAddress)) {
+                    tri->indexType = VK_INDEX_TYPE_NONE_KHR;
+                    tri->indexData.deviceAddress = 0ULL;
+                }
+            } else if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+                VkAccelerationStructureGeometryAabbsDataKHR *aabb = &all_geoms[idx].geometry.aabbs;
+                if (rt_is_invalid_gpu_bda(aabb->data.deviceAddress) || aabb->data.deviceAddress == 0ULL) {
+                    aabb->data.deviceAddress = rt_get_zero_bda(d);
+                    if (aabb->stride < 24) aabb->stride = 24;
+                }
+            } else if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
+                VkAccelerationStructureGeometryInstancesDataKHR *inst = &all_geoms[idx].geometry.instances;
+                VkDeviceAddress inst_bda = inst->data.deviceAddress;
+                uint32_t prim_cnt = all_ranges[idx].primitiveCount;
+                uint32_t prim_off = all_ranges[idx].primitiveOffset;
+                if (rt_is_invalid_gpu_bda(inst_bda) || inst_bda == 0ULL ||
+                    rt_is_invalid_gpu_bda(inst_bda + (uint64_t)prim_off)) {
+                    inst->data.deviceAddress = rt_get_zero_bda(d);
+                    all_ranges[idx].primitiveCount = 0;
+                } else if (inst->arrayOfPointers == VK_FALSE && prim_cnt > 0) {
+                    void *host_base = rt_resolve_gpu_bda_to_host(inst_bda + prim_off, sizeof(VkAccelerationStructureInstanceKHR));
+                    if (host_base) {
+                        VkAccelerationStructureInstanceKHR *inst_arr = (VkAccelerationStructureInstanceKHR *)host_base;
+                        uint32_t bad_refs = 0;
+                        for (uint32_t k = 0; k < prim_cnt; k++) {
+                            if ((k & 63u) == 0 && k > 0) {
+                                if (!rt_is_host_address_accessible((const void *)&inst_arr[k], sizeof(VkAccelerationStructureInstanceKHR))) {
+                                    break;
                                 }
                             }
-                            if (bad_refs > 0) {
-                                COMPAT_INFO("RT_EMU: sanitized %u invalid BLAS refs (mask=0) in TLAS build #%u (inst_bda=0x%llx)",
-                                            bad_refs, as_idx, (unsigned long long)inst_bda);
+                            VkDeviceAddress as_ref = inst_arr[k].accelerationStructureReference;
+                            if (rt_is_invalid_gpu_bda(as_ref)) {
+                                inst_arr[k].mask = 0;
+                                inst_arr[k].accelerationStructureReference = rt_get_zero_bda(d);
+                                bad_refs++;
                             }
                         }
+                        if (bad_refs > 0) {
+                            COMPAT_INFO("RT_EMU: sanitized %u invalid BLAS refs (mask=0) in TLAS build #%u (inst_bda=0x%llx, host=%p)",
+                                        bad_refs, as_idx, (unsigned long long)inst_bda, host_base);
+                        }
+                        cache_maintenance(host_base, (VkDeviceSize)prim_cnt * sizeof(VkAccelerationStructureInstanceKHR), false);
                     }
                 }
             }
@@ -6256,10 +6285,16 @@ compat_GetAccelerationStructureDeviceAddressKHR(
     VkAccelerationStructureDeviceAddressInfoKHR info = *pInfo;
     pthread_mutex_lock(&g_rt_as_lock);
     struct RtAsTrack *t = rt_as_lookup_locked(pInfo->accelerationStructure);
-    if (t) info.accelerationStructure = t->active_handle;
+    if (t && t->active_handle) info.accelerationStructure = t->active_handle;
     pthread_mutex_unlock(&g_rt_as_lock);
 
-    return d->fpGetAccelerationStructureDeviceAddressKHR(device, &info);
+    VkDeviceAddress bda = d->fpGetAccelerationStructureDeviceAddressKHR(device, &info);
+    if (rt_is_invalid_gpu_bda(bda)) {
+        COMPAT_INFO("RT_EMU: GetASDeviceAddress returned invalid BDA 0x%llx for AS %p, clamping to rt_zero_bda",
+                    (unsigned long long)bda, (void *)pInfo->accelerationStructure);
+        return rt_get_zero_bda(d);
+    }
+    return bda;
 }
 
 static VKAPI_ATTR void VKAPI_CALL
