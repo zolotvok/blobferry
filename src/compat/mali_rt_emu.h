@@ -5977,9 +5977,11 @@ compat_CmdBuildAccelerationStructuresKHR(
             infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         }
 
-        if (has_safe_scratch && safe_scratch_bda) {
-            uint64_t offset = ((uint64_t)i * slice_size) % (RT_AS_SCRATCH_SIZE - slice_size);
-            infos[i].scratchData.deviceAddress = safe_scratch_bda + offset;
+        if (rt_is_invalid_gpu_bda(infos[i].scratchData.deviceAddress) || infos[i].scratchData.deviceAddress == 0ULL) {
+            if (has_safe_scratch && safe_scratch_bda) {
+                uint64_t offset = ((uint64_t)i * slice_size) % (RT_AS_SCRATCH_SIZE - slice_size);
+                infos[i].scratchData.deviceAddress = safe_scratch_bda + offset;
+            }
         }
     }
     pthread_mutex_unlock(&g_rt_as_lock);
@@ -6069,7 +6071,8 @@ compat_CmdBuildAccelerationStructuresKHR(
                     tri->vertexData.deviceAddress = rt_get_zero_bda(d);
                     if (tri->vertexStride < 12) tri->vertexStride = 12;
                 }
-                if (tri->indexType != VK_INDEX_TYPE_NONE_KHR && rt_is_invalid_gpu_bda(tri->indexData.deviceAddress)) {
+                if (tri->indexType != VK_INDEX_TYPE_NONE_KHR &&
+                    (rt_is_invalid_gpu_bda(tri->indexData.deviceAddress) || tri->indexData.deviceAddress == 0ULL)) {
                     tri->indexType = VK_INDEX_TYPE_NONE_KHR;
                     tri->indexData.deviceAddress = 0ULL;
                 }
@@ -6100,7 +6103,7 @@ compat_CmdBuildAccelerationStructuresKHR(
                                 }
                             }
                             VkDeviceAddress as_ref = inst_arr[k].accelerationStructureReference;
-                            if (rt_is_invalid_gpu_bda(as_ref)) {
+                            if (as_ref == 0ULL || rt_is_invalid_gpu_bda(as_ref)) {
                                 inst_arr[k].mask = 0;
                                 inst_arr[k].accelerationStructureReference = rt_get_zero_bda(d);
                                 bad_refs++;
