@@ -60,24 +60,13 @@ static void relink(struct unlinked u) {
 
 static void mali_compat_log_write(const char *fmt, ...) {
     static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&log_lock);
     va_list ap;
     va_start(ap, fmt);
-    if (g_debug) {
-        vfprintf(stderr, fmt, ap);
-        fputc('\n', stderr);
-        fflush(stderr);
-    }
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    fflush(stderr);
     va_end(ap);
-
-    pthread_mutex_lock(&log_lock);
-    FILE *f = fopen("/data/local/tmp/mali-compat.log", "a");
-    if (!f) f = fopen("/tmp/mali-compat.log", "a");
-    if (f) {
-        va_start(ap, fmt);
-        vfprintf(f, fmt, ap);
-        fputc('\n', f);
-        fclose(f);
-    }
     pthread_mutex_unlock(&log_lock);
 }
 
@@ -1527,6 +1516,11 @@ struct DeviceData {
     VkBuffer rt_zero_buf;
     VkDeviceMemory rt_zero_mem;
     VkDeviceAddress rt_zero_bda;
+    VkBuffer rt_ring_buf;
+    VkDeviceMemory rt_ring_mem;
+    VkDeviceAddress rt_ring_bda;
+    void *rt_ring_ptr;
+    _Atomic uint32_t rt_ring_offset;
     pthread_mutex_t bc_lock;
 };
 
@@ -9460,6 +9454,11 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
         if (d->rt_ind_layout && d->fpDestroyPipelineLayout) d->fpDestroyPipelineLayout(device, d->rt_ind_layout, NULL);
         if (d->rt_zero_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_zero_buf, NULL);
         if (d->rt_zero_mem && d->fpFreeMemory) d->fpFreeMemory(device, d->rt_zero_mem, NULL);
+        if (d->rt_ring_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_ring_buf, NULL);
+        if (d->rt_ring_mem && d->fpFreeMemory) {
+            if (d->rt_ring_ptr && d->fpUnmapMemory) d->fpUnmapMemory(device, d->rt_ring_mem);
+            d->fpFreeMemory(device, d->rt_ring_mem, NULL);
+        }
         pthread_mutex_destroy(&d->bc_lock);
         destroy_staging_pool(d);
         if (d->fpDestroyDevice && device)

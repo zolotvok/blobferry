@@ -4412,31 +4412,42 @@ compat_CmdSetRayTracingPipelineStackSizeKHR(
     (void)commandBuffer; (void)pipelineStackSize;
 }
 
-/* ── TraceRays Dispatch Execution ─────────────────────────────────────────── */
+/* ── TraceRays Dispatch Execution & Persistent Ring Buffer ─────────────────── */
 
-static bool rt_alloc_cmd_buffer(struct DeviceData *d,
-                                VkCommandBuffer cmd,
-                                VkDeviceSize byte_size,
-                                VkBufferUsageFlags usage,
-                                const void *initial_data,
-                                VkBuffer *out_buf,
-                                VkDeviceAddress *out_bda) {
-    if (!d || !d->fpCreateBuffer || !d->fpAllocateMemory || !d->fpBindBufferMemory ||
-        !d->fpGetBufferDeviceAddress) {
+#define RT_RING_SIZE (4u * 1024u * 1024u)
+
+static bool rt_ensure_ring_buffer(struct DeviceData *d) {
+    if (!d) return false;
+    if (d->rt_ring_bda != 0ULL && d->rt_ring_ptr != NULL) return true;
+
+    pthread_mutex_lock(&d->bc_lock);
+    if (d->rt_ring_bda != 0ULL && d->rt_ring_ptr != NULL) {
+        pthread_mutex_unlock(&d->bc_lock);
+        return true;
+    }
+
+    if (!d->fpCreateBuffer || !d->fpAllocateMemory || !d->fpBindBufferMemory ||
+        !d->fpGetBufferDeviceAddress || !d->fpMapMemory) {
+        pthread_mutex_unlock(&d->bc_lock);
         return false;
     }
+
     VkBufferCreateInfo bci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size  = byte_size < 256 ? 256 : byte_size,
-        .usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .size  = RT_RING_SIZE,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     };
     VkBuffer buf = VK_NULL_HANDLE;
-    if (d->fpCreateBuffer(d->device, &bci, NULL, &buf) != VK_SUCCESS) return false;
+    if (d->fpCreateBuffer(d->device, &bci, NULL, &buf) != VK_SUCCESS) {
+        pthread_mutex_unlock(&d->bc_lock);
+        return false;
+    }
 
     VkMemoryRequirements req = {0};
     d->fpGetBufferMemoryRequirements(d->device, buf, &req);
     uint32_t mask = req.memoryTypeBits;
-    if (initial_data && (mask & d->coherent_types)) {
+    if (mask & d->coherent_types) {
         mask &= d->coherent_types;
     }
     uint32_t mtype = mask ? (uint32_t)__builtin_ctz(mask) : 0u;
@@ -4448,44 +4459,74 @@ static bool rt_alloc_cmd_buffer(struct DeviceData *d,
     VkMemoryAllocateInfo mai = {
         .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext           = &mafi,
-        .allocationSize  = req.size,
+        .allocationSize  = req.size < RT_RING_SIZE ? RT_RING_SIZE : req.size,
         .memoryTypeIndex = mtype,
     };
     VkDeviceMemory mem = VK_NULL_HANDLE;
     if (d->fpAllocateMemory(d->device, &mai, NULL, &mem) != VK_SUCCESS) {
         d->fpDestroyBuffer(d->device, buf, NULL);
+        pthread_mutex_unlock(&d->bc_lock);
         return false;
     }
+
     if (d->fpBindBufferMemory(d->device, buf, mem, 0) != VK_SUCCESS) {
         d->fpFreeMemory(d->device, mem, NULL);
         d->fpDestroyBuffer(d->device, buf, NULL);
+        pthread_mutex_unlock(&d->bc_lock);
         return false;
     }
-    if (initial_data && d->fpMapMemory && d->fpUnmapMemory) {
-        void *ptr = NULL;
-        if (d->fpMapMemory(d->device, mem, 0, byte_size, 0, &ptr) == VK_SUCCESS && ptr) {
-            memcpy(ptr, initial_data, (size_t)byte_size);
-            d->fpUnmapMemory(d->device, mem);
-        }
+
+    void *ptr = NULL;
+    if (d->fpMapMemory(d->device, mem, 0, RT_RING_SIZE, 0, &ptr) != VK_SUCCESS || !ptr) {
+        d->fpFreeMemory(d->device, mem, NULL);
+        d->fpDestroyBuffer(d->device, buf, NULL);
+        pthread_mutex_unlock(&d->bc_lock);
+        return false;
     }
+    memset(ptr, 0, RT_RING_SIZE);
+
     VkBufferDeviceAddressInfo bdai = {
         .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
         .buffer = buf,
     };
     VkDeviceAddress bda = d->fpGetBufferDeviceAddress(d->device, &bdai);
+    if (!bda) {
+        d->fpUnmapMemory(d->device, mem);
+        d->fpFreeMemory(d->device, mem, NULL);
+        d->fpDestroyBuffer(d->device, buf, NULL);
+        pthread_mutex_unlock(&d->bc_lock);
+        return false;
+    }
 
-    /* size = 0 tells release_staging() to call destroy_staging() on cmd reset/free */
-    add_staging_resource(cmd, (struct StagingResource){
-        .buffer   = buf,
-        .memory   = mem,
-        .size     = 0,
-        .addr     = bda,
-        .mem_size = 0,
-        .heap     = BUDGET_NO_HEAP,
-    });
-    if (out_buf) *out_buf = buf;
-    if (out_bda) *out_bda = bda;
+    d->rt_ring_buf = buf;
+    d->rt_ring_mem = mem;
+    d->rt_ring_bda = bda;
+    d->rt_ring_ptr = ptr;
+    atomic_store(&d->rt_ring_offset, 0u);
+    pthread_mutex_unlock(&d->bc_lock);
+    COMPAT_INFO("rt_ensure_ring_buffer: 4MB persistent ring allocated at BDA 0x%lx host=%p",
+                (unsigned long)bda, ptr);
     return true;
+}
+
+static VkDeviceAddress rt_ring_alloc(struct DeviceData *d,
+                                     uint32_t byte_size,
+                                     uint32_t align,
+                                     void **out_ptr,
+                                     uint32_t *out_offset) {
+    if (!rt_ensure_ring_buffer(d)) return 0ULL;
+    if (align < 64u) align = 64u;
+    uint32_t aligned_size = (byte_size + align - 1u) & ~(align - 1u);
+    uint32_t max_span = RT_RING_SIZE - aligned_size;
+    uint32_t off = atomic_fetch_add(&d->rt_ring_offset, aligned_size);
+    off = off % max_span;
+    if (out_ptr) {
+        *out_ptr = (void *)((uintptr_t)d->rt_ring_ptr + off);
+    }
+    if (out_offset) {
+        *out_offset = off;
+    }
+    return d->rt_ring_bda + (VkDeviceAddress)off;
 }
 
 static VkDeviceAddress rt_get_zero_bda(struct DeviceData *d) {
@@ -4573,15 +4614,17 @@ static VkDeviceAddress rt_get_zero_bda(struct DeviceData *d) {
 static VkDeviceAddress rt_upload_user_push_constants(struct DeviceData *d,
                                                      VkCommandBuffer cmd,
                                                      const struct RtCmdState *cs) {
+    (void)cmd;
     if (!cs || cs->user_pc_dirty_size == 0) {
         return rt_get_zero_bda(d);
     }
-    VkDeviceAddress bda = 0ULL;
-    if (!rt_alloc_cmd_buffer(d, cmd, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                             cs->user_push_constants, NULL, &bda)) {
-        return rt_get_zero_bda(d);
+    void *ptr = NULL;
+    VkDeviceAddress bda = rt_ring_alloc(d, 256, 256, &ptr, NULL);
+    if (bda && ptr) {
+        memcpy(ptr, cs->user_push_constants, 256);
+        return bda;
     }
-    return bda;
+    return rt_get_zero_bda(d);
 }
 
 static void rt_prepare_and_bind_megakernel(struct DeviceData *d,
@@ -4706,6 +4749,24 @@ compat_CmdTraceRaysKHR(
     uint32_t gz = depth;
     d->fpCmdDispatch(commandBuffer, gx, gy, gz);
 
+    /* Post-trace memory barrier: ensure compute writes to storage buffers/images
+     * are coherent for subsequent compute dispatches and graphics reads */
+    if (d->fpCmdPipelineBarrier) {
+        VkMemoryBarrier post_bar = {
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
+        };
+        d->fpCmdPipelineBarrier(commandBuffer,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                                0,
+                                1, &post_bar,
+                                0, NULL,
+                                0, NULL);
+    }
+
     rt_restore_post_trace_state(d, commandBuffer, cs, rp);
 }
 
@@ -4812,12 +4873,10 @@ static void rt_dispatch_indirect_common(
 
     rt_ensure_indirect_setup_pipeline(d);
 
-    VkBuffer ind_buf = VK_NULL_HANDLE;
-    VkDeviceAddress dst_bda = 0ULL;
-    if (d->rt_ind_pipeline && d->fpCmdDispatchIndirect &&
-        rt_alloc_cmd_buffer(d, commandBuffer, 16,
-                            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            NULL, &ind_buf, &dst_bda)) {
+    uint32_t ind_off = 0;
+    void *ind_ptr = NULL;
+    VkDeviceAddress dst_bda = rt_ring_alloc(d, 64, 64, &ind_ptr, &ind_off);
+    if (d->rt_ind_pipeline && d->fpCmdDispatchIndirect && dst_bda && d->rt_ring_buf) {
         uint64_t src_bda = indirectDeviceAddress + (indirect_mode == 2 ? 88ULL : 0ULL);
         uint64_t setup_pc[2] = { src_bda, dst_bda };
 
@@ -4836,10 +4895,23 @@ static void rt_dispatch_indirect_common(
                                 0, 1, &mb_bar, 0, NULL, 0, NULL);
 
         rt_prepare_and_bind_megakernel(d, commandBuffer, cs, rp, &pc);
-        d->fpCmdDispatchIndirect(commandBuffer, ind_buf, 0);
+        d->fpCmdDispatchIndirect(commandBuffer, d->rt_ring_buf, (VkDeviceSize)ind_off);
     } else {
         rt_prepare_and_bind_megakernel(d, commandBuffer, cs, rp, &pc);
         d->fpCmdDispatch(commandBuffer, 256, 256, 1);
+    }
+
+    if (d->fpCmdPipelineBarrier) {
+        VkMemoryBarrier post_bar = {
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
+        };
+        d->fpCmdPipelineBarrier(commandBuffer,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                                0, 1, &post_bar, 0, NULL, 0, NULL);
     }
 
     rt_restore_post_trace_state(d, commandBuffer, cs, rp);
