@@ -27,6 +27,46 @@
 /* Forward declarations */
 static void rt_patch_fex_thunks(void);
 
+/* ── Valid Mali GPU Device Address Range & Safety Checks ─────────────────── */
+/* In Mali kbase CSF on 64-bit Linux/Android, all /mali_gmc GPU device allocations
+ * reside strictly below 0x6000000000ULL (384 GB). Addresses >= 0x6000000000ULL are
+ * in CPU user space / [anon:FEXAllocator] PROT_NONE pages and will unconditionally
+ * crash the Mali MMU with a Level 1 translation fault (0x1002c1).
+ * Addresses < 0x10000ULL (64 KB) are NULL/near-null pointers. */
+#define RT_MIN_VALID_GPU_BDA                         0x10000ULL
+#define RT_MAX_VALID_GPU_BDA                         0x6000000000ULL
+
+static inline bool rt_is_invalid_gpu_bda(VkDeviceAddress addr) {
+    return (addr != 0ULL) && (addr < RT_MIN_VALID_GPU_BDA || addr >= RT_MAX_VALID_GPU_BDA);
+}
+
+static int g_pipe_check_fds[2] = {-1, -1};
+static pthread_mutex_t g_pipe_check_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Safely tests if a host virtual address is mapped and readable in CPU memory
+ * without risking a SIGSEGV fault by using the Linux kernel copy_from_user check in pipe(). */
+static inline bool rt_is_host_address_accessible(const void *addr, size_t size) {
+    if (!addr || size == 0) return false;
+    pthread_mutex_lock(&g_pipe_check_lock);
+    if (g_pipe_check_fds[0] < 0) {
+        if (pipe(g_pipe_check_fds) < 0) {
+            pthread_mutex_unlock(&g_pipe_check_lock);
+            return false;
+        }
+        fcntl(g_pipe_check_fds[0], F_SETFL, O_NONBLOCK);
+        fcntl(g_pipe_check_fds[1], F_SETFL, O_NONBLOCK);
+    }
+    ssize_t ret = write(g_pipe_check_fds[1], addr, size);
+    if (ret > 0) {
+        char drain[256];
+        while (read(g_pipe_check_fds[0], drain, sizeof(drain)) > 0);
+        pthread_mutex_unlock(&g_pipe_check_lock);
+        return true;
+    }
+    pthread_mutex_unlock(&g_pipe_check_lock);
+    return false;
+}
+
 /* ── SPIR-V Constants for RT Lowering ─────────────────────────────────────── */
 #define RT_SPV_MAGIC                                 0x07230203u
 
@@ -3139,10 +3179,22 @@ static void rt_emit_invoke_rcall_fn(struct RtMegaBuilder *mb,
     uint32_t calc_call_rec = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_call_rec, call_base, off64);
 
+    uint32_t c_min_bda = rt_get_const_u64(mb, RT_MIN_VALID_GPU_BDA);
+    uint32_t c_max_bda = rt_get_const_u64(mb, RT_MAX_VALID_GPU_BDA);
+    uint32_t is_call_ge_min = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, is_call_ge_min, calc_call_rec, c_min_bda);
+    uint32_t is_call_lt_max = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_ULESS_THAN, mb->t_bool, is_call_lt_max, calc_call_rec, c_max_bda);
+    uint32_t is_call_range_ok = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_call_range_ok, is_call_ge_min, is_call_lt_max);
+
+    uint32_t is_safe_call_bda = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_safe_call_bda, is_valid_call_addr, is_call_range_ok);
+
     uint32_t safe_call_hdr = rt_alloc_id(mb);
     uint32_t pc_bda = rt_alloc_id(mb);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, pc_bda, mb->g_push_consts_bda);
-    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_call_hdr, is_valid_call_addr, calc_call_rec, pc_bda);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_call_hdr, is_safe_call_bda, calc_call_rec, pc_bda);
 
     uint32_t loaded_call_magic = rt_alloc_id(mb);
     rt_emit_psb_load_u32(mb, b, loaded_call_magic, safe_call_hdr, 0u);
@@ -3152,7 +3204,7 @@ static void rt_emit_invoke_rcall_fn(struct RtMegaBuilder *mb,
     spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_call_magic_ok, loaded_call_magic, c_magic);
 
     uint32_t run_call = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_call, is_valid_call_addr, is_call_magic_ok);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_call, is_safe_call_bda, is_call_magic_ok);
 
     spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_exit, 0u);
     spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, run_call, lbl_valid, lbl_exit);
@@ -3314,11 +3366,23 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
     uint32_t calc_base = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_base, hit_base, byte_off64);
 
+    uint32_t c_min_bda = rt_get_const_u64(mb, RT_MIN_VALID_GPU_BDA);
+    uint32_t c_max_bda = rt_get_const_u64(mb, RT_MAX_VALID_GPU_BDA);
+    uint32_t is_ge_min = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, is_ge_min, calc_base, c_min_bda);
+    uint32_t is_lt_max = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_ULESS_THAN, mb->t_bool, is_lt_max, calc_base, c_max_bda);
+    uint32_t is_range_ok = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_range_ok, is_ge_min, is_lt_max);
+
+    uint32_t is_safe_bda = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_safe_bda, is_valid_addr, is_range_ok);
+
     /* Magic check:
-     * Safely load offset 0 (magic) by reading from calc_base if is_valid_addr, else pc_bda.
+     * Safely load offset 0 (magic) by reading from calc_base if is_safe_bda, else pc_bda.
      * Check if magic == RT_GROUP_HANDLE_MAGIC (0x52544748). */
     uint32_t safe_hdr_bda = rt_alloc_id(mb);
-    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_hdr_bda, is_valid_addr, calc_base, pc_bda);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_hdr_bda, is_safe_bda, calc_base, pc_bda);
 
     uint32_t loaded_magic = rt_alloc_id(mb);
     rt_emit_psb_load_u32(mb, b, loaded_magic, safe_hdr_bda, 0u);
@@ -3328,7 +3392,7 @@ static uint32_t rt_emit_compute_hit_record_bda(struct RtMegaBuilder *mb, struct 
     spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_magic_ok, loaded_magic, c_magic);
 
     uint32_t is_valid = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid, is_valid_addr, is_magic_ok);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_valid, is_safe_bda, is_magic_ok);
 
     uint32_t rec_base = rt_alloc_id(mb);
     spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, rec_base, is_valid, calc_base, c_zero64);
@@ -3628,10 +3692,22 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
     uint32_t calc_miss_rec = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_IADD, mb->t_u64, calc_miss_rec, miss_base, miss_off64);
 
+    uint32_t c_min_bda = rt_get_const_u64(mb, RT_MIN_VALID_GPU_BDA);
+    uint32_t c_max_bda = rt_get_const_u64(mb, RT_MAX_VALID_GPU_BDA);
+    uint32_t is_miss_ge_min = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, is_miss_ge_min, calc_miss_rec, c_min_bda);
+    uint32_t is_miss_lt_max = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_ULESS_THAN, mb->t_bool, is_miss_lt_max, calc_miss_rec, c_max_bda);
+    uint32_t is_miss_range_ok = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_miss_range_ok, is_miss_ge_min, is_miss_lt_max);
+
+    uint32_t is_safe_miss_bda = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_safe_miss_bda, is_valid_miss_addr, is_miss_range_ok);
+
     uint32_t safe_miss_hdr = rt_alloc_id(mb);
     uint32_t pc_bda = rt_alloc_id(mb);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_u64, pc_bda, mb->g_push_consts_bda);
-    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_miss_hdr, is_valid_miss_addr, calc_miss_rec, pc_bda);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_miss_hdr, is_safe_miss_bda, calc_miss_rec, pc_bda);
 
     uint32_t loaded_miss_magic = rt_alloc_id(mb);
     rt_emit_psb_load_u32(mb, b, loaded_miss_magic, safe_miss_hdr, 0u);
@@ -3641,7 +3717,7 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
     spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_miss_magic_ok, loaded_miss_magic, c_magic);
 
     uint32_t run_miss = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_miss, is_valid_miss_addr, is_miss_magic_ok);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_miss, is_safe_miss_bda, is_miss_magic_ok);
 
     spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_after_miss, 0u);
     spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, run_miss, lbl_do_miss, lbl_after_miss);
@@ -3846,9 +3922,21 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, has_rgen_sz, cur_rgen_size, c_32_64);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, run_rgen, has_rgen, has_rgen_sz);
 
+    uint32_t c_min_bda = rt_get_const_u64(mb, RT_MIN_VALID_GPU_BDA);
+    uint32_t c_max_bda = rt_get_const_u64(mb, RT_MAX_VALID_GPU_BDA);
+    uint32_t is_rgen_ge_min = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_UGREATER_THAN_EQUAL, mb->t_bool, is_rgen_ge_min, cur_rgen_base, c_min_bda);
+    uint32_t is_rgen_lt_max = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_ULESS_THAN, mb->t_bool, is_rgen_lt_max, cur_rgen_base, c_max_bda);
+    uint32_t is_rgen_range_ok = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_rgen_range_ok, is_rgen_ge_min, is_rgen_lt_max);
+
+    uint32_t is_safe_rgen_bda = rt_alloc_id(mb);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, is_safe_rgen_bda, run_rgen, is_rgen_range_ok);
+
     /* Magic check for raygen handle */
     uint32_t safe_rgen_hdr = rt_alloc_id(mb);
-    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_rgen_hdr, run_rgen, cur_rgen_base, pc_bda);
+    spv_emit_op5(b, RT_OP_SELECT, mb->t_u64, safe_rgen_hdr, is_safe_rgen_bda, cur_rgen_base, pc_bda);
 
     uint32_t loaded_rgen_magic = rt_alloc_id(mb);
     rt_emit_psb_load_u32(mb, b, loaded_rgen_magic, safe_rgen_hdr, 0u);
@@ -3858,7 +3946,7 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     spv_emit_op4(b, RT_OP_IEQUAL, mb->t_bool, is_rgen_magic_ok, loaded_rgen_magic, c_magic);
 
     uint32_t final_run_rgen = rt_alloc_id(mb);
-    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, final_run_rgen, run_rgen, is_rgen_magic_ok);
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, final_run_rgen, is_safe_rgen_bda, is_rgen_magic_ok);
 
     uint32_t lbl_do_rgen = rt_alloc_id(mb);
     spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_exit, 0u);
@@ -4778,24 +4866,52 @@ compat_CmdTraceRaysKHR(
     struct RtDispatchPushConstants pc;
     memset(&pc, 0, sizeof(pc));
     if (pRaygenShaderBindingTable) {
-        pc.rgen_base   = pRaygenShaderBindingTable->deviceAddress;
-        pc.rgen_stride = (uint32_t)pRaygenShaderBindingTable->stride;
-        pc.rgen_size   = (uint32_t)pRaygenShaderBindingTable->size;
+        VkDeviceAddress addr = pRaygenShaderBindingTable->deviceAddress;
+        if (rt_is_invalid_gpu_bda(addr)) {
+            pc.rgen_base   = rt_get_zero_bda(d);
+            pc.rgen_stride = 0;
+            pc.rgen_size   = 0;
+        } else {
+            pc.rgen_base   = addr;
+            pc.rgen_stride = (uint32_t)pRaygenShaderBindingTable->stride;
+            pc.rgen_size   = (uint32_t)pRaygenShaderBindingTable->size;
+        }
     }
     if (pMissShaderBindingTable) {
-        pc.miss_base   = pMissShaderBindingTable->deviceAddress;
-        pc.miss_stride = (uint32_t)pMissShaderBindingTable->stride;
-        pc.miss_size   = (uint32_t)pMissShaderBindingTable->size;
+        VkDeviceAddress addr = pMissShaderBindingTable->deviceAddress;
+        if (rt_is_invalid_gpu_bda(addr)) {
+            pc.miss_base   = rt_get_zero_bda(d);
+            pc.miss_stride = 0;
+            pc.miss_size   = 0;
+        } else {
+            pc.miss_base   = addr;
+            pc.miss_stride = (uint32_t)pMissShaderBindingTable->stride;
+            pc.miss_size   = (uint32_t)pMissShaderBindingTable->size;
+        }
     }
     if (pHitShaderBindingTable) {
-        pc.hit_base    = pHitShaderBindingTable->deviceAddress;
-        pc.hit_stride  = (uint32_t)pHitShaderBindingTable->stride;
-        pc.hit_size    = (uint32_t)pHitShaderBindingTable->size;
+        VkDeviceAddress addr = pHitShaderBindingTable->deviceAddress;
+        if (rt_is_invalid_gpu_bda(addr)) {
+            pc.hit_base    = rt_get_zero_bda(d);
+            pc.hit_stride  = 0;
+            pc.hit_size    = 0;
+        } else {
+            pc.hit_base    = addr;
+            pc.hit_stride  = (uint32_t)pHitShaderBindingTable->stride;
+            pc.hit_size    = (uint32_t)pHitShaderBindingTable->size;
+        }
     }
     if (pCallableShaderBindingTable) {
-        pc.call_base   = pCallableShaderBindingTable->deviceAddress;
-        pc.call_stride = (uint32_t)pCallableShaderBindingTable->stride;
-        pc.call_size   = (uint32_t)pCallableShaderBindingTable->size;
+        VkDeviceAddress addr = pCallableShaderBindingTable->deviceAddress;
+        if (rt_is_invalid_gpu_bda(addr)) {
+            pc.call_base   = rt_get_zero_bda(d);
+            pc.call_stride = 0;
+            pc.call_size   = 0;
+        } else {
+            pc.call_base   = addr;
+            pc.call_stride = (uint32_t)pCallableShaderBindingTable->stride;
+            pc.call_size   = (uint32_t)pCallableShaderBindingTable->size;
+        }
     }
     pc.launch_width    = width;
     pc.launch_height   = height;
@@ -4919,7 +5035,7 @@ static void rt_dispatch_indirect_common(
     VkDeviceAddress                             indirectDeviceAddress,
     uint32_t                                    indirect_mode)
 {
-    if (!indirectDeviceAddress) return;
+    if (!indirectDeviceAddress || rt_is_invalid_gpu_bda(indirectDeviceAddress)) return;
     struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
     if (!d) return;
     struct RtCmdState *cs = rt_get_cmd_state(commandBuffer, false);
@@ -4929,24 +5045,52 @@ static void rt_dispatch_indirect_common(
     struct RtDispatchPushConstants pc;
     memset(&pc, 0, sizeof(pc));
     if (pRaygenShaderBindingTable) {
-        pc.rgen_base   = pRaygenShaderBindingTable->deviceAddress;
-        pc.rgen_stride = (uint32_t)pRaygenShaderBindingTable->stride;
-        pc.rgen_size   = (uint32_t)pRaygenShaderBindingTable->size;
+        VkDeviceAddress addr = pRaygenShaderBindingTable->deviceAddress;
+        if (rt_is_invalid_gpu_bda(addr)) {
+            pc.rgen_base   = rt_get_zero_bda(d);
+            pc.rgen_stride = 0;
+            pc.rgen_size   = 0;
+        } else {
+            pc.rgen_base   = addr;
+            pc.rgen_stride = (uint32_t)pRaygenShaderBindingTable->stride;
+            pc.rgen_size   = (uint32_t)pRaygenShaderBindingTable->size;
+        }
     }
     if (pMissShaderBindingTable) {
-        pc.miss_base   = pMissShaderBindingTable->deviceAddress;
-        pc.miss_stride = (uint32_t)pMissShaderBindingTable->stride;
-        pc.miss_size   = (uint32_t)pMissShaderBindingTable->size;
+        VkDeviceAddress addr = pMissShaderBindingTable->deviceAddress;
+        if (rt_is_invalid_gpu_bda(addr)) {
+            pc.miss_base   = rt_get_zero_bda(d);
+            pc.miss_stride = 0;
+            pc.miss_size   = 0;
+        } else {
+            pc.miss_base   = addr;
+            pc.miss_stride = (uint32_t)pMissShaderBindingTable->stride;
+            pc.miss_size   = (uint32_t)pMissShaderBindingTable->size;
+        }
     }
     if (pHitShaderBindingTable) {
-        pc.hit_base    = pHitShaderBindingTable->deviceAddress;
-        pc.hit_stride  = (uint32_t)pHitShaderBindingTable->stride;
-        pc.hit_size    = (uint32_t)pHitShaderBindingTable->size;
+        VkDeviceAddress addr = pHitShaderBindingTable->deviceAddress;
+        if (rt_is_invalid_gpu_bda(addr)) {
+            pc.hit_base    = rt_get_zero_bda(d);
+            pc.hit_stride  = 0;
+            pc.hit_size    = 0;
+        } else {
+            pc.hit_base    = addr;
+            pc.hit_stride  = (uint32_t)pHitShaderBindingTable->stride;
+            pc.hit_size    = (uint32_t)pHitShaderBindingTable->size;
+        }
     }
     if (pCallableShaderBindingTable) {
-        pc.call_base   = pCallableShaderBindingTable->deviceAddress;
-        pc.call_stride = (uint32_t)pCallableShaderBindingTable->stride;
-        pc.call_size   = (uint32_t)pCallableShaderBindingTable->size;
+        VkDeviceAddress addr = pCallableShaderBindingTable->deviceAddress;
+        if (rt_is_invalid_gpu_bda(addr)) {
+            pc.call_base   = rt_get_zero_bda(d);
+            pc.call_stride = 0;
+            pc.call_size   = 0;
+        } else {
+            pc.call_base   = addr;
+            pc.call_stride = (uint32_t)pCallableShaderBindingTable->stride;
+            pc.call_size   = (uint32_t)pCallableShaderBindingTable->size;
+        }
     }
     pc.indirect_mode   = indirect_mode;
     pc.push_consts_bda = rt_upload_user_push_constants(d, commandBuffer, cs);
@@ -5579,6 +5723,12 @@ compat_CreateAccelerationStructureKHR(
             track->next = g_rt_as_tracks[b];
             g_rt_as_tracks[b] = track;
             pthread_mutex_unlock(&g_rt_as_lock);
+            COMPAT_INFO("CreateAS: handle=%p type=%u buf=%p off=%llu sz=%llu",
+                        (void *)*pAccelerationStructure,
+                        pCreateInfo ? pCreateInfo->type : 0,
+                        pCreateInfo ? (void *)pCreateInfo->buffer : NULL,
+                        pCreateInfo ? (unsigned long long)pCreateInfo->offset : 0ULL,
+                        pCreateInfo ? (unsigned long long)pCreateInfo->size : 0ULL);
         }
     }
     return res;
@@ -5805,14 +5955,167 @@ compat_CmdBuildAccelerationStructuresKHR(
 
     static uint32_t g_as_build_count = 0;
     uint32_t as_idx = g_as_build_count++;
+
+    /* Deep geometry and range info sanitization:
+     * 1. Protect against CPU user-space pointers (>= 0x6000000000ULL, e.g. FEXAllocator PROT_NONE pages)
+     *    and invalid/NULL pointers (< 0x10000ULL).
+     * 2. VK_GEOMETRY_TYPE_TRIANGLES_KHR:
+     *    - If transformData is invalid/CPU-space, clamp to 0ULL (Vulkan standard Identity transform)
+     *      and enforce transformOffset = 0 (VUID-VkAccelerationStructureGeometryTrianglesDataKHR-transformData-04092).
+     *    - If vertexData is invalid, point to rt_zero_bda (degenerate triangles culled by hardware).
+     *    - If indexData is invalid, set indexType = VK_INDEX_TYPE_NONE_KHR.
+     * 3. VK_GEOMETRY_TYPE_INSTANCES_KHR (TLAS):
+     *    - If instances.data is invalid, point to rt_zero_bda and set primitiveCount = 0.
+     *    - For each instance in the array: if accelerationStructureReference is invalid/CPU-space (such as 0x6d7a3689c0),
+     *      set instance.mask = 0 (so ray traversal skips it completely without affecting valid instances)
+     *      and point accelerationStructureReference to rt_zero_bda so the driver BVH builder never faults!
+     */
+    uint32_t total_geoms = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        total_geoms += infos[i].geometryCount;
+    }
+
+    VkAccelerationStructureGeometryKHR stack_all_geoms[32];
+    VkAccelerationStructureBuildRangeInfoKHR stack_all_ranges[32];
+    const VkAccelerationStructureBuildRangeInfoKHR *stack_ppRangeInfos[16];
+
+    VkAccelerationStructureGeometryKHR *all_geoms = stack_all_geoms;
+    VkAccelerationStructureBuildRangeInfoKHR *all_ranges = stack_all_ranges;
+    const VkAccelerationStructureBuildRangeInfoKHR **new_ppBuildRangeInfos = stack_ppRangeInfos;
+
+    if (total_geoms > 32) {
+        all_geoms = (VkAccelerationStructureGeometryKHR *)malloc(total_geoms * sizeof(*all_geoms));
+        all_ranges = (VkAccelerationStructureBuildRangeInfoKHR *)malloc(total_geoms * sizeof(*all_ranges));
+        if (!all_geoms) all_geoms = stack_all_geoms;
+        if (!all_ranges) all_ranges = stack_all_ranges;
+    }
+
+    if (count > 16) {
+        new_ppBuildRangeInfos = (const VkAccelerationStructureBuildRangeInfoKHR **)malloc(count * sizeof(*new_ppBuildRangeInfos));
+        if (!new_ppBuildRangeInfos) new_ppBuildRangeInfos = stack_ppRangeInfos;
+    }
+
+    uint32_t curr_geom_idx = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t g_count = infos[i].geometryCount;
+        if (g_count == 0 || curr_geom_idx + g_count > total_geoms) {
+            new_ppBuildRangeInfos[i] = (ppBuildRangeInfos ? ppBuildRangeInfos[i] : NULL);
+            continue;
+        }
+
+        VkAccelerationStructureGeometryKHR *info_geoms = &all_geoms[curr_geom_idx];
+        VkAccelerationStructureBuildRangeInfoKHR *info_ranges = &all_ranges[curr_geom_idx];
+        new_ppBuildRangeInfos[i] = info_ranges;
+
+        for (uint32_t j = 0; j < g_count; j++) {
+            uint32_t idx = curr_geom_idx + j;
+            const VkAccelerationStructureGeometryKHR *src_geom = NULL;
+            if (pInfos[i].pGeometries) src_geom = &pInfos[i].pGeometries[j];
+            else if (pInfos[i].ppGeometries && pInfos[i].ppGeometries[j]) src_geom = pInfos[i].ppGeometries[j];
+
+            if (src_geom) {
+                all_geoms[idx] = *src_geom;
+            } else {
+                memset(&all_geoms[idx], 0, sizeof(all_geoms[idx]));
+                all_geoms[idx].sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+            }
+
+            if (ppBuildRangeInfos && ppBuildRangeInfos[i]) {
+                all_ranges[idx] = ppBuildRangeInfos[i][j];
+            } else {
+                memset(&all_ranges[idx], 0, sizeof(all_ranges[idx]));
+            }
+
+            if (infos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) {
+                if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+                    VkAccelerationStructureGeometryTrianglesDataKHR *tri = &all_geoms[idx].geometry.triangles;
+                    if (rt_is_invalid_gpu_bda(tri->transformData.deviceAddress)) {
+                        tri->transformData.deviceAddress = 0ULL;
+                    }
+                    if (tri->transformData.deviceAddress == 0ULL) {
+                        all_ranges[idx].transformOffset = 0;
+                    }
+                    if (rt_is_invalid_gpu_bda(tri->vertexData.deviceAddress) || tri->vertexData.deviceAddress == 0ULL) {
+                        tri->vertexData.deviceAddress = rt_get_zero_bda(d);
+                        if (tri->vertexStride < 12) tri->vertexStride = 12;
+                    }
+                    if (tri->indexType != VK_INDEX_TYPE_NONE_KHR && rt_is_invalid_gpu_bda(tri->indexData.deviceAddress)) {
+                        tri->indexType = VK_INDEX_TYPE_NONE_KHR;
+                        tri->indexData.deviceAddress = 0ULL;
+                    }
+                } else if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+                    VkAccelerationStructureGeometryAabbsDataKHR *aabb = &all_geoms[idx].geometry.aabbs;
+                    if (rt_is_invalid_gpu_bda(aabb->data.deviceAddress) || aabb->data.deviceAddress == 0ULL) {
+                        aabb->data.deviceAddress = rt_get_zero_bda(d);
+                        if (aabb->stride < 24) aabb->stride = 24;
+                    }
+                }
+            } else if (infos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
+                if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
+                    VkAccelerationStructureGeometryInstancesDataKHR *inst = &all_geoms[idx].geometry.instances;
+                    VkDeviceAddress inst_bda = inst->data.deviceAddress;
+                    if (rt_is_invalid_gpu_bda(inst_bda) || inst_bda == 0ULL) {
+                        inst->data.deviceAddress = rt_get_zero_bda(d);
+                        all_ranges[idx].primitiveCount = 0;
+                    } else if (inst->arrayOfPointers == VK_FALSE && all_ranges[idx].primitiveCount > 0) {
+                        uint32_t prim_cnt = all_ranges[idx].primitiveCount;
+                        uint32_t prim_off = all_ranges[idx].primitiveOffset;
+                        uintptr_t host_base = (uintptr_t)inst_bda + prim_off;
+                        if (rt_is_host_address_accessible((const void *)host_base, sizeof(VkAccelerationStructureInstanceKHR))) {
+                            VkAccelerationStructureInstanceKHR *inst_arr = (VkAccelerationStructureInstanceKHR *)host_base;
+                            uint32_t bad_refs = 0;
+                            for (uint32_t k = 0; k < prim_cnt; k++) {
+                                if ((k & 63u) == 0 && k > 0) {
+                                    if (!rt_is_host_address_accessible((const void *)&inst_arr[k], sizeof(VkAccelerationStructureInstanceKHR))) {
+                                        break;
+                                    }
+                                }
+                                VkDeviceAddress as_ref = inst_arr[k].accelerationStructureReference;
+                                if (rt_is_invalid_gpu_bda(as_ref)) {
+                                    inst_arr[k].mask = 0;
+                                    inst_arr[k].accelerationStructureReference = rt_get_zero_bda(d);
+                                    bad_refs++;
+                                }
+                            }
+                            if (bad_refs > 0) {
+                                COMPAT_INFO("RT_EMU: sanitized %u invalid BLAS refs (mask=0) in TLAS build #%u (inst_bda=0x%llx)",
+                                            bad_refs, as_idx, (unsigned long long)inst_bda);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        infos[i].pGeometries = info_geoms;
+        infos[i].ppGeometries = NULL;
+        curr_geom_idx += g_count;
+    }
+
     if (as_idx < 10 || (as_idx % 60) == 0) {
         for (uint32_t i = 0; i < count; i++) {
-            COMPAT_INFO("CmdBuildAS #%u [%u/%u]: type=%u mode=%u dst=%p src=%p geoms=%u scratch=0x%llx",
+            VkDeviceAddress dst_bda = 0ULL;
+            if (d->fpGetAccelerationStructureDeviceAddressKHR && infos[i].dstAccelerationStructure) {
+                VkAccelerationStructureDeviceAddressInfoKHR dai = {
+                    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                    .accelerationStructure = infos[i].dstAccelerationStructure,
+                };
+                dst_bda = d->fpGetAccelerationStructureDeviceAddressKHR(d->device, &dai);
+            }
+            VkDeviceAddress inst_bda = 0ULL;
+            if (infos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR && infos[i].geometryCount > 0) {
+                if (infos[i].pGeometries) inst_bda = infos[i].pGeometries[0].geometry.instances.data.deviceAddress;
+                else if (infos[i].ppGeometries && infos[i].ppGeometries[0]) inst_bda = infos[i].ppGeometries[0]->geometry.instances.data.deviceAddress;
+            }
+            COMPAT_INFO("CmdBuildAS #%u [%u/%u]: type=%u mode=%u dst=%p (bda=0x%llx) src=%p geoms=%u inst_bda=0x%llx scratch=0x%llx (orig=0x%llx)",
                         as_idx, i + 1, count, infos[i].type, infos[i].mode,
                         (void *)infos[i].dstAccelerationStructure,
+                        (unsigned long long)dst_bda,
                         (void *)infos[i].srcAccelerationStructure,
                         infos[i].geometryCount,
-                        (unsigned long long)infos[i].scratchData.deviceAddress);
+                        (unsigned long long)inst_bda,
+                        (unsigned long long)infos[i].scratchData.deviceAddress,
+                        (unsigned long long)pInfos[i].scratchData.deviceAddress);
         }
     }
 
@@ -5836,7 +6139,10 @@ compat_CmdBuildAccelerationStructuresKHR(
                                 0, NULL);
     }
 
-    d->fpCmdBuildAccelerationStructuresKHR(commandBuffer, count, infos, ppBuildRangeInfos);
+    const VkAccelerationStructureBuildRangeInfoKHR * const *pass_ranges =
+        ppBuildRangeInfos ? (const VkAccelerationStructureBuildRangeInfoKHR * const *)new_ppBuildRangeInfos : NULL;
+
+    d->fpCmdBuildAccelerationStructuresKHR(commandBuffer, count, infos, pass_ranges);
 
     if (d->fpCmdPipelineBarrier) {
         VkMemoryBarrier mb = {
@@ -5858,6 +6164,9 @@ compat_CmdBuildAccelerationStructuresKHR(
                                 0, NULL);
     }
 
+    if (all_geoms != stack_all_geoms) free(all_geoms);
+    if (all_ranges != stack_all_ranges) free(all_ranges);
+    if (new_ppBuildRangeInfos != stack_ppRangeInfos) free((void *)new_ppBuildRangeInfos);
     if (infos != stack_infos) free(infos);
 }
 
