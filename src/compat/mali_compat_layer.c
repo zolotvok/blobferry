@@ -8411,22 +8411,23 @@ static void sal_writes(int path, uint32_t n, const VkWriteDescriptorSet *w) {
     sal_flush(path, loc);
 }
 
-// Templates: only their SSBO entries are kept (handle -> entries), from vkCreateDescriptorUpdateTemplate on.
+// Templates: only their SSBO entries are kept ((VkDevice, handle) -> entries), from vkCreateDescriptorUpdateTemplate on.
 struct SalTplEnt { uint32_t count; size_t offset, stride; };
-struct SalTpl { uint64_t h; uint32_t n; struct SalTplEnt *e; struct SalTpl *next; };
+struct SalTpl { VkDevice dev; uint64_t h; uint32_t n; struct SalTplEnt *e; struct SalTpl *next; };
 #define SAL_TPL_BUCKETS 256
 static struct SalTpl *g_sal_tpl[SAL_TPL_BUCKETS];
 static pthread_mutex_t g_sal_tpl_m = PTHREAD_MUTEX_INITIALIZER;
-static void sal_tpl_del_locked(uint64_t h) {
+static void sal_tpl_del_locked(VkDevice dev, uint64_t h) {
     for (struct SalTpl **pp = &g_sal_tpl[handle_bucket(h, SAL_TPL_BUCKETS)]; *pp; pp = &(*pp)->next)
-        if ((*pp)->h == h) { struct SalTpl *t = *pp; *pp = t->next; free(t->e); free(t); return; }
+        if ((*pp)->h == h && (*pp)->dev == dev) { struct SalTpl *t = *pp; *pp = t->next; free(t->e); free(t); return; }
 }
-static void sal_tpl_new(VkDescriptorUpdateTemplate tpl, const VkDescriptorUpdateTemplateCreateInfo *ci) {
+static void sal_tpl_new(VkDevice dev, VkDescriptorUpdateTemplate tpl, const VkDescriptorUpdateTemplateCreateInfo *ci) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < ci->descriptorUpdateEntryCount; i++) n += sal_is_ssbo(ci->pDescriptorUpdateEntries[i].descriptorType);
     struct SalTpl *t = n ? calloc(1, sizeof *t) : NULL;
     if (t && !(t->e = calloc(n, sizeof *t->e))) { free(t); t = NULL; }
     if (t) {
+        t->dev = dev;
         t->h = (uint64_t)tpl;
         for (uint32_t i = 0; i < ci->descriptorUpdateEntryCount; i++) {
             const VkDescriptorUpdateTemplateEntry *s = &ci->pDescriptorUpdateEntries[i];
@@ -8434,7 +8435,7 @@ static void sal_tpl_new(VkDescriptorUpdateTemplate tpl, const VkDescriptorUpdate
         }
     }
     pthread_mutex_lock(&g_sal_tpl_m);
-    sal_tpl_del_locked((uint64_t)tpl); // a reused handle whose destroy was not seen
+    sal_tpl_del_locked(dev, (uint64_t)tpl); // a reused handle whose destroy was not seen
     if (t) {
         uint32_t b = handle_bucket(t->h, SAL_TPL_BUCKETS);
         t->next = g_sal_tpl[b];
@@ -8442,12 +8443,12 @@ static void sal_tpl_new(VkDescriptorUpdateTemplate tpl, const VkDescriptorUpdate
     }
     pthread_mutex_unlock(&g_sal_tpl_m);
 }
-static void sal_tpl_data(int path, VkDescriptorUpdateTemplate tpl, const void *data) {
+static void sal_tpl_data(int path, VkDevice dev, VkDescriptorUpdateTemplate tpl, const void *data) {
     uint64_t loc[5] = {0};
     if (data) {
         pthread_mutex_lock(&g_sal_tpl_m);
         for (struct SalTpl *t = g_sal_tpl[handle_bucket((uint64_t)tpl, SAL_TPL_BUCKETS)]; t; t = t->next) {
-            if (t->h != (uint64_t)tpl) continue;
+            if (t->h != (uint64_t)tpl || t->dev != dev) continue;
             for (uint32_t i = 0; i < t->n; i++)
                 for (uint32_t k = 0; k < t->e[i].count; k++)
                     sal_add(loc, ((const VkDescriptorBufferInfo *)((const uint8_t *)data + t->e[i].offset +
@@ -8470,7 +8471,7 @@ static VKAPI_ATTR void VKAPI_CALL sal_UpdateDescriptorSets(VkDevice device, uint
 }
 static VKAPI_ATTR void VKAPI_CALL sal_UpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet set,
                                                                       VkDescriptorUpdateTemplate t, const void *data) {
-    sal_tpl_data(SALP_TPL, t, data);
+    sal_tpl_data(SALP_TPL, device, t, data);
     ((PFN_vkUpdateDescriptorSetWithTemplate)sal_next(get_device_data(device), SAL_UPD_TPL))(device, set, t, data);
 }
 static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSet(VkCommandBuffer cmd, VkPipelineBindPoint bp, VkPipelineLayout layout,
@@ -8484,24 +8485,26 @@ static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSet2(VkCommandBuffer cmd,
 }
 static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSetWithTemplate(VkCommandBuffer cmd, VkDescriptorUpdateTemplate t,
                                                                        VkPipelineLayout layout, uint32_t set, const void *data) {
-    sal_tpl_data(SALP_PUSH, t, data);
-    ((PFN_vkCmdPushDescriptorSetWithTemplate)sal_next(get_device_data_by_cmd(cmd), SAL_PUSH_TPL))(cmd, t, layout, set, data);
+    struct DeviceData *d = get_device_data_by_cmd(cmd);
+    sal_tpl_data(SALP_PUSH, d ? d->device : VK_NULL_HANDLE, t, data);
+    ((PFN_vkCmdPushDescriptorSetWithTemplate)sal_next(d, SAL_PUSH_TPL))(cmd, t, layout, set, data);
 }
 static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSetWithTemplate2(VkCommandBuffer cmd, const VkPushDescriptorSetWithTemplateInfo *i) {
-    if (i) sal_tpl_data(SALP_PUSH, i->descriptorUpdateTemplate, i->pData);
-    ((PFN_vkCmdPushDescriptorSetWithTemplate2)sal_next(get_device_data_by_cmd(cmd), SAL_PUSH_TPL2))(cmd, i);
+    struct DeviceData *d = get_device_data_by_cmd(cmd);
+    if (i) sal_tpl_data(SALP_PUSH, d ? d->device : VK_NULL_HANDLE, i->descriptorUpdateTemplate, i->pData);
+    ((PFN_vkCmdPushDescriptorSetWithTemplate2)sal_next(d, SAL_PUSH_TPL2))(cmd, i);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL sal_CreateDescriptorUpdateTemplate(VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *ci,
                                                                          const VkAllocationCallbacks *a, VkDescriptorUpdateTemplate *t) {
     VkResult r = ((PFN_vkCreateDescriptorUpdateTemplate)sal_next(get_device_data(device), SAL_TPL_NEW))(device, ci, a, t);
-    if (r == VK_SUCCESS && ci && t) sal_tpl_new(*t, ci);
+    if (r == VK_SUCCESS && ci && t) sal_tpl_new(device, *t, ci);
     return r;
 }
 static VKAPI_ATTR void VKAPI_CALL sal_DestroyDescriptorUpdateTemplate(VkDevice device, VkDescriptorUpdateTemplate t,
                                                                       const VkAllocationCallbacks *a) {
     if (t) {
         pthread_mutex_lock(&g_sal_tpl_m);
-        sal_tpl_del_locked((uint64_t)t);
+        sal_tpl_del_locked(device, (uint64_t)t);
         pthread_mutex_unlock(&g_sal_tpl_m);
     }
     ((PFN_vkDestroyDescriptorUpdateTemplate)sal_next(get_device_data(device), SAL_TPL_DEL))(device, t, a);
@@ -8545,11 +8548,17 @@ static PFN_vkVoidFunction sal_proc(VkDevice device, const char *pName) {
     PFN_vkVoidFunction inner = vkGetDeviceProcAddr(device, pName);
     tl_sal_inner = false;
     if (!inner) return NULL;
+    // One next pointer per kind (core and KHR name share it). An alias whose entry point below differs from the one already
+    // recorded is handed out unwrapped (not counted) instead of being routed to the other name's entry point.
+    int kind = g_sal_names[k].kind;
+    bool wrap;
     pthread_mutex_lock(&g_sal_tpl_m);
-    if (!d->sal_next[g_sal_names[k].kind]) d->sal_next[g_sal_names[k].kind] = inner; // KHR alias: the same entry point
-    if (!g_sal_next_any[g_sal_names[k].kind]) g_sal_next_any[g_sal_names[k].kind] = inner;
+    if (!d->sal_next[kind]) d->sal_next[kind] = inner;
+    wrap = d->sal_next[kind] == inner;
+    if (wrap && !g_sal_next_any[kind]) g_sal_next_any[kind] = inner;
     pthread_mutex_unlock(&g_sal_tpl_m);
-    return g_sal_names[k].fn;
+    if (!wrap) fprintf(stderr, "mali-compat: ssbo-align: %s resolves to another entry point than its alias, not counted\n", pName);
+    return wrap ? g_sal_names[k].fn : inner;
 }
 
 static void gt_render_begin(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t colors, const VkRenderingInfo *ri) {
