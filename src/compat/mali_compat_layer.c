@@ -58,8 +58,12 @@ static void relink(struct unlinked u) {
     if (u.prev) u.prev->pNext = u.node;
 }
 
+// 11-10: one persistent log handle instead of fopen/fclose per line (ported from Gemini 4 Argon's wt-rtx-emu; the
+// RT path logs thousands of lines). fflush after every line so a crash or GPU-fault kill loses nothing.
 static void mali_compat_log_write(const char *fmt, ...) {
     static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+    static FILE *s_log_file = NULL;
+    static bool s_log_opened = false;
     pthread_mutex_lock(&log_lock);
     va_list ap;
     va_start(ap, fmt);
@@ -68,13 +72,17 @@ static void mali_compat_log_write(const char *fmt, ...) {
     fflush(stderr);
     va_end(ap);
 
-    FILE *f = fopen("/tmp/mali-compat.log", "a");
-    if (!f) f = fopen("/data/local/tmp/mali-compat.log", "a");
-    if (f) {
+    if (!s_log_opened) {
+        s_log_file = fopen("/tmp/mali-compat.log", "a");
+        if (!s_log_file) s_log_file = fopen("/data/local/tmp/mali-compat.log", "a");
+        s_log_opened = true;
+    }
+    if (s_log_file) {
         va_start(ap, fmt);
-        vfprintf(f, fmt, ap);
-        fputc('\n', f);
-        fclose(f);
+        vfprintf(s_log_file, fmt, ap);
+        fputc('\n', s_log_file);
+        fflush(s_log_file);
+        va_end(ap);
     }
     pthread_mutex_unlock(&log_lock);
 }
@@ -1513,6 +1521,7 @@ struct DeviceData {
     struct SdDev *sd;   // sync-diag next/driver entry points, NULL when off
     VkPipelineLayout rt_ind_layout;
     VkPipeline rt_ind_pipeline;
+    PFN_vkCmdUpdateBuffer fpCmdUpdateBuffer;  /* rt param upload (GPU-ordered), param-fix 11-08 */
     PFN_vkCmdDispatchIndirect fpCmdDispatchIndirect;
     PFN_vkCmdSetDescriptorBufferOffsetsEXT fpCmdSetDescriptorBufferOffsetsEXT;
     PFN_vkCmdBindDescriptorSets fpCmdBindDescriptorSets;
@@ -1520,6 +1529,7 @@ struct DeviceData {
     PFN_vkDestroyAccelerationStructureKHR fpDestroyAccelerationStructureKHR;
     PFN_vkCmdBuildAccelerationStructuresKHR fpCmdBuildAccelerationStructuresKHR;
     PFN_vkCmdCopyAccelerationStructureKHR fpCmdCopyAccelerationStructureKHR;
+    PFN_vkCmdCopyBuffer fpCmdCopyBuffer;   /* lead-1110c: the layer's AS CLONE (mali_rt_emu.h) */
     PFN_vkCmdWriteAccelerationStructuresPropertiesKHR fpCmdWriteAccelerationStructuresPropertiesKHR;
     PFN_vkGetAccelerationStructureDeviceAddressKHR fpGetAccelerationStructureDeviceAddressKHR;
     PFN_vkGetAccelerationStructureBuildSizesKHR fpGetAccelerationStructureBuildSizesKHR;
@@ -6076,6 +6086,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
     if (mod.usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) {
         mod.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
+    bool as_xfer = false;   /* lead-1110c: an AS storage buffer that got TRANSFER_SRC|TRANSFER_DST (layer CLONE) */
     if (g_rt_pipeline) {
         if (mod.usage & VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR) {
             mod.usage &= ~VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR;
@@ -6086,11 +6097,33 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
         if (mod.usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT)) {
             mod.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         }
+        /* lead-1110c: the layer clones ASes with vkCmdCopyBuffer (mali_rt_emu.h compat_CmdCopyAccelerationStructureKHR):
+         * every AS storage buffer gets both transfer bits (after the rules above, so they add nothing else). With a
+         * VkBufferUsageFlags2CreateInfo in pNext (maintenance5: it replaces .usage) the buffer is left as it is and is
+         * recorded only if it already has both bits; an unrecorded buffer makes a CLONE fall back to the driver. */
+        const VkBufferUsageFlags2CreateInfoKHR *u2 = (const VkBufferUsageFlags2CreateInfoKHR *)
+            find_struct(mod.pNext, VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR);
+        const VkBufferUsageFlags2KHR xfer2 = VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT_KHR | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR;
+        if (u2) {
+            as_xfer = (u2->usage & VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) && (u2->usage & xfer2) == xfer2;
+        } else if (mod.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) {
+            mod.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            as_xfer = true;
+        }
     }
 
     VkResult r = d->fpCreateBuffer(device, &mod, pAllocator, pBuffer);
     if (g_dc_on && r == VK_SUCCESS) dc_buf_create(d, *pBuffer, &mod);
+    if (as_xfer && r == VK_SUCCESS) rt_xfer_buf_add(*pBuffer);
     return r;
+}
+
+/* lead-1110c: only with MALI_COMPAT_RT_PIPELINE: forgets the buffer in the layer's AS-transfer set (a reused handle
+ * must not inherit the record), then the normal destroy (desc-capture's when it is on). */
+static VKAPI_ATTR void VKAPI_CALL compat_RtDestroyBuffer(VkDevice device, VkBuffer b, const VkAllocationCallbacks *a) {
+    if (b) rt_xfer_buf_remove(b);
+    if (g_dc_on) { compat_DcDestroyBuffer(device, b, a); return; }
+    get_device_data(device)->fpDestroyBuffer(device, b, a);
 }
 
 // -----------------------------------------------------------------------------
@@ -9385,10 +9418,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         d->fpCmdSetDescriptorBufferOffsetsEXT = (PFN_vkCmdSetDescriptorBufferOffsetsEXT)fpGetDeviceProcAddr(*pDevice, "vkCmdSetDescriptorBufferOffsetsEXT");
         d->fpCmdBindDescriptorSets = (PFN_vkCmdBindDescriptorSets)fpGetDeviceProcAddr(*pDevice, "vkCmdBindDescriptorSets");
         d->fpCmdDispatchIndirect = (PFN_vkCmdDispatchIndirect)fpGetDeviceProcAddr(*pDevice, "vkCmdDispatchIndirect");
+        d->fpCmdUpdateBuffer = (PFN_vkCmdUpdateBuffer)fpGetDeviceProcAddr(*pDevice, "vkCmdUpdateBuffer");
         d->fpCreateAccelerationStructureKHR = (PFN_vkCreateAccelerationStructureKHR)fpGetDeviceProcAddr(*pDevice, "vkCreateAccelerationStructureKHR");
         d->fpDestroyAccelerationStructureKHR = (PFN_vkDestroyAccelerationStructureKHR)fpGetDeviceProcAddr(*pDevice, "vkDestroyAccelerationStructureKHR");
         d->fpCmdBuildAccelerationStructuresKHR = (PFN_vkCmdBuildAccelerationStructuresKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdBuildAccelerationStructuresKHR");
         d->fpCmdCopyAccelerationStructureKHR = (PFN_vkCmdCopyAccelerationStructureKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdCopyAccelerationStructureKHR");
+        d->fpCmdCopyBuffer = (PFN_vkCmdCopyBuffer)fpGetDeviceProcAddr(*pDevice, "vkCmdCopyBuffer");
         d->fpCmdWriteAccelerationStructuresPropertiesKHR = (PFN_vkCmdWriteAccelerationStructuresPropertiesKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdWriteAccelerationStructuresPropertiesKHR");
         d->fpGetAccelerationStructureDeviceAddressKHR = (PFN_vkGetAccelerationStructureDeviceAddressKHR)fpGetDeviceProcAddr(*pDevice, "vkGetAccelerationStructureDeviceAddressKHR");
         d->fpGetAccelerationStructureBuildSizesKHR = (PFN_vkGetAccelerationStructureBuildSizesKHR)fpGetDeviceProcAddr(*pDevice, "vkGetAccelerationStructureBuildSizesKHR");
@@ -9478,6 +9513,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
 
 static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
     VkDevice device, const VkAllocationCallbacks *pAllocator) {
+    // 11-10 keeper: a megakernel compile still running on a worker (DestroyPipeline does not wait for it) must
+    // finish its driver calls before the device goes away (Codex 1110-194217 "detached compile outlives its device").
+    if (device) rt_drain_device_jobs(device);
     struct DeviceData *d = get_device_data(device);
     if (g_memlog) ml_flush();
     if (d) {
@@ -9672,6 +9710,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     }
     if (g_rt_pipeline) {
         rt_patch_fex_thunks();
+        if (!strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;   /* lead-1110c */
         if (!strcmp(pName, "vkCreateRayTracingPipelinesKHR") || !strcmp(pName, "vkCreateRayTracingPipelinesNV")) return (PFN_vkVoidFunction)compat_CreateRayTracingPipelinesKHR;
         if (!strcmp(pName, "vkGetRayTracingShaderGroupHandlesKHR") || !strcmp(pName, "vkGetRayTracingShaderGroupHandlesNV")) return (PFN_vkVoidFunction)compat_GetRayTracingShaderGroupHandlesKHR;
         if (!strcmp(pName, "vkGetRayTracingCaptureReplayShaderGroupHandlesKHR")) return (PFN_vkVoidFunction)compat_GetRayTracingCaptureReplayShaderGroupHandlesKHR;
@@ -9689,6 +9728,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         if (!strcmp(pName, "vkDestroyPipeline")) return (PFN_vkVoidFunction)compat_DestroyPipeline;
         if (!strcmp(pName, "vkCreateDescriptorSetLayout")) return (PFN_vkVoidFunction)compat_RtCreateDescriptorSetLayout;
         if (!strcmp(pName, "vkCreatePipelineLayout")) return (PFN_vkVoidFunction)compat_RtCreatePipelineLayout;
+        if (!strcmp(pName, "vkDestroyPipelineLayout")) return (PFN_vkVoidFunction)compat_RtDestroyPipelineLayout;
         if (!strcmp(pName, "vkCmdBindDescriptorSets")) return (PFN_vkVoidFunction)compat_RtCmdBindDescriptorSets;
         if (!strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT")) {
             struct DeviceData *dd = get_device_data(device);
@@ -9824,6 +9864,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
     MATCH_DEV2(FreeCommandBuffers);
     if (g_rt_pipeline) {
         rt_patch_fex_thunks();
+        if (!strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;   /* lead-1110c */
         MATCH_DEV2(CreateRayTracingPipelinesKHR);
         MATCH_DEV2(GetRayTracingShaderGroupHandlesKHR);
         if (!strcmp(pName, "vkCreateRayTracingPipelinesNV")) return (PFN_vkVoidFunction)compat_CreateRayTracingPipelinesKHR;
@@ -9843,6 +9884,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
         MATCH_DEV2(DestroyPipeline);
         if (!strcmp(pName, "vkCreateDescriptorSetLayout")) return (PFN_vkVoidFunction)compat_RtCreateDescriptorSetLayout;
         if (!strcmp(pName, "vkCreatePipelineLayout")) return (PFN_vkVoidFunction)compat_RtCreatePipelineLayout;
+        if (!strcmp(pName, "vkDestroyPipelineLayout")) return (PFN_vkVoidFunction)compat_RtDestroyPipelineLayout;
         if (!strcmp(pName, "vkCmdBindDescriptorSets")) return (PFN_vkVoidFunction)compat_RtCmdBindDescriptorSets;
         if (!strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT")) return (PFN_vkVoidFunction)compat_RtCmdSetDescriptorBufferOffsetsEXT;
         if (!strcmp(pName, "vkCreateAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_CreateAccelerationStructureKHR;

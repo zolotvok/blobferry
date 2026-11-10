@@ -34,7 +34,10 @@ static void rt_patch_fex_thunks(void);
  * Addresses >= 0x6000000000ULL are in CPU user space / [anon:FEXAllocator] PROT_NONE pages.
  * Any GPU MMU dereference outside this range unconditionally crashes the GPU with
  * a Level 1 translation fault (0x1002c1 / 0x55002c1). */
-#define RT_MIN_VALID_GPU_BDA                         0x4000000000ULL
+/* 11-08 keeper: the floor goes back to 0x10000 (01f42d9 value). kbase fills its VA space downward, so real
+ * /mali_gmc heaps DO land below 256 GB (W3 megafix L1: all BLAS at 0x3a.., 440 AS addresses clamped to the
+ * 4 KB zero buffer, 99.6 % of TLAS instances masked, every app scratch replaced). */
+#define RT_MIN_VALID_GPU_BDA                         0x10000ULL
 #define RT_MAX_VALID_GPU_BDA                         0x6000000000ULL
 
 static inline bool rt_is_invalid_gpu_bda(VkDeviceAddress addr) {
@@ -357,6 +360,16 @@ struct RtDispatchPushConstants {
     uint64_t indirect_bda;     /* offset 88: BDA of indirect trace command */
 };
 
+/* Traversal safety bound (param-fix 11-08): a ray whose ray-query loop runs more than g_rt_guard_max
+ * OpRayQueryProceedKHR iterations is terminated and treated as a miss, so a bad SBT/TLAS/param value can
+ * never keep a GPU job alive until the watchdog kills it.  Counter = one u32 in the last ring slot
+ * (GPU atomic), logged once per second with MALI_COMPAT_DEBUG.  MALI_COMPAT_RT_GUARD_ITERS overrides. */
+#define RT_GUARD_SLOT_OFF ((4u * 1024u * 1024u) - 256u)
+static VkDeviceAddress g_rt_guard_bda = 0ULL;
+static uint32_t        g_rt_guard_max = 0u;
+struct DeviceData;
+static bool rt_ensure_ring_buffer(struct DeviceData *d);
+
 /* ── Intercepted RT Shader Module & Pipeline Tables ───────────────────────── */
 struct RtShaderModule {
     uint32_t               magic;
@@ -398,6 +411,13 @@ struct RtPipeline {
     struct RtGroupHandle  *groups;
     uint32_t               group_count;
     uint32_t               max_recursion_depth;
+    /* megakernel compile state (11-08 megafix): 0 none/sync, 1 pending on a worker, 2 ready, 3 failed, 4 capped */
+    int                    compile_state;
+    bool                   compile_thread_live;
+    bool                   compile_null_alloc;  /* async compile used a NULL allocator */
+    bool                   layout_pinned;       /* 1110b: `layout` pinned for this object's life (rt_pin_pipeline_layout) */
+    pthread_t              compile_thread;
+    _Atomic int            compile_handshake;   /* 11-08 keeper: worker vs DestroyPipeline, second one cleans up */
     struct RtPipeline     *next;
 };
 
@@ -435,8 +455,91 @@ struct RtLayoutNode {
 #ifndef COMPAT_INFO
 #define COMPAT_INFO(...) LOG(__VA_ARGS__)
 #endif
+/* 11-10 keeper (lead-1110): every RT env lever is read ONCE, thread-safely (pthread_once), into g_rt_env.
+ * Before, each lever was a function-local `static int v = -1` that two threads could read/write at the same
+ * time on their first trace / AS-build / CRTP call (Codex 1110-194217: C data race = UB). */
+struct RtEnv {
+    int skip_traces;    /* MALI_COMPAT_RT_SKIP_TRACES=1: skip every trace dispatch (default 0) */
+    int max_stages;     /* MALI_COMPAT_RT_MAX_STAGES=N: no megakernel above N stages (default 0 = off) */
+    int sync_compile;   /* MALI_COMPAT_RT_SYNC_COMPILE=1: megakernel compiled inside CRTP (default 0 = async) */
+    int own_scratch;    /* MALI_COMPAT_RT_OWN_SCRATCH=0: keep the app's AS build scratch (default 1) */
+    int force_build;    /* MALI_COMPAT_RT_FORCE_BUILD=1: UPDATE builds become BUILD, src cleared (default 0) */
+    uint32_t build_log; /* MALI_COMPAT_RT_BUILD_LOG=N: per-build lines for the first N calls (+N after 1st trace) */
+    int trace;          /* MALI_COMPAT_TRACE=1: COMPAT_TRACE lines (default 0) */
+    int size_pad;       /* 1110b MALI_COMPAT_RT_SIZE_PAD=0: GetASBuildSizes returns the driver's sizes (default 1 = inflate) */
+    int as_trust;       /* 1110b MALI_COMPAT_RT_AS_TRUST=1: no handle recreation on a type change, no UPDATE->BUILD for
+                         * unbuilt/mutated tracks (an UPDATE with a null src still becomes a BUILD); default 0 */
+    int upd_src;        /* 1110b MALI_COMPAT_RT_UPD_SRC=1: UPDATE with src != dst -> BUILD; =2 only if src storage > dst
+                         * storage; 0 = unchanged. lead-1110c: default 1 (the blob breaks on such refits, as-probe) */
+    int clone;          /* lead-1110c MALI_COMPAT_RT_CLONE=0: CLONE copies go to the driver (default 1 = the layer copies
+                         * the source's real AS bytes with vkCmdCopyBuffer) */
+    int clone_refit;    /* lead-1110c MALI_COMPAT_RT_CLONE_REFIT=0: an in-place UPDATE of a copied-into AS is passed
+                         * through (default 1 = its first UPDATE after a copy becomes a BUILD) */
+};
+static struct RtEnv    g_rt_env;
+static pthread_once_t  g_rt_env_once = PTHREAD_ONCE_INIT;
+#define RT_AS_SCRATCH_SIZE (128 * 1024 * 1024)
+static void rt_env_init(void) {
+    const char *e;
+    e = getenv("MALI_COMPAT_RT_SKIP_TRACES");  g_rt_env.skip_traces  = (e && e[0] == '1') ? 1 : 0;
+    e = getenv("MALI_COMPAT_RT_MAX_STAGES");   g_rt_env.max_stages   = e ? atoi(e) : 0;
+    if (g_rt_env.max_stages < 0) g_rt_env.max_stages = 0;
+    e = getenv("MALI_COMPAT_RT_SYNC_COMPILE"); g_rt_env.sync_compile = (e && e[0] == '1') ? 1 : 0;
+    e = getenv("MALI_COMPAT_RT_OWN_SCRATCH");  g_rt_env.own_scratch  = (e && e[0] == '0') ? 0 : 1;
+    e = getenv("MALI_COMPAT_RT_FORCE_BUILD");  g_rt_env.force_build  = (e && e[0] == '1') ? 1 : 0;
+    e = getenv("MALI_COMPAT_RT_BUILD_LOG");    g_rt_env.build_log    = (e && atoi(e) > 0) ? (uint32_t)atoi(e) : 0u;
+    e = getenv("MALI_COMPAT_TRACE");           g_rt_env.trace        = (e && e[0] == '1') ? 1 : 0;
+    e = getenv("MALI_COMPAT_RT_SIZE_PAD");     g_rt_env.size_pad     = (e && e[0] == '0') ? 0 : 1;
+    e = getenv("MALI_COMPAT_RT_AS_TRUST");     g_rt_env.as_trust     = (e && e[0] == '1') ? 1 : 0;
+    e = getenv("MALI_COMPAT_RT_UPD_SRC");      g_rt_env.upd_src      = (e && (e[0] == '0' || e[0] == '2')) ? e[0] - '0' : 1;
+    e = getenv("MALI_COMPAT_RT_CLONE");        g_rt_env.clone        = (e && e[0] == '0') ? 0 : 1;
+    e = getenv("MALI_COMPAT_RT_CLONE_REFIT");  g_rt_env.clone_refit  = (e && e[0] == '0') ? 0 : 1;
+    e = getenv("MALI_COMPAT_RT_GUARD_ITERS");
+    int gv = e ? atoi(e) : 0;
+    g_rt_guard_max = gv > 0 ? (uint32_t)gv : 4096u;   /* was a racy lazy write in CRTP */
+    if (g_rt_env.skip_traces)
+        LOG("rt_skip: MALI_COMPAT_RT_SKIP_TRACES=1 -> every TraceRays/TraceRaysIndirect is skipped (AS builds kept)");
+    LOG("rt_scratch: layer-owned AS build scratch %s (MALI_COMPAT_RT_OWN_SCRATCH), pool %u MB",
+        g_rt_env.own_scratch ? "ON" : "OFF", (unsigned)(RT_AS_SCRATCH_SIZE >> 20));
+    if (g_rt_env.force_build)
+        LOG("rt_build: MALI_COMPAT_RT_FORCE_BUILD=1 -> every UPDATE build becomes a full BUILD (src cleared)");
+    if (!g_rt_env.size_pad)
+        LOG("rt_build: MALI_COMPAT_RT_SIZE_PAD=0 -> vkGetAccelerationStructureBuildSizesKHR returns the driver's own sizes "
+            "(no 1.5x+2 MiB / 2x+4 MiB inflation, no 64 KB padding)");
+    if (g_rt_env.as_trust)
+        LOG("rt_build: MALI_COMPAT_RT_AS_TRUST=1 -> no AS handle recreation on a type change, no UPDATE->BUILD for "
+            "unbuilt/mutated ASes (UPDATE with a null src still becomes BUILD)");
+    if (g_rt_env.upd_src != 1)
+        LOG("rt_build: MALI_COMPAT_RT_UPD_SRC=%d -> %s", g_rt_env.upd_src, g_rt_env.upd_src == 2
+            ? "an UPDATE from a different source AS becomes a BUILD only when the source's storage is larger"
+            : "an UPDATE from a different source AS is passed through (default 1 turns it into a BUILD)");
+    if (!g_rt_env.clone)
+        LOG("rt_copy: MALI_COMPAT_RT_CLONE=0 -> CLONE copies go to the driver's vkCmdCopyAccelerationStructureKHR "
+            "(it copies the source's whole created size)");
+    if (!g_rt_env.clone_refit)
+        LOG("rt_build: MALI_COMPAT_RT_CLONE_REFIT=0 -> the first in-place UPDATE of a copied-into AS is passed through");
+    if (g_rt_env.build_log)
+        LOG("rt_build: MALI_COMPAT_RT_BUILD_LOG=%u -> per-build lines for the first %u calls and %u calls after the "
+            "first TraceRays", g_rt_env.build_log, g_rt_env.build_log, g_rt_env.build_log);
+}
+static inline const struct RtEnv *rt_env(void) {
+    pthread_once(&g_rt_env_once, rt_env_init);
+    return &g_rt_env;
+}
+/* AS-build call counter + the counter value at the first recorded TraceRays (MALI_COMPAT_RT_BUILD_LOG). */
+static _Atomic uint32_t g_as_build_count = 0;
+static _Atomic uint32_t g_rt_first_trace_call = UINT32_MAX;
+static inline void rt_note_trace(void) {
+    if (atomic_load_explicit(&g_rt_first_trace_call, memory_order_relaxed) != UINT32_MAX) return;
+    uint32_t expect = UINT32_MAX, now = atomic_load(&g_as_build_count);
+    if (atomic_compare_exchange_strong(&g_rt_first_trace_call, &expect, now) && rt_env()->build_log)
+        LOG("rt_build: first TraceRays recorded after %u CmdBuildAS calls", now);
+}
+
 #ifndef COMPAT_TRACE
-#define COMPAT_TRACE(...) LOG(__VA_ARGS__)
+/* 11-10: gated behind MALI_COMPAT_TRACE=1 (ported from Gemini 4 Argon's wt-rtx-emu; there a racy per-site static,
+ * here the once-read g_rt_env). Default off: these lines were logged on every TraceRays call. */
+#define COMPAT_TRACE(...) do { if (__builtin_expect(rt_env()->trace, 0)) LOG(__VA_ARGS__); } while (0)
 #endif
 
 static inline unsigned rt_bucket(uintptr_t h) {
@@ -587,6 +690,298 @@ static void rt_free_stage_record(struct RtStageRecord *s) {
     free(s->spec_data);
 }
 
+/* ── 11-08 megafix: async megakernel compile, stage cap, skip counter ─────── */
+static inline int64_t rt_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static inline bool rt_mega_ready(struct RtPipeline *rp) {
+    return rp && __atomic_load_n(&rp->compute_pipeline, __ATOMIC_ACQUIRE) != VK_NULL_HANDLE;
+}
+static _Atomic uint64_t g_rt_skip_pending = 0;   /* compile still running on the worker */
+static _Atomic uint64_t g_rt_skip_nopipe  = 0;   /* capped (MALI_COMPAT_RT_MAX_STAGES) or compile failed */
+static void rt_count_skip(struct RtPipeline *rp) {
+    int st = __atomic_load_n(&rp->compile_state, __ATOMIC_ACQUIRE);
+    uint64_t pend = (st == 1) ? atomic_fetch_add(&g_rt_skip_pending, 1) + 1 : atomic_load(&g_rt_skip_pending);
+    uint64_t nop  = (st == 1) ? atomic_load(&g_rt_skip_nopipe) : atomic_fetch_add(&g_rt_skip_nopipe, 1) + 1;
+    if (!g_debug) return;
+    static _Atomic int64_t last_ms = 0;
+    int64_t now = rt_now_ms(), prev = atomic_load(&last_ms);
+    if ((pend + nop == 1 || now - prev >= 1000) && atomic_compare_exchange_strong(&last_ms, &prev, now))
+        LOG("rt_skip: t=%lld ms trace dispatch skipped (pipe=%p state=%d) total pending=%llu capped/failed=%llu",
+            (long long)now, (void *)rp, st, (unsigned long long)pend, (unsigned long long)nop);
+}
+/* 11-08 keeper: MALI_COMPAT_RT_SKIP_TRACES=1 = A/B level "AS builds + megakernel compiles as usual, but NO trace
+ * dispatch at all" (isolates the AS build path from the megakernel). Default off. */
+static _Atomic uint64_t g_rt_skip_forced = 0;
+static bool rt_forced_trace_skip(void) {
+    if (!rt_env()->skip_traces) return false;
+    uint64_t n = atomic_fetch_add(&g_rt_skip_forced, 1) + 1;
+    static _Atomic int64_t last_ms = 0;
+    int64_t now = rt_now_ms(), prev = atomic_load(&last_ms);
+    if ((n == 1 || now - prev >= 5000) && atomic_compare_exchange_strong(&last_ms, &prev, now))
+        LOG("rt_skip: t=%lld ms forced skip (MALI_COMPAT_RT_SKIP_TRACES) total=%llu", (long long)now, (unsigned long long)n);
+    return true;
+}
+/* 11-10 keeper (lead-1110, Codex 1110-194217 findings 1+2): an async megakernel compile no longer touches a
+ * DeviceData (g_devices[] entries move on DestroyDevice compaction): the worker uses the device handle and the
+ * driver entry points copied into the job. Every queued job sits on g_rt_jobs until its LAST driver call is done;
+ * compat_DestroyDevice waits there (rt_drain_device_jobs) before it calls down. The app's pipeline layout used by
+ * the compile is pinned (g_rt_layout_pins): vkDestroyPipelineLayout of a pinned layout is deferred (NULL allocator)
+ * and executed by the worker when the job ends, or waits for the job (app allocator: no safe deferral). */
+struct RtCompileJob {
+    VkDevice device;
+    struct RtPipeline *rp;
+    VkComputePipelineCreateInfo cpci;
+    VkPipelineCreateFlags2CreateInfoKHR f2;
+    PFN_vkCreateComputePipelines fpCreateComputePipelines;
+    PFN_vkDestroyPipeline        fpDestroyPipeline;
+    PFN_vkDestroyShaderModule    fpDestroyShaderModule;
+    uint32_t stages, groups;
+    size_t words;
+    int64_t t_req;
+    struct RtCompileJob *next;    /* g_rt_jobs (async jobs only) */
+};
+struct RtLayoutPin {
+    VkDevice device;
+    VkPipelineLayout layout;
+    uint32_t refs;                             /* pending compile jobs using the layout */
+    uint32_t pipe_refs;                        /* 1110b: live RT pipelines whose trace recording uses the layout */
+    PFN_vkDestroyPipelineLayout fp_destroy;    /* != NULL: the app destroyed it, the last ref destroys it */
+    bool has_alloc;                            /* 1110b: app allocator, copied (see compat_RtDestroyPipelineLayout) */
+    VkAllocationCallbacks alloc;
+    struct RtLayoutPin *next;
+};
+static pthread_mutex_t      g_rt_job_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t       g_rt_job_cv   = PTHREAD_COND_INITIALIZER;
+static struct RtCompileJob *g_rt_jobs;
+static struct RtLayoutPin  *g_rt_layout_pins;
+static struct RtLayoutPin **rt_pin_find_locked(VkDevice dev, VkPipelineLayout l) {
+    struct RtLayoutPin **pp = &g_rt_layout_pins;
+    while (*pp && !((*pp)->device == dev && (*pp)->layout == l)) pp = &(*pp)->next;
+    return pp;
+}
+/* Unlinks the pin when no job and no pipeline holds it any more; returns it (caller runs rt_pin_dispose outside the
+ * lock) or NULL. */
+static struct RtLayoutPin *rt_pin_maybe_unlink_locked(struct RtLayoutPin **pp) {
+    struct RtLayoutPin *n = *pp;
+    if (!n || n->refs || n->pipe_refs) return NULL;
+    *pp = n->next;
+    return n;
+}
+/* Destroys the app's layout if the app already asked for it (deferred destroy), then frees the pin. */
+static void rt_pin_dispose(struct RtLayoutPin *n, const char *why) {
+    if (!n) return;
+    if (n->fp_destroy) {
+        LOG("rt_compile: destroying pipeline layout %p deferred by the app's vkDestroyPipelineLayout (%s)",
+            (void *)n->layout, why);
+        n->fp_destroy(n->device, n->layout, n->has_alloc ? &n->alloc : NULL);
+    }
+    free(n);
+}
+/* 1110b keeper (Codex 1110-202009 #3): the trace path records vkCmdPushConstants / descriptor-buffer offsets with the
+ * RT pipeline's creation layout (rp->layout) long after CRTP returned. The app may destroy that layout right after
+ * CRTP (legal), so every non-library RT pipeline now pins its layout for its WHOLE life: a vkDestroyPipelineLayout
+ * of it is deferred until the pipeline object is freed (rt_free_pipeline_obj_fp - normal DestroyPipeline and the
+ * worker's destroyed-while-compiling path) or the device is destroyed (rt_drain_device_jobs). */
+static bool rt_pin_pipeline_layout(VkDevice dev, VkPipelineLayout layout) {
+    if (!layout) return false;
+    pthread_mutex_lock(&g_rt_job_lock);
+    struct RtLayoutPin **pp = rt_pin_find_locked(dev, layout);
+    if (!*pp) {
+        struct RtLayoutPin *n = (struct RtLayoutPin *)calloc(1, sizeof(*n));
+        if (!n) { pthread_mutex_unlock(&g_rt_job_lock); return false; }
+        n->device = dev; n->layout = layout;
+        *pp = n;
+    }
+    (*pp)->pipe_refs++;
+    pthread_mutex_unlock(&g_rt_job_lock);
+    return true;
+}
+static void rt_unpin_pipeline_layout(VkDevice dev, VkPipelineLayout layout) {
+    pthread_mutex_lock(&g_rt_job_lock);
+    struct RtLayoutPin **pp = rt_pin_find_locked(dev, layout);
+    struct RtLayoutPin *gone = NULL;
+    if (*pp && (*pp)->pipe_refs) {
+        (*pp)->pipe_refs--;
+        gone = rt_pin_maybe_unlink_locked(pp);
+    }
+    pthread_cond_broadcast(&g_rt_job_cv);
+    pthread_mutex_unlock(&g_rt_job_lock);
+    rt_pin_dispose(gone, "its RT pipeline was destroyed");
+}
+/* Registers an async job + pins its layout. false = out of memory (caller compiles synchronously). */
+static bool rt_job_register(struct RtCompileJob *j) {
+    pthread_mutex_lock(&g_rt_job_lock);
+    if (j->cpci.layout) {
+        struct RtLayoutPin **pp = rt_pin_find_locked(j->device, j->cpci.layout);
+        if (!*pp) {
+            struct RtLayoutPin *n = (struct RtLayoutPin *)calloc(1, sizeof(*n));
+            if (!n) { pthread_mutex_unlock(&g_rt_job_lock); return false; }
+            n->device = j->device; n->layout = j->cpci.layout;
+            *pp = n;
+        }
+        (*pp)->refs++;
+    }
+    j->next = g_rt_jobs;
+    g_rt_jobs = j;
+    pthread_mutex_unlock(&g_rt_job_lock);
+    return true;
+}
+/* Ends a job: unpins the layout (destroys it if the app already did and no pipeline holds it), THEN removes the job
+ * and wakes waiters. The caller frees j afterwards; nothing of the device may be used after this returns. */
+static void rt_job_end(struct RtCompileJob *j) {
+    struct RtLayoutPin *gone = NULL;
+    pthread_mutex_lock(&g_rt_job_lock);
+    if (j->cpci.layout) {
+        struct RtLayoutPin **pp = rt_pin_find_locked(j->device, j->cpci.layout);
+        if (*pp && (*pp)->refs) {
+            (*pp)->refs--;
+            gone = rt_pin_maybe_unlink_locked(pp);
+        }
+    }
+    pthread_mutex_unlock(&g_rt_job_lock);
+    rt_pin_dispose(gone, "the megakernel compile ended");
+    pthread_mutex_lock(&g_rt_job_lock);
+    for (struct RtCompileJob **pp = &g_rt_jobs; *pp; pp = &(*pp)->next)
+        if (*pp == j) { *pp = j->next; break; }
+    pthread_cond_broadcast(&g_rt_job_cv);
+    pthread_mutex_unlock(&g_rt_job_lock);
+}
+/* compat_DestroyDevice: wait until no async compile of this device is left (the worker's last driver call done), then
+ * drop every layout pin of the device (pipelines the app leaked): deferred layout destroys run now, before the
+ * device goes away, so a pin can never outlive its device. */
+static void rt_drain_device_jobs(VkDevice dev) {
+    pthread_mutex_lock(&g_rt_job_lock);
+    for (;;) {
+        bool busy = false;
+        for (struct RtCompileJob *j = g_rt_jobs; j && !busy; j = j->next) busy = (j->device == dev);
+        if (!busy) break;
+        LOG("rt_compile: vkDestroyDevice %p waits for a running megakernel compile", (void *)dev);
+        pthread_cond_wait(&g_rt_job_cv, &g_rt_job_lock);
+    }
+    struct RtLayoutPin *mine = NULL;
+    for (struct RtLayoutPin **pp = &g_rt_layout_pins; *pp;) {
+        if ((*pp)->device == dev) {
+            struct RtLayoutPin *n = *pp;
+            *pp = n->next;
+            n->next = mine;
+            mine = n;
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+    pthread_cond_broadcast(&g_rt_job_cv);
+    pthread_mutex_unlock(&g_rt_job_lock);
+    while (mine) {
+        struct RtLayoutPin *n = mine;
+        mine = n->next;
+        rt_pin_dispose(n, "vkDestroyDevice");
+    }
+}
+/* 1110b (Codex 1110-202009 #2): no DeviceData* is kept across the wait (g_devices[] entries move when another device
+ * is destroyed meanwhile): the driver entry point is copied first, the device handle is the caller's.
+ * NULL allocator + pinned -> deferred (the last job / the pipeline's destruction destroys it).
+ * App allocator + pinned -> wait for running compile jobs only (bounded); if an RT pipeline still holds the layout
+ * afterwards, the destroy is deferred with a COPY of the app's VkAllocationCallbacks (waiting for the pipeline could
+ * deadlock the app thread). vkd3d-proton passes NULL. */
+static VKAPI_ATTR void VKAPI_CALL
+compat_RtDestroyPipelineLayout(VkDevice device, VkPipelineLayout layout, const VkAllocationCallbacks *pAllocator) {
+    struct DeviceData *d = get_device_data(device);
+    if (!d || !d->fpDestroyPipelineLayout) return;
+    PFN_vkDestroyPipelineLayout fp = d->fpDestroyPipelineLayout;
+    d = NULL;   /* not used past this point */
+    if (layout) {
+        pthread_mutex_lock(&g_rt_job_lock);
+        struct RtLayoutPin *n = *rt_pin_find_locked(device, layout);
+        if (n && !pAllocator) {
+            n->fp_destroy = fp;
+            /* lead-1110c (Codex 1110-212923 :890): read the pin BEFORE unlocking - the worker may free it right after */
+            const bool by_job = n->refs != 0;
+            pthread_mutex_unlock(&g_rt_job_lock);
+            LOG("rt_compile: vkDestroyPipelineLayout %p deferred: %s still uses it", (void *)layout,
+                by_job ? "a megakernel compile" : "an RT pipeline");
+            return;
+        }
+        while ((n = *rt_pin_find_locked(device, layout)) != NULL && n->refs)
+            pthread_cond_wait(&g_rt_job_cv, &g_rt_job_lock);
+        if (n) {   /* only RT pipelines hold it now */
+            n->fp_destroy = fp;
+            n->has_alloc = true;
+            n->alloc = *pAllocator;
+            pthread_mutex_unlock(&g_rt_job_lock);
+            LOG("rt_compile: vkDestroyPipelineLayout %p (app allocator) deferred until its RT pipeline is destroyed",
+                (void *)layout);
+            return;
+        }
+        pthread_mutex_unlock(&g_rt_job_lock);
+    }
+    fp(device, layout, pAllocator);
+}
+static void rt_compile_finish(struct RtCompileJob *j, VkResult r, VkPipeline p, const char *where) {
+    int64_t t1 = rt_now_ms();
+    if (r == VK_SUCCESS && p) {
+        __atomic_store_n(&j->rp->compute_pipeline, p, __ATOMIC_RELEASE);
+        __atomic_store_n(&j->rp->compile_state, 2, __ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&j->rp->compile_state, 3, __ATOMIC_RELEASE);
+        LOG("RT megakernel vkCreateComputePipelines failed (%d) for %u stages / %u groups", r, j->stages, j->groups);
+    }
+    LOG("CRTP %s: fpCreateComputePipelines result=%d pipe=%p (%u stages, %lld ms)", where, r, (void *)p,
+        j->stages, (long long)(t1 - j->t_req));
+    if (g_debug)
+        LOG("rt_compile: done t=%lld ms dt=%lld ms result=%d pipe=%p stages=%u words=%zu (%s, tid %ld)",
+            (long long)t1, (long long)(t1 - j->t_req), r, (void *)j->rp, j->stages, j->words, where,
+            (long)syscall(SYS_gettid));
+}
+static void rt_free_pipeline_obj_fp(VkDevice dev, PFN_vkDestroyPipeline fp_dp, PFN_vkDestroyShaderModule fp_dm,
+                                    struct RtPipeline *victim, const VkAllocationCallbacks *pAllocator);
+static void *rt_compile_worker(void *arg) {
+    struct RtCompileJob *j = (struct RtCompileJob *)arg;
+    if (j->cpci.pNext) j->cpci.pNext = &j->f2;
+    if (g_debug)
+        LOG("rt_compile: worker start t=%lld ms (queued %lld ms) pipe=%p stages=%u words=%zu tid %ld",
+            (long long)rt_now_ms(), (long long)(rt_now_ms() - j->t_req), (void *)j->rp, j->stages, j->words,
+            (long)syscall(SYS_gettid));
+    VkPipeline p = VK_NULL_HANDLE;
+    /* NULL cache + NULL allocator: the app may destroy its cache/allocator while we compile. */
+    VkResult r = j->fpCreateComputePipelines(j->device, VK_NULL_HANDLE, 1, &j->cpci, NULL, &p);
+    rt_compile_finish(j, r, p, "worker");
+    /* 11-08 keeper: DestroyPipeline no longer joins a pending compile (it blocked the app thread for up to the
+     * whole compile, 112 s for the 80-stage W3 kernel). Whoever comes second (worker or destroy) frees the object. */
+    struct RtPipeline *rp = j->rp;
+    if (atomic_fetch_add(&rp->compile_handshake, 1) == 1) {
+        LOG("rt_compile: pipeline %p was destroyed while compiling; worker frees it now", (void *)rp);
+        rt_free_pipeline_obj_fp(j->device, j->fpDestroyPipeline, j->fpDestroyShaderModule, rp, NULL);
+    }
+    rt_job_end(j);   /* last: after this DestroyDevice may proceed */
+    free(j);
+    return NULL;
+}
+
+static void rt_free_pipeline_obj_fp(VkDevice dev, PFN_vkDestroyPipeline fp_dp, PFN_vkDestroyShaderModule fp_dm,
+                                    struct RtPipeline *victim, const VkAllocationCallbacks *pAllocator) {
+    if (victim->compile_null_alloc) pAllocator = NULL;
+    if (victim->compute_pipeline && fp_dp) {
+        fp_dp(dev, victim->compute_pipeline, pAllocator);
+    }
+    if (victim->compute_module && fp_dm) {
+        fp_dm(dev, victim->compute_module, victim->compile_null_alloc ? NULL : pAllocator);
+    }
+    for (uint32_t i = 0; i < victim->stage_count; i++) {
+        rt_free_stage_record(&victim->stages[i]);
+    }
+    if (victim->layout_pinned) rt_unpin_pipeline_layout(victim->device, victim->layout);
+    free(victim->stages);
+    free(victim->groups);
+    free(victim);
+}
+static void rt_free_pipeline_obj(struct DeviceData *d, struct RtPipeline *victim, const VkAllocationCallbacks *pAllocator) {
+    rt_free_pipeline_obj_fp(d ? d->device : VK_NULL_HANDLE, d ? d->fpDestroyPipeline : NULL,
+                            d ? d->fpDestroyShaderModule : NULL, victim, pAllocator);
+}
+
 static bool rt_destroy_pipeline(struct DeviceData *d, VkPipeline handle, const VkAllocationCallbacks *pAllocator) {
     if (!handle) return false;
     unsigned b = rt_bucket((uintptr_t)handle);
@@ -597,18 +992,16 @@ static bool rt_destroy_pipeline(struct DeviceData *d, VkPipeline handle, const V
             struct RtPipeline *victim = *pp;
             *pp = victim->next;
             pthread_mutex_unlock(&g_rt_lock);
-            if (victim->compute_pipeline && d && d->fpDestroyPipeline) {
-                d->fpDestroyPipeline(d->device, victim->compute_pipeline, pAllocator);
+            if (victim->compile_thread_live) {
+                victim->compile_thread_live = false;
+                pthread_detach(victim->compile_thread);
+                if (atomic_fetch_add(&victim->compile_handshake, 1) == 0) {
+                    LOG("rt_compile: DestroyPipeline %p while its megakernel still compiles; not waiting (worker frees it)",
+                        (void *)victim);
+                    return true;
+                }
             }
-            if (victim->compute_module && d && d->fpDestroyShaderModule) {
-                d->fpDestroyShaderModule(d->device, victim->compute_module, pAllocator);
-            }
-            for (uint32_t i = 0; i < victim->stage_count; i++) {
-                rt_free_stage_record(&victim->stages[i]);
-            }
-            free(victim->stages);
-            free(victim->groups);
-            free(victim);
+            rt_free_pipeline_obj(d, victim, pAllocator);
             return true;
         }
         pp = &(*pp)->next;
@@ -995,6 +1388,7 @@ struct RtMegaBuilder {
 
     uint32_t g_rahit_ignored;
     uint32_t g_ray_terminated;
+    uint32_t g_guard_iter;
     uint32_t g_rint_generated_hit;
     uint32_t g_cur_rahit_id;
 
@@ -1400,6 +1794,7 @@ static void rt_mega_init_preamble(struct RtMegaBuilder *mb) {
 
     mb->g_rahit_ignored     = rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
     mb->g_ray_terminated    = rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
+    mb->g_guard_iter        = rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
     mb->g_rint_generated_hit= rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
     mb->g_cur_rahit_id      = rt_emit_global_var(mb, mb->t_ptr_priv_u32, RT_SC_PRIVATE);
 
@@ -3470,6 +3865,7 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
 
     spv_emit_op4(b, RT_OP_FUNCTION, mb->t_void, fn_id, 0u, mb->t_fn_void);
     spv_emit_op1(b, RT_OP_LABEL, lbl_entry);
+    spv_emit_op2(b, RT_OP_STORE, mb->g_guard_iter, mb->c_u32_0);
     spv_emit_op1(b, RT_OP_BRANCH, lbl_loop_hdr);
 
     /* Loop header */
@@ -3479,6 +3875,19 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
 
     /* Loop body: OpRayQueryProceedKHR */
     spv_emit_op1(b, RT_OP_LABEL, lbl_loop_body);
+    (void)rt_env();   /* g_rt_guard_max is set once there */
+    uint32_t c_guard_max = rt_get_const_u32(mb, g_rt_guard_max ? g_rt_guard_max : 4096u);
+    {
+        uint32_t it_old = rt_alloc_id(mb), it_new = rt_alloc_id(mb), it_ok = rt_alloc_id(mb);
+        uint32_t lbl_proceed = rt_alloc_id(mb);
+        spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, it_old, mb->g_guard_iter);
+        spv_emit_op4(b, RT_OP_IADD, mb->t_u32, it_new, it_old, mb->c_u32_1);
+        spv_emit_op2(b, RT_OP_STORE, mb->g_guard_iter, it_new);
+        spv_emit_op4(b, RT_OP_ULESS_THAN_EQUAL, mb->t_bool, it_ok, it_new, c_guard_max);
+        /* over the bound: break to the loop merge (legal unstructured break) */
+        spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, it_ok, lbl_proceed, lbl_loop_exit);
+        spv_emit_op1(b, RT_OP_LABEL, lbl_proceed);
+    }
     uint32_t proceed = rt_alloc_id(mb);
     spv_emit_op3(b, RT_OP_RAY_QUERY_PROCEED_KHR, mb->t_bool, proceed, rq_var);
     spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, proceed, lbl_candidate, lbl_loop_exit);
@@ -3612,10 +4021,37 @@ static void rt_emit_trace_loop_fn(struct RtMegaBuilder *mb,
 
     /* Loop exit: evaluate committed hit vs miss */
     spv_emit_op1(b, RT_OP_LABEL, lbl_loop_exit);
+    uint32_t g_tripped = rt_alloc_id(mb);
+    {
+        uint32_t it_fin = rt_alloc_id(mb);
+        uint32_t lbl_g_do = rt_alloc_id(mb), lbl_g_after = rt_alloc_id(mb);
+        spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, it_fin, mb->g_guard_iter);
+        spv_emit_op4(b, RT_OP_UGREATER_THAN, mb->t_bool, g_tripped, it_fin, c_guard_max);
+        spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_g_after, 0u);
+        spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, g_tripped, lbl_g_do, lbl_g_after);
+        spv_emit_op1(b, RT_OP_LABEL, lbl_g_do);
+        spv_emit_op1(b, RT_OP_RAY_QUERY_TERMINATE_KHR, rq_var);
+        VkDeviceAddress guard_bda = __atomic_load_n(&g_rt_guard_bda, __ATOMIC_ACQUIRE);
+        if (guard_bda) {
+            uint32_t gptr = rt_alloc_id(mb), gres = rt_alloc_id(mb);
+            uint32_t c_gbda  = rt_get_const_u64(mb, (uint64_t)guard_bda);
+            /* Device scope (1) needs VulkanMemoryModelDeviceScope under the Vulkan memory model: use QueueFamily (5) there */
+            uint32_t c_scope = rt_get_const_u32(mb, mb->has_vulkan_memory_model ? 5u : 1u);
+            spv_emit_op3(b, RT_OP_CONVERT_U_TO_PTR, mb->t_ptr_psb_u32, gptr, c_gbda);
+            spv_emit_op5(b, 232u /* OpAtomicIIncrement */, mb->t_u32, gres, gptr, c_scope, mb->c_u32_0);
+        }
+        spv_emit_op1(b, RT_OP_BRANCH, lbl_g_after);
+        spv_emit_op1(b, RT_OP_LABEL, lbl_g_after);
+    }
     uint32_t comm_type = rt_alloc_id(mb);
+    uint32_t has_hit_raw = rt_alloc_id(mb);
+    uint32_t not_tripped = rt_alloc_id(mb);
     uint32_t has_hit   = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_RAY_QUERY_GET_INTERSECTION_TYPE_KHR, mb->t_u32, comm_type, rq_var, mb->c_u32_1);
-    spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_hit, comm_type, mb->c_u32_0);
+    spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, has_hit_raw, comm_type, mb->c_u32_0);
+    spv_emit_op3(b, RT_OP_LOGICAL_NOT, mb->t_bool, not_tripped, g_tripped);
+    /* a cut ray is a miss, whatever it had committed so far */
+    spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, has_hit, has_hit_raw, not_tripped);
 
     uint32_t lbl_hit            = rt_alloc_id(mb);
     uint32_t lbl_miss           = rt_alloc_id(mb);
@@ -3980,9 +4416,14 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     uint32_t final_run_rgen = rt_alloc_id(mb);
     spv_emit_op4(b, RT_OP_LOGICAL_AND, mb->t_bool, final_run_rgen, is_safe_rgen_bda, is_rgen_magic_ok);
 
+    /* 11-08 megafix: the inner selection needs its OWN merge block. Reusing lbl_exit (already the merge of the
+     * launch-bounds selection) is invalid structured control flow (spirv-val: "Block is already a merge block for
+     * another header", every megakernel dump since 11-07); a structurizer may then run raygen for out-of-bounds
+     * threads (LocalSize 8x4: 3 of 4 rows are out of bounds for W3's 131072x1 / 32x1 launches). */
     uint32_t lbl_do_rgen = rt_alloc_id(mb);
-    spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_exit, 0u);
-    spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, final_run_rgen, lbl_do_rgen, lbl_exit);
+    uint32_t lbl_rgen_merge = rt_alloc_id(mb);
+    spv_emit_op2(b, RT_OP_SELECTION_MERGE, lbl_rgen_merge, 0u);
+    spv_emit_op3(b, RT_OP_BRANCH_CONDITIONAL, final_run_rgen, lbl_do_rgen, lbl_rgen_merge);
 
     spv_emit_op1(b, RT_OP_LABEL, lbl_do_rgen);
     uint32_t rgen_srb = rt_alloc_id(mb);
@@ -3993,6 +4434,9 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     rt_emit_psb_load_u32(mb, b, rgen_id, cur_rgen_base, 8u);
     rt_emit_stage_switch_inline(mb, b, rgen_id, stages, parses, stage_count,
                                 VK_SHADER_STAGE_RAYGEN_BIT_KHR, 0);
+    spv_emit_op1(b, RT_OP_BRANCH, lbl_rgen_merge);
+
+    spv_emit_op1(b, RT_OP_LABEL, lbl_rgen_merge);
     spv_emit_op1(b, RT_OP_BRANCH, lbl_exit);
 
     spv_emit_op1(b, RT_OP_LABEL, lbl_exit);
@@ -4404,6 +4848,18 @@ compat_CreateRayTracingPipelinesKHR(
         rp->is_library = is_library;
         rp->use_descriptor_buffer = use_desc_buf;
         rp->layout = ci->layout;
+        if (!is_library && ci->layout) {
+            /* lead-1110c (Codex 1110-212923 :4837): no pin = no pipeline (an unpinned one could later record with a
+             * destroyed layout). Nothing else is allocated for rp yet. */
+            rp->layout_pinned = rt_pin_pipeline_layout(device, ci->layout);
+            if (!rp->layout_pinned) {
+                LOG("CRTP [%u/%u]: out of host memory pinning layout %p -> VK_ERROR_OUT_OF_HOST_MEMORY",
+                    i + 1, createInfoCount, (void *)ci->layout);
+                free(rp);
+                final_res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                continue;
+            }
+        }
         rp->max_recursion_depth = ci->maxPipelineRayRecursionDepth ? ci->maxPipelineRayRecursionDepth : 1;
 
         if (total_stages > 0) {
@@ -4471,9 +4927,24 @@ compat_CreateRayTracingPipelinesKHR(
         /* 4. If executable pipeline (!is_library), build and compile the GLCompute megakernel */
         COMPAT_INFO("CRTP [%u/%u]: building megakernel (is_lib=%d, stage_ok=%d, stages=%u)...",
                     i + 1, createInfoCount, (int)is_library, (int)stage_ok, rp->stage_count);
-        if (!is_library && stage_ok && rp->stage_count > 0) {
+        const int rt_max_stages = rt_env()->max_stages;   /* also sets g_rt_guard_max (once) */
+        if (!is_library && stage_ok && rt_max_stages > 0 && rp->stage_count > (uint32_t)rt_max_stages) {
+            /* A/B lever: no megakernel for this pipeline; its trace dispatches are skipped and counted. */
+            rp->compile_state = 4;
+            COMPAT_INFO("CRTP [%u/%u]: %u stages > MALI_COMPAT_RT_MAX_STAGES=%d -> megakernel NOT built, traces skipped",
+                        i + 1, createInfoCount, rp->stage_count, rt_max_stages);
+        } else if (!is_library && stage_ok && rp->stage_count > 0) {
             size_t mega_words = 0;
+            int64_t t_build0 = rt_now_ms();
+            if (!__atomic_load_n(&g_rt_guard_bda, __ATOMIC_ACQUIRE) && rt_ensure_ring_buffer(d)) {
+                VkDeviceAddress zero = 0ULL;   /* first device wins (was a racy plain write) */
+                __atomic_compare_exchange_n(&g_rt_guard_bda, &zero, d->rt_ring_bda + RT_GUARD_SLOT_OFF, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+            }
             uint32_t *mega_spv = rt_build_megakernel_spirv(rp->stages, rp->stage_count, &mega_words);
+            if (g_debug)
+                LOG("rt_compile: SPIR-V built t=%lld ms dt=%lld ms stages=%u words=%zu",
+                    (long long)rt_now_ms(), (long long)(rt_now_ms() - t_build0), rp->stage_count, mega_words);
             COMPAT_INFO("CRTP [%u/%u]: megakernel SPIR-V built (%zu words, %p)",
                         i + 1, createInfoCount, mega_words, (void *)mega_spv);
             if (mega_spv && mega_words > 5) {
@@ -4520,16 +4991,49 @@ compat_CreateRayTracingPipelinesKHR(
                         },
                         .layout = rp->layout,
                     };
-                    COMPAT_INFO("CRTP [%u/%u]: calling fpCreateComputePipelines...", i + 1, createInfoCount);
-                    VkResult cp_res = d->fpCreateComputePipelines(device, pipelineCache, 1, &cpci,
-                                                                  pAllocator, &rp->compute_pipeline);
-                    COMPAT_INFO("CRTP [%u/%u]: fpCreateComputePipelines result=%d pipe=%p", i + 1, createInfoCount, cp_res, (void *)rp->compute_pipeline);
-                    if (cp_res != VK_SUCCESS) {
-                        COMPAT_INFO("RT megakernel vkCreateComputePipelines failed (%d) for %u stages / %u groups",
-                                    cp_res, rp->stage_count, rp->group_count);
-                    } else {
-                        COMPAT_TRACE("RT megakernel compiled: %u stages, %u groups (%zu SPIR-V words)",
-                                     rp->stage_count, rp->group_count, mega_words);
+                    struct RtCompileJob *job = (struct RtCompileJob *)calloc(1, sizeof(*job));
+                    const int sync_compile = rt_env()->sync_compile;
+                    if (job) {
+                        job->device = device; job->rp = rp; job->cpci = cpci; job->f2 = comp_flags2;
+                        job->fpCreateComputePipelines = d->fpCreateComputePipelines;
+                        job->fpDestroyPipeline = d->fpDestroyPipeline;
+                        job->fpDestroyShaderModule = d->fpDestroyShaderModule;
+                        job->stages = rp->stage_count; job->groups = rp->group_count; job->words = mega_words;
+                        job->t_req = rt_now_ms();
+                    }
+                    if (g_debug)
+                        LOG("rt_compile: request t=%lld ms pipe=%p stages=%u groups=%u words=%zu mode=%s",
+                            (long long)rt_now_ms(), (void *)rp, rp->stage_count, rp->group_count, mega_words,
+                            (sync_compile || !job) ? "sync" : "async");
+                    bool queued = false;
+                    if (job && !sync_compile && rt_job_register(job)) {
+                        rp->compile_state = 1;
+                        rp->compile_null_alloc = true;
+                        /* the job is fully initialised before the thread starts; the worker owns it */
+                        if (pthread_create(&rp->compile_thread, NULL, rt_compile_worker, job) == 0) {
+                            rp->compile_thread_live = true;
+                            queued = true;
+                            COMPAT_INFO("CRTP [%u/%u]: megakernel compile queued on a worker (%u stages)",
+                                        i + 1, createInfoCount, rp->stage_count);
+                        } else {
+                            rt_job_end(job);   /* unpin + unlist; the layout cannot be app-destroyed during CRTP */
+                            rp->compile_state = 0;
+                            rp->compile_null_alloc = false;
+                        }
+                    }
+                    if (!queued) {
+                        COMPAT_INFO("CRTP [%u/%u]: calling fpCreateComputePipelines...", i + 1, createInfoCount);
+                        VkPipeline cp = VK_NULL_HANDLE;
+                        VkResult cp_res = d->fpCreateComputePipelines(device, pipelineCache, 1, &cpci,
+                                                                      pAllocator, &cp);
+                        COMPAT_INFO("CRTP [%u/%u]: fpCreateComputePipelines result=%d pipe=%p", i + 1, createInfoCount, cp_res, (void *)cp);
+                        if (job) {
+                            rt_compile_finish(job, cp_res, cp, "sync");
+                            free(job);
+                        } else if (cp_res == VK_SUCCESS) {
+                            rp->compute_pipeline = cp;
+                            rp->compile_state = 2;
+                        }
                     }
                 } else {
                     COMPAT_INFO("RT megakernel vkCreateShaderModule failed (%d)", sm_res);
@@ -4724,8 +5228,9 @@ static VkDeviceAddress rt_ring_alloc(struct DeviceData *d,
     (void)align;
     uint32_t slots_needed = (byte_size + RT_RING_SLOT_SIZE - 1u) / RT_RING_SLOT_SIZE;
     if (slots_needed == 0u) slots_needed = 1u;
-    if (slots_needed > RT_RING_NUM_SLOTS) return 0ULL;
-    uint32_t max_first_slot = RT_RING_NUM_SLOTS - slots_needed;
+    /* last slot = guard counter (RT_GUARD_SLOT_OFF), never handed out */
+    if (slots_needed > RT_RING_NUM_SLOTS - 1u) return 0ULL;
+    uint32_t max_first_slot = RT_RING_NUM_SLOTS - 1u - slots_needed;
     uint32_t raw_slot = atomic_fetch_add(&d->rt_ring_offset, slots_needed);
     uint32_t slot = raw_slot % (max_first_slot + 1u);
     uint32_t off = slot * RT_RING_SLOT_SIZE;
@@ -4736,6 +5241,21 @@ static VkDeviceAddress rt_ring_alloc(struct DeviceData *d,
         *out_offset = off;
     }
     return d->rt_ring_bda + (VkDeviceAddress)off;
+}
+
+static void rt_guard_log(struct DeviceData *d) {
+    static _Atomic int64_t last_ns = 0;
+    static uint32_t last_val = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    int64_t prev = atomic_load(&last_ns);
+    if (now - prev < 1000000000LL) return;
+    if (!atomic_compare_exchange_strong(&last_ns, &prev, now)) return;
+    uint32_t v = *(volatile uint32_t *)((uint8_t *)d->rt_ring_ptr + RT_GUARD_SLOT_OFF);
+    COMPAT_INFO("rt_guard: %u rays cut as miss after %u ray-query iterations (+%u in the last 1 s)",
+                v, g_rt_guard_max, v - last_val);
+    last_val = v;
 }
 
 static VkDeviceAddress rt_get_zero_bda(struct DeviceData *d) {
@@ -4827,9 +5347,28 @@ static VkDeviceAddress rt_upload_user_push_constants(struct DeviceData *d,
     if (!cs || cs->user_pc_dirty_size == 0) {
         return rt_get_zero_bda(d);
     }
+    if (g_debug && d && d->rt_ring_ptr) rt_guard_log(d);
     void *ptr = NULL;
-    VkDeviceAddress bda = rt_ring_alloc(d, 256, 256, &ptr, NULL);
-    if (bda && ptr) {
+    uint32_t off = 0;
+    VkDeviceAddress bda = rt_ring_alloc(d, 256, 256, &ptr, &off);
+    if (bda && d->fpCmdUpdateBuffer && d->rt_ring_buf && d->fpCmdPipelineBarrier &&
+        !getenv("MALI_COMPAT_RT_PARAM_HOSTWRITE")) {
+        /* param-fix 11-08: the per-dispatch params (vkd3d root constants + root descriptor VAs, incl. the
+         * TLAS VA) are written by the GPU in command-stream order right before this dispatch, instead of a
+         * host memcpy at record time into a slot that the ring hands out again later (07cd745).  The data
+         * now travels inside the command buffer: a resubmitted / late-submitted / still-pending command
+         * buffer always reads its own params, no matter how often the ring wrapped. */
+        d->fpCmdUpdateBuffer(cmd, d->rt_ring_buf, (VkDeviceSize)off, 256, cs->user_push_constants);
+        VkMemoryBarrier ub = {
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT,
+        };
+        d->fpCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                0, 1, &ub, 0, NULL, 0, NULL);
+        return bda;
+    }
+    if (bda && ptr) {   /* fallback / A-B lever MALI_COMPAT_RT_PARAM_HOSTWRITE=1: old host write */
         memcpy(ptr, cs->user_push_constants, 256);
         return bda;
     }
@@ -4888,11 +5427,14 @@ compat_CmdTraceRaysKHR(
     rt_patch_fex_thunks();
     COMPAT_TRACE("compat_CmdTraceRaysKHR: cmd=%p width=%u height=%u depth=%u",
                  (void *)commandBuffer, width, height, depth);
+    rt_note_trace();   /* MALI_COMPAT_RT_BUILD_LOG: marks the first recorded TraceRays */
     if (width == 0 || height == 0 || depth == 0) return;
     struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
     if (!d) return;
     struct RtCmdState *cs = rt_get_cmd_state(commandBuffer, false);
-    if (!cs || !cs->bound_rt_pipeline || !cs->bound_rt_pipeline->compute_pipeline) return;
+    if (!cs || !cs->bound_rt_pipeline) return;
+    if (rt_forced_trace_skip()) return;
+    if (!rt_mega_ready(cs->bound_rt_pipeline)) { rt_count_skip(cs->bound_rt_pipeline); return; }
     struct RtPipeline *rp = cs->bound_rt_pipeline;
 
     struct RtDispatchPushConstants pc;
@@ -5067,11 +5609,14 @@ static void rt_dispatch_indirect_common(
     VkDeviceAddress                             indirectDeviceAddress,
     uint32_t                                    indirect_mode)
 {
+    rt_note_trace();
     if (!indirectDeviceAddress || rt_is_invalid_gpu_bda(indirectDeviceAddress)) return;
     struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
     if (!d) return;
     struct RtCmdState *cs = rt_get_cmd_state(commandBuffer, false);
-    if (!cs || !cs->bound_rt_pipeline || !cs->bound_rt_pipeline->compute_pipeline) return;
+    if (!cs || !cs->bound_rt_pipeline) return;
+    if (rt_forced_trace_skip()) return;
+    if (!rt_mega_ready(cs->bound_rt_pipeline)) { rt_count_skip(cs->bound_rt_pipeline); return; }
     struct RtPipeline *rp = cs->bound_rt_pipeline;
 
     struct RtDispatchPushConstants pc;
@@ -5483,7 +6028,7 @@ static bool rt_cmd_bind_pipeline(VkCommandBuffer commandBuffer,
         struct RtCmdState *cs = rt_get_cmd_state(commandBuffer, true);
         struct RtPipeline *rp = rt_lookup_pipeline(pipeline);
         if (cs) cs->bound_rt_pipeline = rp;
-        if (rp && rp->compute_pipeline) {
+        if (rp && rt_mega_ready(rp)) {
             struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
             if (d && d->fpCmdBindPipeline) {
                 d->fpCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rp->compute_pipeline);
@@ -5696,8 +6241,93 @@ struct RtAsTrack {
     VkDeviceSize               size;
     VkAccelerationStructureTypeKHR created_type;
     VkAccelerationStructureTypeKHR built_type;
+    VkDeviceSize               buf_rest;      /* 1110b, MALI_COMPAT_DEBUG only: buffer memreq size - offset (0 = unknown) */
+    /* 1110b: driver handles replaced on a type change (layer-created ones, NULL allocator). Destroying one at
+     * replacement time is not safe (a submitted command may still use it); the app's vkDestroyAccelerationStructure
+     * guarantees every command using this AS completed, so they are destroyed there. */
+    VkAccelerationStructureKHR *retired;
+    uint32_t                   n_retired, cap_retired;
+    /* lead-1110c */
+    VkDeviceSize               as_size;       /* driver's accelerationStructureSize of the last BUILD into it (or the
+                                               * source's after a copy); 0 = unknown -> a CLONE from it goes to the driver */
+    VkAccelerationStructureTypeKHR active_type; /* creation type of active_handle (GENERIC or explicit) */
+    bool                       xfer_ok;       /* its VkBuffer was created through compat_CreateBuffer with TRANSFER_SRC+DST */
+    bool                       refit_ready;   /* false after a copy into it until a BUILD (MALI_COMPAT_RT_CLONE_REFIT) */
     struct RtAsTrack          *next;
 };
+
+/* lead-1110c: VkBuffers created through compat_CreateBuffer with ACCELERATION_STRUCTURE_STORAGE usage, to which the
+ * layer added TRANSFER_SRC|TRANSFER_DST (needed for the layer's vkCmdCopyBuffer CLONE). Open-addressing set,
+ * removed in compat_RtDestroyBuffer. An AS track records at CreateAS whether its buffer is in here (xfer_ok). */
+static pthread_mutex_t g_rt_xbuf_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t       *g_rt_xbuf;
+static size_t          g_rt_xbuf_cap, g_rt_xbuf_n;
+static inline size_t rt_xbuf_slot(uint64_t k, size_t cap) {
+    k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33;
+    return (size_t)k & (cap - 1);
+}
+static void rt_xfer_buf_add(VkBuffer b) {
+    uint64_t k = (uint64_t)(uintptr_t)b;
+    if (!k) return;
+    pthread_mutex_lock(&g_rt_xbuf_lock);
+    if ((g_rt_xbuf_n + 1) * 2 > g_rt_xbuf_cap) {
+        size_t nc = g_rt_xbuf_cap ? g_rt_xbuf_cap * 2 : 1024;
+        uint64_t *nt = (uint64_t *)calloc(nc, sizeof(*nt));
+        if (!nt) {   /* not recorded: a CLONE through this buffer falls back to the driver (reason=usage) */
+            pthread_mutex_unlock(&g_rt_xbuf_lock);
+            return;
+        }
+        for (size_t i = 0; i < g_rt_xbuf_cap; i++) {
+            if (!g_rt_xbuf[i]) continue;
+            size_t j = rt_xbuf_slot(g_rt_xbuf[i], nc);
+            while (nt[j]) j = (j + 1) & (nc - 1);
+            nt[j] = g_rt_xbuf[i];
+        }
+        free(g_rt_xbuf);
+        g_rt_xbuf = nt;
+        g_rt_xbuf_cap = nc;
+    }
+    size_t i = rt_xbuf_slot(k, g_rt_xbuf_cap);
+    while (g_rt_xbuf[i] && g_rt_xbuf[i] != k) i = (i + 1) & (g_rt_xbuf_cap - 1);
+    if (!g_rt_xbuf[i]) { g_rt_xbuf[i] = k; g_rt_xbuf_n++; }
+    pthread_mutex_unlock(&g_rt_xbuf_lock);
+}
+static bool rt_xfer_buf_has(VkBuffer b) {
+    uint64_t k = (uint64_t)(uintptr_t)b;
+    bool found = false;
+    if (!k) return false;
+    pthread_mutex_lock(&g_rt_xbuf_lock);
+    if (g_rt_xbuf_cap) {
+        size_t i = rt_xbuf_slot(k, g_rt_xbuf_cap);
+        while (g_rt_xbuf[i] && g_rt_xbuf[i] != k) i = (i + 1) & (g_rt_xbuf_cap - 1);
+        found = g_rt_xbuf[i] == k;
+    }
+    pthread_mutex_unlock(&g_rt_xbuf_lock);
+    return found;
+}
+static void rt_xfer_buf_remove(VkBuffer b) {
+    uint64_t k = (uint64_t)(uintptr_t)b;
+    if (!k) return;
+    pthread_mutex_lock(&g_rt_xbuf_lock);
+    if (g_rt_xbuf_cap) {
+        const size_t mask = g_rt_xbuf_cap - 1;
+        size_t i = rt_xbuf_slot(k, g_rt_xbuf_cap);
+        while (g_rt_xbuf[i] && g_rt_xbuf[i] != k) i = (i + 1) & mask;
+        if (g_rt_xbuf[i] == k) {   /* backward-shift deletion keeps every probe chain intact */
+            size_t j = i;
+            for (;;) {
+                j = (j + 1) & mask;
+                if (!g_rt_xbuf[j]) break;
+                size_t h = rt_xbuf_slot(g_rt_xbuf[j], g_rt_xbuf_cap);
+                bool movable = (j > i) ? (h <= i || h > j) : (h <= i && h > j);
+                if (movable) { g_rt_xbuf[i] = g_rt_xbuf[j]; i = j; }
+            }
+            g_rt_xbuf[i] = 0;
+            g_rt_xbuf_n--;
+        }
+    }
+    pthread_mutex_unlock(&g_rt_xbuf_lock);
+}
 
 #define RT_AS_TYPE_UNBUILT ((VkAccelerationStructureTypeKHR)0x7fffffff)
 #define RT_AS_BUCKETS 1024
@@ -5749,6 +6379,14 @@ compat_CreateAccelerationStructureKHR(
                 track->created_type = pCreateInfo->type;
             }
             track->built_type    = RT_AS_TYPE_UNBUILT; /* unbuilt */
+            track->active_type   = track->created_type;
+            track->refit_ready   = true;
+            track->xfer_ok       = rt_xfer_buf_has(track->buffer);
+            if (g_debug && pCreateInfo && pCreateInfo->buffer && d->fpGetBufferMemoryRequirements) {
+                VkMemoryRequirements mr = {0};
+                d->fpGetBufferMemoryRequirements(device, pCreateInfo->buffer, &mr);
+                track->buf_rest = mr.size > pCreateInfo->offset ? mr.size - pCreateInfo->offset : 0;
+            }
 
             pthread_mutex_lock(&g_rt_as_lock);
             unsigned b = rt_as_hash((uint64_t)(uintptr_t)track->orig_handle);
@@ -5766,6 +6404,22 @@ compat_CreateAccelerationStructureKHR(
     return res;
 }
 
+/* 1110b: destroys the track's driver handles: the active one, the app's original (if a type change replaced it) and
+ * every intermediate retired one. Layer-created handles were created with a NULL allocator. */
+static void rt_as_destroy_track(struct DeviceData *d, VkDevice device, struct RtAsTrack *victim,
+                                const VkAllocationCallbacks *pAllocator) {
+    if (d->fpDestroyAccelerationStructureKHR) {
+        bool replaced = victim->active_handle != victim->orig_handle;
+        d->fpDestroyAccelerationStructureKHR(device, victim->active_handle, replaced ? NULL : pAllocator);
+        if (replaced && victim->orig_handle)
+            d->fpDestroyAccelerationStructureKHR(device, victim->orig_handle, pAllocator);
+        for (uint32_t i = 0; i < victim->n_retired; i++)
+            d->fpDestroyAccelerationStructureKHR(device, victim->retired[i], NULL);
+    }
+    free(victim->retired);
+    free(victim);
+}
+
 static VKAPI_ATTR void VKAPI_CALL
 compat_DestroyAccelerationStructureKHR(
     VkDevice                                    device,
@@ -5775,50 +6429,27 @@ compat_DestroyAccelerationStructureKHR(
     struct DeviceData *d = get_device_data(device);
     if (!d || !accelerationStructure) return;
 
-    VkAccelerationStructureKHR real_handle = accelerationStructure;
     pthread_mutex_lock(&g_rt_as_lock);
     unsigned b = rt_as_hash((uint64_t)(uintptr_t)accelerationStructure);
-    struct RtAsTrack **pp = &g_rt_as_tracks[b];
-    while (*pp) {
-        if ((*pp)->orig_handle == accelerationStructure || (*pp)->active_handle == accelerationStructure) {
-            struct RtAsTrack *victim = *pp;
-            *pp = victim->next;
-            real_handle = victim->active_handle;
-            pthread_mutex_unlock(&g_rt_as_lock);
-            if (d->fpDestroyAccelerationStructureKHR) {
-                d->fpDestroyAccelerationStructureKHR(device, real_handle, pAllocator);
-            }
-            free(victim);
-            return;
-        }
-        pp = &(*pp)->next;
-    }
-    for (unsigned i = 0; i < RT_AS_BUCKETS; i++) {
-        if (i == b) continue;
-        pp = &g_rt_as_tracks[i];
-        while (*pp) {
+    for (unsigned k = 0; k <= RT_AS_BUCKETS; k++) {
+        unsigned bi = k == 0 ? b : k - 1;      /* own bucket first, then all others */
+        if (k > 0 && bi == b) continue;
+        for (struct RtAsTrack **pp = &g_rt_as_tracks[bi]; *pp; pp = &(*pp)->next) {
             if ((*pp)->orig_handle == accelerationStructure || (*pp)->active_handle == accelerationStructure) {
                 struct RtAsTrack *victim = *pp;
                 *pp = victim->next;
-                real_handle = victim->active_handle;
                 pthread_mutex_unlock(&g_rt_as_lock);
-                if (d->fpDestroyAccelerationStructureKHR) {
-                    d->fpDestroyAccelerationStructureKHR(device, real_handle, pAllocator);
-                }
-                free(victim);
+                rt_as_destroy_track(d, device, victim, pAllocator);
                 return;
             }
-            pp = &(*pp)->next;
         }
     }
     pthread_mutex_unlock(&g_rt_as_lock);
 
     if (d->fpDestroyAccelerationStructureKHR) {
-        d->fpDestroyAccelerationStructureKHR(device, real_handle, pAllocator);
+        d->fpDestroyAccelerationStructureKHR(device, accelerationStructure, pAllocator);
     }
 }
-
-#define RT_AS_SCRATCH_SIZE (128 * 1024 * 1024)
 
 static bool rt_ensure_as_scratch_buffer(struct DeviceData *d) {
     if (!d) return false;
@@ -5906,6 +6537,387 @@ static bool rt_ensure_as_scratch_buffer(struct DeviceData *d) {
     return true;
 }
 
+/* 11-08 keeper: AS build scratch.
+ * Data: move-fix run (7c00bbe9): 989 identical GPU WRITE faults (0x3c3) at 0x5dd2e01000 = 4 KB past the end of the
+ * app's 32 MB+4 KB scratch heap [0x5dd0e00000, 0x5dd2e01000) (maps/m_hang.txt), Gemini's Flaw F: 137 KB past an
+ * 8 MB heap during 54 in-place BLAS updates. e46d170 then replaced every scratch below 256 GB by FIXED 2 MB slices
+ * although each build needs ~4.6 MB (the inflated size) -> builds of one call overlap and run concurrently, the BVH
+ * builder's atomics/counters corrupt each other (megafix L1: 1149 WRITE/ATOMIC faults spread over 0x39d..0x3ac).
+ * Now: every build gets its own slice of the layer's 128 MB scratch, sized from the DRIVER's real size query for this
+ * build (not our inflated hook) plus max(need, 1 MB) headroom, 64 KB aligned, non-overlapping inside one call.
+ * Reuse across calls is ordered by the full pre-build barrier (single queue: MTK m_num_queues=1).
+ * Lever MALI_COMPAT_RT_OWN_SCRATCH=0: keep the app scratch (only 0/invalid scratch is still redirected).
+ * MALI_COMPAT_DEBUG: rt_scratch: summary line (<= 1/s) incl. "app region short" = builds whose app scratch range
+ * [scratch, scratch+need) starts in mapped memory but ends in unmapped memory (decisive for the overrun theory). */
+/* 11-10 keeper (lead-1110, Codex 1110-194217 finding 3): pool exhaustion no longer forwards a scratch that was judged
+ * 0/invalid. When the next build's slice does not fit the rest of the pool, the builds planned so far go out as
+ * their own driver call (pre/post barrier each) and the pool restarts at 0 for the rest ("nofit" = such splits).
+ * A build that ALONE does not fit (even without headroom) keeps a valid app scratch ("big-app"), and is DROPPED when
+ * the app scratch is 0/invalid ("dropped", logged <= 1/s): no 0/invalid scratch address reaches the driver.
+ * Per build the plan also carries the driver's real AS size (same query) for the dst-short check and the
+ * MALI_COMPAT_RT_BUILD_LOG lines. RT_AS_SCRATCH_POOL_TEST: test-only smaller pool (host split test). */
+#ifndef RT_AS_SCRATCH_POOL_TEST
+#define RT_AS_SCRATCH_POOL ((VkDeviceSize)RT_AS_SCRATCH_SIZE)
+#else
+#define RT_AS_SCRATCH_POOL ((VkDeviceSize)(RT_AS_SCRATCH_POOL_TEST))
+#endif
+struct RtBuildPlan {
+    VkDeviceSize storage;      /* dst RtAsTrack.size (what the app created the AS with), 0 = untracked */
+    VkDeviceSize drv_as;       /* driver's real accelerationStructureSize for this build, 0 = not queried */
+    VkDeviceSize drv_scratch;  /* driver's real build/update scratch size, 0 = not queried */
+    uint32_t     batch;        /* driver call this build goes out in */
+    bool         drop;
+    VkAccelerationStructureKHR src_drv;   /* 1110b: driver handle of the APP's src (kept if a lever clears src) */
+    VkDeviceSize src_storage;  /* 1110b: src RtAsTrack.size, 0 = no src / untracked */
+    bool         othersrc_bigger;   /* 1110b: app UPDATE from another AS whose storage > dst storage */
+    bool         othersrc_forced;   /* 1110b: ... turned into BUILD by MALI_COMPAT_RT_UPD_SRC */
+    bool         need_pool;    /* lead-1110c: the app's UPDATE became a BUILD in the layer: its app scratch was sized for
+                                * the UPDATE, so the pool slice (BUILD-sized) is used even with MALI_COMPAT_RT_OWN_SCRATCH=0 */
+};
+static _Atomic uint64_t g_rt_scr_builds = 0, g_rt_scr_own = 0, g_rt_scr_nofit = 0, g_rt_scr_short = 0,
+                        g_rt_scr_blind = 0, g_rt_scr_maxcall = 0, g_rt_scr_dropped = 0, g_rt_scr_bigapp = 0,
+                        g_rt_scr_dstshort = 0;
+/* 1110b: UPDATE builds the LAYER turned into BUILD, by reason; CmdBuildAS calls passed through unplanned because a
+ * host allocation failed. lead-1110c: g_rt_as_leaked now counts type-change recreations SKIPPED because the retire list
+ * could not grow (Codex 1110-212923 :6773; nothing leaks any more), printed as retire-skip=; clone = first in-place
+ * UPDATE after a copy (MALI_COMPAT_RT_CLONE_REFIT), badgeom = an UPDATE whose geometry the sanitiser zeroes. */
+static _Atomic uint64_t g_rt_fb_unbuilt = 0, g_rt_fb_mutated = 0, g_rt_fb_nosrc = 0, g_rt_fb_lever = 0,
+                        g_rt_as_leaked = 0, g_rt_build_oom = 0, g_rt_fb_clone = 0, g_rt_fb_badgeom = 0;
+/* 1110b follow-up: app UPDATEs with src == dst (in place) / src != dst, and those of the latter whose source's created
+ * storage is larger than the destination's; othersrc = such UPDATEs turned into BUILD by MALI_COMPAT_RT_UPD_SRC. */
+static _Atomic uint64_t g_rt_upd_inplace = 0, g_rt_upd_othersrc = 0, g_rt_upd_bigger = 0, g_rt_fb_othersrc = 0;
+/* returns the number of driver calls (batches) the builds were split into */
+static uint32_t rt_assign_as_scratch(struct DeviceData *d, uint32_t count,
+                                     VkAccelerationStructureBuildGeometryInfoKHR *infos,
+                                     const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+                                     const VkAccelerationStructureBuildRangeInfoKHR * const *ppBuildRangeInfos,
+                                     VkDeviceAddress own_bda, struct RtBuildPlan *plan, bool want_sizes) {
+    const int own = rt_env()->own_scratch;
+    const VkDeviceSize align = 65536;
+    const VkDeviceSize pool_end = RT_AS_SCRATCH_POOL - 65536; /* last 64 KB stay a guard */
+    VkDeviceSize cursor = 0, max_cursor = 0;
+    uint32_t batch = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        VkDeviceAddress app = infos[i].scratchData.deviceAddress;
+        bool bad_app = (app == 0ULL) || rt_is_invalid_gpu_bda(app);
+        VkDeviceSize need = 0;
+        plan[i].drv_as = 0; plan[i].drv_scratch = 0; plan[i].drop = false;
+        /* lead-1110c: always queried for a BUILD (the track records the driver's AS size for the layer's CLONE) */
+        if (d->fpGetAccelerationStructureBuildSizesKHR &&
+            (own || bad_app || g_debug || want_sizes || plan[i].need_pool ||
+             infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)) {
+            uint32_t stack_max[32];
+            uint32_t *maxp = stack_max;
+            uint32_t gc = infos[i].geometryCount;
+            if (gc > 32) maxp = (uint32_t *)calloc(gc, sizeof(uint32_t));
+            if (maxp) {
+                for (uint32_t g = 0; g < gc; g++)
+                    maxp[g] = (ppBuildRangeInfos && ppBuildRangeInfos[i]) ? ppBuildRangeInfos[i][g].primitiveCount : 0;
+                VkAccelerationStructureBuildGeometryInfoKHR q = infos[i];
+                q.pGeometries = pInfos[i].pGeometries;
+                q.ppGeometries = pInfos[i].ppGeometries;
+                VkAccelerationStructureBuildSizesInfoKHR sz = {
+                    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+                d->fpGetAccelerationStructureBuildSizesKHR(d->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                                           &q, maxp, &sz);
+                need = (infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
+                           ? sz.updateScratchSize : sz.buildScratchSize;
+                plan[i].drv_as = sz.accelerationStructureSize;
+                plan[i].drv_scratch = need;
+                if (maxp != stack_max) free(maxp);
+            }
+        }
+        atomic_fetch_add(&g_rt_scr_builds, 1);
+        if (g_debug && !bad_app && need > 0) {
+            bool s0 = rt_is_host_address_accessible((const void *)(uintptr_t)app, 1);
+            bool s1 = rt_is_host_address_accessible((const void *)(uintptr_t)(app + need - 1), 1);
+            if (!s0) atomic_fetch_add(&g_rt_scr_blind, 1);
+            else if (!s1) {
+                uint64_t n = atomic_fetch_add(&g_rt_scr_short, 1) + 1;
+                if (n <= 8)
+                    LOG("rt_scratch: app region short #%llu: build %u/%u type=%u mode=%u scratch=0x%llx need=%llu "
+                        "(end 0x%llx unmapped)", (unsigned long long)n, i + 1, count, infos[i].type, infos[i].mode,
+                        (unsigned long long)app, (unsigned long long)need, (unsigned long long)(app + need));
+            }
+        }
+        if (g_debug && plan[i].drv_as && plan[i].storage && plan[i].drv_as > plan[i].storage) {
+            uint64_t n = atomic_fetch_add(&g_rt_scr_dstshort, 1) + 1;
+            if (n <= 8) {
+                VkDeviceAddress dst_bda = 0ULL;
+                if (d->fpGetAccelerationStructureDeviceAddressKHR && infos[i].dstAccelerationStructure) {
+                    VkAccelerationStructureDeviceAddressInfoKHR dai = {
+                        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                        .accelerationStructure = infos[i].dstAccelerationStructure };
+                    dst_bda = d->fpGetAccelerationStructureDeviceAddressKHR(d->device, &dai);
+                }
+                LOG("rt_scratch: dst short #%llu type=%u mode=%u dst_bda=0x%llx storage=%llu need=%llu",
+                    (unsigned long long)n, infos[i].type, infos[i].mode, (unsigned long long)dst_bda,
+                    (unsigned long long)plan[i].storage, (unsigned long long)plan[i].drv_as);
+            }
+        }
+        plan[i].batch = batch;
+        if (!(own || bad_app || plan[i].need_pool)) continue;   /* valid app scratch kept (OWN_SCRATCH=0) */
+        if (!own_bda) {                                     /* no layer pool: an invalid app scratch cannot go out */
+            if (bad_app) plan[i].drop = true;
+            continue;
+        }
+        if (need == 0) need = 4ull * 1024 * 1024;          /* query unavailable: old 4 MB guess */
+        VkDeviceSize head = need;                           /* 2x need, at least +1 MB (the app heap was overrun) */
+        if (head < 1024 * 1024) head = 1024 * 1024;
+        VkDeviceSize slice = (need + head + align - 1) & ~(align - 1);
+        VkDeviceSize base  = ((own_bda + align - 1) & ~(align - 1)) - own_bda;
+        VkDeviceSize start = (((own_bda + cursor) + align - 1) & ~(align - 1)) - own_bda;
+        if (start + slice > pool_end && cursor > 0) {       /* pool full: split, the next call reuses the pool */
+            batch++;
+            plan[i].batch = batch;
+            cursor = 0;
+            start = base;
+            atomic_fetch_add(&g_rt_scr_nofit, 1);
+        }
+        if (start + slice > pool_end) {                     /* alone too big with headroom */
+            VkDeviceSize tight = (need + align - 1) & ~(align - 1);
+            if (start + tight <= pool_end) {
+                slice = tight;
+            } else if (!bad_app) {
+                atomic_fetch_add(&g_rt_scr_bigapp, 1);      /* keep the app's valid scratch */
+                continue;
+            } else {
+                plan[i].drop = true;
+                continue;
+            }
+        }
+        infos[i].scratchData.deviceAddress = own_bda + start;
+        cursor = start + slice;
+        if (cursor > max_cursor) max_cursor = cursor;
+        atomic_fetch_add(&g_rt_scr_own, 1);
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (!plan[i].drop) continue;
+        uint64_t n = atomic_fetch_add(&g_rt_scr_dropped, 1) + 1;
+        static _Atomic int64_t drop_ms = 0;
+        int64_t now = rt_now_ms(), pv = atomic_load(&drop_ms);
+        if ((n == 1 || now - pv >= 1000) && atomic_compare_exchange_strong(&drop_ms, &pv, now))
+            LOG("rt_scratch: DROPPED build %u/%u type=%u mode=%u need=%llu app scratch=0x%llx (0/invalid, does not "
+                "fit the %u MB pool) total dropped=%llu", i + 1, count, infos[i].type, infos[i].mode,
+                (unsigned long long)plan[i].drv_scratch, (unsigned long long)infos[i].scratchData.deviceAddress,
+                (unsigned)(RT_AS_SCRATCH_POOL >> 20), (unsigned long long)n);
+    }
+    uint64_t prev_max = atomic_load(&g_rt_scr_maxcall);
+    while (max_cursor > prev_max && !atomic_compare_exchange_weak(&g_rt_scr_maxcall, &prev_max, max_cursor)) {}
+    if (g_debug) {
+        static _Atomic int64_t last_ms = 0;
+        int64_t now = rt_now_ms(), pv = atomic_load(&last_ms);
+        if (now - pv >= 1000 && atomic_compare_exchange_strong(&last_ms, &pv, now))
+            LOG("rt_scratch: t=%lld ms builds=%llu own=%llu nofit=%llu dropped=%llu big-app=%llu dst-short=%llu "
+                "app-short=%llu app-unmapped-start=%llu max-per-call=%llu KB forced-build=unbuilt:%llu,mutated:%llu,"
+                "no-src:%llu,lever:%llu,othersrc:%llu,clone:%llu,badgeom:%llu retire-skip=%llu oom-passthrough=%llu upd-inplace=%llu "
+                "upd-othersrc=%llu upd-othersrc-bigger=%llu", (long long)now,
+                (unsigned long long)atomic_load(&g_rt_scr_builds), (unsigned long long)atomic_load(&g_rt_scr_own),
+                (unsigned long long)atomic_load(&g_rt_scr_nofit), (unsigned long long)atomic_load(&g_rt_scr_dropped),
+                (unsigned long long)atomic_load(&g_rt_scr_bigapp), (unsigned long long)atomic_load(&g_rt_scr_dstshort),
+                (unsigned long long)atomic_load(&g_rt_scr_short), (unsigned long long)atomic_load(&g_rt_scr_blind),
+                (unsigned long long)(atomic_load(&g_rt_scr_maxcall) >> 10),
+                (unsigned long long)atomic_load(&g_rt_fb_unbuilt), (unsigned long long)atomic_load(&g_rt_fb_mutated),
+                (unsigned long long)atomic_load(&g_rt_fb_nosrc), (unsigned long long)atomic_load(&g_rt_fb_lever),
+                (unsigned long long)atomic_load(&g_rt_fb_othersrc), (unsigned long long)atomic_load(&g_rt_fb_clone),
+                (unsigned long long)atomic_load(&g_rt_fb_badgeom), (unsigned long long)atomic_load(&g_rt_as_leaked), (unsigned long long)atomic_load(&g_rt_build_oom),
+                (unsigned long long)atomic_load(&g_rt_upd_inplace), (unsigned long long)atomic_load(&g_rt_upd_othersrc),
+                (unsigned long long)atomic_load(&g_rt_upd_bigger));
+    }
+    return batch + 1;
+}
+
+/* The full barriers around every AS build batch (unchanged since 308e8895; as-probe 11-10: a ray-query dispatch and a
+ * following AS build on one queue are only ordered with a barrier between them). */
+static void rt_as_build_barrier(struct DeviceData *d, VkCommandBuffer cmd, bool pre) {
+    if (!d->fpCmdPipelineBarrier) return;
+    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    if (pre) {
+        mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                           VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                           VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    } else {
+        mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                           VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                           VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                           VK_ACCESS_UNIFORM_READ_BIT;
+    }
+    d->fpCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+/* lead-1110c: true if the layer's sanitiser will zero a geometry of this build (invalid/0 vertex, AABB or instance
+ * data -> primitiveCount 0). An UPDATE must keep the primitive counts of its BUILD (Codex 1110-212923 :6923/:6935),
+ * so such an UPDATE is turned into a BUILD before the scratch is planned. Same tests as the sanitiser below. */
+static bool rt_build_has_bad_geometry(const VkAccelerationStructureBuildGeometryInfoKHR *bi,
+                                      const VkAccelerationStructureBuildRangeInfoKHR *ranges) {
+    for (uint32_t j = 0; j < bi->geometryCount; j++) {
+        const VkAccelerationStructureGeometryKHR *g = bi->pGeometries ? &bi->pGeometries[j]
+                                                    : (bi->ppGeometries ? bi->ppGeometries[j] : NULL);
+        if (!g) continue;
+        if (g->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+            VkDeviceAddress a = g->geometry.triangles.vertexData.deviceAddress;
+            if (a == 0ULL || rt_is_invalid_gpu_bda(a)) return true;
+        } else if (g->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+            VkDeviceAddress a = g->geometry.aabbs.data.deviceAddress;
+            if (a == 0ULL || rt_is_invalid_gpu_bda(a)) return true;
+        } else if (g->geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
+            VkDeviceAddress a = g->geometry.instances.data.deviceAddress;
+            uint32_t off = ranges ? ranges[j].primitiveOffset : 0;
+            if (a == 0ULL || rt_is_invalid_gpu_bda(a) || rt_is_invalid_gpu_bda(a + (uint64_t)off)) return true;
+        }
+    }
+    return false;
+}
+
+/* lead-1110c: a build's type does not match the track's built type or its active handle's creation type: a clean
+ * driver handle of that type on the same storage. Codex 1110-212923 :6773: room on the retired list is made FIRST;
+ * if it cannot grow, nothing is created or destroyed - the old active handle stays and is rebuilt (as with
+ * MALI_COMPAT_RT_AS_TRUST=1), counted as retire-skip. Either way the build becomes a BUILD of the new type.
+ * Caller holds g_rt_as_lock. */
+static void rt_as_recreate_locked(struct DeviceData *d, struct RtAsTrack *track,
+                                  VkAccelerationStructureBuildGeometryInfoKHR *info, bool app_update) {
+    VkAccelerationStructureKHR old = track->active_handle;
+    const bool retire = old && old != track->orig_handle;
+    bool room = !retire || track->n_retired < track->cap_retired;
+    if (!room) {
+        uint32_t nc = track->cap_retired ? track->cap_retired * 2 : 4;
+        VkAccelerationStructureKHR *nr = (VkAccelerationStructureKHR *)realloc(track->retired, nc * sizeof(*nr));
+        if (nr) { track->retired = nr; track->cap_retired = nc; room = true; }
+    }
+    VkAccelerationStructureKHR new_h = VK_NULL_HANDLE;
+    if (room) {
+        VkAccelerationStructureCreateInfoKHR ci = {
+            .sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+            .type   = info->type,
+            .buffer = track->buffer,
+            .offset = track->offset,
+            .size   = track->size,
+        };
+        if (!d->fpCreateAccelerationStructureKHR ||
+            d->fpCreateAccelerationStructureKHR(track->device, &ci, NULL, &new_h) != VK_SUCCESS)
+            new_h = VK_NULL_HANDLE;
+    } else {
+        uint64_t n = atomic_fetch_add(&g_rt_as_leaked, 1) + 1;
+        static _Atomic int64_t rs_ms = 0;
+        int64_t now = rt_now_ms(), pv = atomic_load(&rs_ms);
+        if ((n == 1 || now - pv >= 1000) && atomic_compare_exchange_strong(&rs_ms, &pv, now))
+            LOG("RT_EMU: AS %p type %u -> %u: retire list cannot grow (out of host memory) -> no new handle, the "
+                "active one is rebuilt (retire-skip=%llu)", (void *)track->orig_handle, (unsigned)track->built_type,
+                (unsigned)info->type, (unsigned long long)n);
+    }
+    if (new_h) {
+        /* 1110b: the replaced handle (unless it is the app's original, destroyed with the track anyway) is kept for
+         * destruction at the app's vkDestroyAccelerationStructure - it may be in flight now */
+        if (retire) track->retired[track->n_retired++] = old;
+        track->active_handle = new_h;
+        track->active_type   = info->type;
+    }
+    track->built_type = info->type;
+    if (app_update && info->mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) atomic_fetch_add(&g_rt_fb_mutated, 1);
+    info->mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+}
+
+/* 1110b (Codex 1110-202009 #1/#4): a host allocation for planning failed. No silent cap, no stack-array fallback:
+ * the WHOLE original call goes to the driver (between the usual barriers) - unless any build carries a 0/invalid
+ * scratch address, then the whole call is dropped (logged <= 1/s): an invalid scratch never reaches the driver.
+ * lead-1110c (Codex 1110-212923 :6666): the driver gets the ACTIVE handles (a type change may have replaced the app's
+ * one): substituted in a copy of the infos. The whole call is DROPPED if that copy cannot be allocated, or if any build
+ * needs what only the planned path can do: a type that does not match the active handle / the last build (UPDATE),
+ * the first UPDATE of a copied-into AS (MALI_COMPAT_RT_CLONE_REFIT=1), an other-source UPDATE that
+ * MALI_COMPAT_RT_UPD_SRC turns into a BUILD. A passed-through BUILD leaves the track's AS size unknown (0: a later
+ * CLONE from it goes to the driver). */
+static void rt_build_passthrough(struct DeviceData *d, VkCommandBuffer cmd, uint32_t infoCount,
+                                 const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+                                 const VkAccelerationStructureBuildRangeInfoKHR * const *ppBuildRangeInfos) {
+    uint64_t n = atomic_fetch_add(&g_rt_build_oom, 1) + 1;
+    const char *why = NULL;
+    uint32_t bad = UINT32_MAX;
+    for (uint32_t i = 0; i < infoCount && bad == UINT32_MAX; i++) {
+        VkDeviceAddress a = pInfos[i].scratchData.deviceAddress;
+        if (a == 0ULL || rt_is_invalid_gpu_bda(a)) bad = i;
+    }
+    if (bad != UINT32_MAX) why = "0/invalid scratch";
+    VkAccelerationStructureBuildGeometryInfoKHR *sub = NULL;
+    const int clone_refit = rt_env()->clone_refit, us = rt_env()->upd_src;
+    if (!why) {
+        pthread_mutex_lock(&g_rt_as_lock);
+        bool need_sub = false;
+        for (uint32_t i = 0; i < infoCount && !why; i++) {
+            const bool upd = pInfos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+            struct RtAsTrack *t = rt_as_lookup_locked(pInfos[i].dstAccelerationStructure);
+            struct RtAsTrack *st = upd ? rt_as_lookup_locked(pInfos[i].srcAccelerationStructure) : NULL;
+            if (t) {
+                if (t->active_type != VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR && t->active_type != pInfos[i].type)
+                    why = "type does not match the active handle";
+                else if (upd && t->built_type != RT_AS_TYPE_UNBUILT && t->built_type != pInfos[i].type)
+                    why = "UPDATE of another type";
+                else if (upd && clone_refit && !t->refit_ready && (!st || st == t))
+                    why = "first UPDATE after a copy";
+                else if (upd && st && st != t && (us == 1 || (us == 2 && st->size > t->size)))
+                    why = "other-source UPDATE";
+                if (t->active_handle && t->active_handle != pInfos[i].dstAccelerationStructure) need_sub = true;
+            }
+            if (st && st->active_handle && st->active_handle != pInfos[i].srcAccelerationStructure) need_sub = true;
+        }
+        if (!why && need_sub) {
+            sub = (VkAccelerationStructureBuildGeometryInfoKHR *)malloc(infoCount * sizeof(*sub));
+            if (!sub) why = "no host memory to substitute the active handles";
+            else {
+                memcpy(sub, pInfos, infoCount * sizeof(*sub));
+                for (uint32_t i = 0; i < infoCount; i++) {
+                    struct RtAsTrack *t = rt_as_lookup_locked(sub[i].dstAccelerationStructure);
+                    if (t && t->active_handle) sub[i].dstAccelerationStructure = t->active_handle;
+                    if (sub[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
+                        struct RtAsTrack *st = rt_as_lookup_locked(sub[i].srcAccelerationStructure);
+                        if (st && st->active_handle) sub[i].srcAccelerationStructure = st->active_handle;
+                    }
+                }
+            }
+        }
+        if (!why) {
+            for (uint32_t i = 0; i < infoCount; i++) {
+                struct RtAsTrack *t = rt_as_lookup_locked(pInfos[i].dstAccelerationStructure);
+                if (!t) continue;
+                if (pInfos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR) {
+                    t->as_size = 0;           /* not queried here */
+                    t->refit_ready = true;
+                    if (t->built_type == RT_AS_TYPE_UNBUILT) t->built_type = pInfos[i].type;
+                } else {
+                    struct RtAsTrack *st = rt_as_lookup_locked(pInfos[i].srcAccelerationStructure);
+                    if (st && st != t) t->as_size = 0;
+                }
+            }
+        }
+        pthread_mutex_unlock(&g_rt_as_lock);
+    }
+    static _Atomic int64_t oom_ms = 0;
+    int64_t now = rt_now_ms(), pv = atomic_load(&oom_ms);
+    if (n <= 4 || (now - pv >= 1000 && atomic_compare_exchange_strong(&oom_ms, &pv, now))) {   /* first 4, then <= 1/s */
+        if (bad != UINT32_MAX)
+            LOG("rt_scratch: out of host memory planning CmdBuildAS (%u builds); build %u has scratch 0x%llx "
+                "(0/invalid) -> whole call DROPPED (total oom calls=%llu)", infoCount, bad + 1,
+                (unsigned long long)pInfos[bad].scratchData.deviceAddress, (unsigned long long)n);
+        else if (why)
+            LOG("rt_scratch: out of host memory planning CmdBuildAS (%u builds) -> whole call DROPPED (%s) "
+                "(total oom calls=%llu)", infoCount, why, (unsigned long long)n);
+        else
+            LOG("rt_scratch: out of host memory planning CmdBuildAS (%u builds) -> passed through %s "
+                "(total oom calls=%llu)", infoCount, sub ? "with the active handles" : "unmodified",
+                (unsigned long long)n);
+    }
+    if (why) { free(sub); return; }
+    rt_as_build_barrier(d, cmd, true);
+    d->fpCmdBuildAccelerationStructuresKHR(cmd, infoCount, sub ? sub : pInfos, ppBuildRangeInfos);
+    rt_as_build_barrier(d, cmd, false);
+    free(sub);
+}
+
 static VKAPI_ATTR void VKAPI_CALL
 compat_CmdBuildAccelerationStructuresKHR(
     VkCommandBuffer                                         commandBuffer,
@@ -5921,51 +6933,149 @@ compat_CmdBuildAccelerationStructuresKHR(
         return;
     }
 
+    /* 1110b: every host array is allocated up front, before any AS track changes; one failure -> the whole call goes
+     * through rt_build_passthrough (no silent cap to 8 builds, no stack fallback that later overruns). */
+    const uint32_t count = infoCount;
+    uint64_t geoms_sum = 0;
+    for (uint32_t i = 0; i < count; i++) geoms_sum += pInfos[i].geometryCount;
+    const uint32_t total_geoms = geoms_sum > (uint64_t)(UINT32_MAX / 2) ? 0u : (uint32_t)geoms_sum;
+
     VkAccelerationStructureBuildGeometryInfoKHR stack_infos[8];
+    struct RtBuildPlan stack_plan[8];
+    VkAccelerationStructureGeometryKHR stack_all_geoms[32];
+    VkAccelerationStructureBuildRangeInfoKHR stack_all_ranges[32];
+    const VkAccelerationStructureBuildRangeInfoKHR *stack_ppRangeInfos[16];
     VkAccelerationStructureBuildGeometryInfoKHR *infos = stack_infos;
-    if (infoCount > 8) {
-        infos = (VkAccelerationStructureBuildGeometryInfoKHR *)malloc(infoCount * sizeof(*infos));
-        if (!infos) infos = stack_infos;
+    struct RtBuildPlan *plan = stack_plan;
+    VkAccelerationStructureGeometryKHR *all_geoms = stack_all_geoms;
+    VkAccelerationStructureBuildRangeInfoKHR *all_ranges = stack_all_ranges;
+    const VkAccelerationStructureBuildRangeInfoKHR **new_ppBuildRangeInfos = stack_ppRangeInfos;
+    bool oom = geoms_sum > (uint64_t)(UINT32_MAX / 2);
+    if (count > 8) {
+        infos = (VkAccelerationStructureBuildGeometryInfoKHR *)malloc(count * sizeof(*infos));
+        plan = (struct RtBuildPlan *)malloc(count * sizeof(*plan));
+        if (!infos || !plan) oom = true;
     }
-    uint32_t count = (infos == stack_infos && infoCount > 8) ? 8 : infoCount;
+    if (total_geoms > 32) {
+        all_geoms = (VkAccelerationStructureGeometryKHR *)malloc(total_geoms * sizeof(*all_geoms));
+        all_ranges = (VkAccelerationStructureBuildRangeInfoKHR *)malloc(total_geoms * sizeof(*all_ranges));
+        if (!all_geoms || !all_ranges) oom = true;
+    }
+    if (count > 16) {
+        new_ppBuildRangeInfos = (const VkAccelerationStructureBuildRangeInfoKHR **)malloc(count * sizeof(*new_ppBuildRangeInfos));
+        if (!new_ppBuildRangeInfos) oom = true;
+    }
+#ifdef RT_BUILD_OOM_TEST   /* test-only: simulate a failed planning allocation for calls with more than one build */
+    if (count > 1) oom = true;
+#endif
+    if (oom) {
+        rt_build_passthrough(d, commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
+        goto out;
+    }
+    memset(plan, 0, count * sizeof(*plan));
     memcpy(infos, pInfos, count * sizeof(*infos));
 
     bool has_safe_scratch = rt_ensure_as_scratch_buffer(d);
     VkDeviceAddress safe_scratch_bda = d->rt_scratch_bda;
-    uint32_t slice_size = 2 * 1024 * 1024;
-    if (count > 32) {
-        slice_size = (RT_AS_SCRATCH_SIZE / count) & ~0xffffu;
-        if (slice_size < 65536) slice_size = 65536;
-    }
 
+    const int as_trust = rt_env()->as_trust;
+    const int clone_refit = rt_env()->clone_refit;
     pthread_mutex_lock(&g_rt_as_lock);
     for (uint32_t i = 0; i < count; i++) {
         VkAccelerationStructureKHR dst = infos[i].dstAccelerationStructure;
         struct RtAsTrack *track = rt_as_lookup_locked(dst);
+        plan[i].storage = track ? track->size : 0;
+        const bool app_update = infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
         if (track) {
+            bool recreate = false;
             if (track->built_type == RT_AS_TYPE_UNBUILT) {
                 track->built_type = infos[i].type;
-                infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+                if (!as_trust) {               /* 1110b lever MALI_COMPAT_RT_AS_TRUST=1: the app's mode is kept */
+                    if (app_update) atomic_fetch_add(&g_rt_fb_unbuilt, 1);
+                    infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+                }
+            } else if (track->built_type != infos[i].type && as_trust) {
+                /* as-probe 11-10: the blob rebuilds a GENERIC handle as the other type without a new handle */
+                COMPAT_INFO("RT_EMU: AS %p type %u -> %u, same handle rebuilt (MALI_COMPAT_RT_AS_TRUST=1)",
+                           (void *)track->orig_handle, (unsigned)track->built_type, (unsigned)infos[i].type);
+                track->built_type = infos[i].type;
             } else if (track->built_type != infos[i].type) {
                 COMPAT_INFO("RT_EMU: AS %p mutated type %u -> %u! Allocating clean driver handle.",
                            (void *)track->orig_handle, (unsigned)track->built_type, (unsigned)infos[i].type);
-                VkAccelerationStructureCreateInfoKHR ci = {
-                    .sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
-                    .type   = infos[i].type,
-                    .buffer = track->buffer,
-                    .offset = track->offset,
-                    .size   = track->size,
-                };
-                VkAccelerationStructureKHR new_h = VK_NULL_HANDLE;
-                if (d->fpCreateAccelerationStructureKHR &&
-                    d->fpCreateAccelerationStructureKHR(track->device, &ci, NULL, &new_h) == VK_SUCCESS) {
-                    track->active_handle = new_h;
-                    track->built_type    = infos[i].type;
-                    infos[i].mode        = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-                }
+                recreate = true;
             }
+            /* lead-1110c (Codex 1110-212923 :7159): a copy propagates the source's built type, but the ACTIVE handle
+             * may have been created with the other explicit type: its creation type decides too. */
+            if (!recreate && track->active_type != VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR &&
+                track->active_type != infos[i].type) {
+                COMPAT_INFO("RT_EMU: AS %p active handle created as type %u, build type %u -> clean driver handle",
+                           (void *)track->orig_handle, (unsigned)track->active_type, (unsigned)infos[i].type);
+                recreate = true;
+            }
+            if (recreate) rt_as_recreate_locked(d, track, &infos[i], app_update);
             if (track->active_handle) {
                 infos[i].dstAccelerationStructure = track->active_handle;
+            }
+        }
+        /* 11-10: MALI_COMPAT_RT_FORCE_BUILD=1 (default off): an UPDATE (in-place refit, reads the src BVH's node
+         * pointers) becomes a full BUILD from the geometry. Lever ported from Gemini 4 Argon's wt-rtx-emu, where it
+         * defaulted ON. */
+        if (infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR && rt_env()->force_build) {
+            atomic_fetch_add(&g_rt_fb_lever, 1);
+            infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+            infos[i].srcAccelerationStructure = VK_NULL_HANDLE;
+        }
+
+        /* lead-1110c lever MALI_COMPAT_RT_CLONE_REFIT=1 (default): the first in-place UPDATE of an AS whose content came
+         * from a copy becomes a BUILD from this build's own geometry (on the blob only a BUILD through a handle is
+         * proven to make it refittable); later refits of it stay refits. */
+        if (track && clone_refit && !track->refit_ready &&
+            infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
+            struct RtAsTrack *s_t = rt_as_lookup_locked(pInfos[i].srcAccelerationStructure);
+            /* a BUILD needs the full AS size: a destination smaller than its source's AS size (a COMPACT copy) keeps
+             * the UPDATE (counted in the DEBUG line, never turned into an overrunning BUILD) */
+            const bool fits = !track->as_size || track->size >= track->as_size;
+            if (!fits && g_debug) {
+                static _Atomic uint32_t nf_lines = 0;
+                if (atomic_fetch_add(&nf_lines, 1) < 8)
+                    LOG("rt_build: clone-refit skipped: AS %p storage=%llu < AS size %llu (compacted copy) -> UPDATE kept",
+                        (void *)track->orig_handle, (unsigned long long)track->size, (unsigned long long)track->as_size);
+            }
+            if (fits && (!pInfos[i].srcAccelerationStructure || s_t == track ||
+                         pInfos[i].srcAccelerationStructure == pInfos[i].dstAccelerationStructure)) {
+                uint64_t cn = atomic_fetch_add(&g_rt_fb_clone, 1) + 1;
+                if (g_debug && cn <= 8)
+                    LOG("rt_build: clone-refit #%llu: first in-place UPDATE of AS %p after a copy -> BUILD "
+                        "(MALI_COMPAT_RT_CLONE_REFIT=1, storage=%llu)", (unsigned long long)cn,
+                        (void *)track->orig_handle, (unsigned long long)track->size);
+                infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+                infos[i].srcAccelerationStructure = VK_NULL_HANDLE;
+            }
+        }
+
+        /* 1110b follow-up (phone L1 on d4827f23: GPU WRITE faults 64-384 KB past the end of 8 MB AS buffers; the game
+         * refits with src != dst). Classify the APP's UPDATE: in place or from another AS (+ source storage larger than
+         * the destination's). Lever MALI_COMPAT_RT_UPD_SRC=1: an other-source UPDATE becomes a BUILD (src cleared,
+         * scratch planned for BUILD; default since lead-1110c); =2: only when the source storage is larger; 0: unchanged. */
+        if (app_update && pInfos[i].srcAccelerationStructure) {
+            struct RtAsTrack *s_t = rt_as_lookup_locked(pInfos[i].srcAccelerationStructure);
+            plan[i].src_storage = s_t ? s_t->size : 0;
+            plan[i].src_drv = (s_t && s_t->active_handle) ? s_t->active_handle : pInfos[i].srcAccelerationStructure;
+            bool other = (s_t && track) ? (s_t != track)
+                                        : (pInfos[i].srcAccelerationStructure != pInfos[i].dstAccelerationStructure);
+            if (!other) {
+                atomic_fetch_add(&g_rt_upd_inplace, 1);
+            } else {
+                atomic_fetch_add(&g_rt_upd_othersrc, 1);
+                bool bigger = plan[i].src_storage && plan[i].storage && plan[i].src_storage > plan[i].storage;
+                if (bigger) { atomic_fetch_add(&g_rt_upd_bigger, 1); plan[i].othersrc_bigger = true; }
+                const int us = rt_env()->upd_src;
+                if (infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR && (us == 1 || (us == 2 && bigger))) {
+                    atomic_fetch_add(&g_rt_fb_othersrc, 1);
+                    plan[i].othersrc_forced = true;
+                    infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+                    infos[i].srcAccelerationStructure = VK_NULL_HANDLE;
+                }
             }
         }
 
@@ -5975,20 +7085,77 @@ compat_CmdBuildAccelerationStructuresKHR(
                 infos[i].srcAccelerationStructure = src_t->active_handle;
             }
         } else if (infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
+            atomic_fetch_add(&g_rt_fb_nosrc, 1);
             infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         }
 
-        if (rt_is_invalid_gpu_bda(infos[i].scratchData.deviceAddress) || infos[i].scratchData.deviceAddress == 0ULL) {
-            if (has_safe_scratch && safe_scratch_bda) {
-                uint64_t offset = ((uint64_t)i * slice_size) % (RT_AS_SCRATCH_SIZE - slice_size);
-                infos[i].scratchData.deviceAddress = safe_scratch_bda + offset;
-            }
+        /* lead-1110c (Codex 1110-212923 :6923/:6935): the sanitiser below sets primitiveCount 0 for invalid geometry
+         * data; an UPDATE must keep its BUILD's counts, so such an UPDATE becomes a BUILD (planned as one). */
+        if (infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR &&
+            rt_build_has_bad_geometry(&pInfos[i], ppBuildRangeInfos ? ppBuildRangeInfos[i] : NULL)) {
+            uint64_t bn = atomic_fetch_add(&g_rt_fb_badgeom, 1) + 1;
+            if (g_debug && bn <= 8)
+                LOG("rt_build: badgeom #%llu: UPDATE with 0/invalid geometry data (the sanitiser zeroes its primitive "
+                    "count) -> BUILD", (unsigned long long)bn);
+            infos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+            infos[i].srcAccelerationStructure = VK_NULL_HANDLE;
         }
+        /* lead-1110c (Codex 1110-212923 :6814): every UPDATE the layer turned into a BUILD gets BUILD-sized pool
+         * scratch, also with MALI_COMPAT_RT_OWN_SCRATCH=0 (the app sized its scratch for the UPDATE). */
+        plan[i].need_pool = app_update && infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     }
     pthread_mutex_unlock(&g_rt_as_lock);
 
-    static uint32_t g_as_build_count = 0;
-    uint32_t as_idx = g_as_build_count++;
+    if (g_debug && d->fpGetAccelerationStructureDeviceAddressKHR) {   /* 1110b: up to 8 other-src-bigger details */
+        static _Atomic uint32_t big_lines = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            if (!plan[i].othersrc_bigger || atomic_load(&big_lines) >= 8) continue;
+            uint32_t n = atomic_fetch_add(&big_lines, 1) + 1;
+            if (n > 8) break;
+            VkAccelerationStructureDeviceAddressInfoKHR dai = {
+                .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
+            dai.accelerationStructure = plan[i].src_drv;
+            VkDeviceAddress sb = d->fpGetAccelerationStructureDeviceAddressKHR(d->device, &dai);
+            dai.accelerationStructure = infos[i].dstAccelerationStructure;
+            VkDeviceAddress db = d->fpGetAccelerationStructureDeviceAddressKHR(d->device, &dai);
+            uint64_t prims = 0;
+            for (uint32_t g = 0; ppBuildRangeInfos && ppBuildRangeInfos[i] && g < infos[i].geometryCount; g++)
+                prims += ppBuildRangeInfos[i][g].primitiveCount;
+            LOG("rt_scratch: upd other-src #%u src_bda=0x%llx src_storage=%llu dst_bda=0x%llx dst_storage=%llu prims=%llu%s",
+                n, (unsigned long long)sb, (unsigned long long)plan[i].src_storage, (unsigned long long)db,
+                (unsigned long long)plan[i].storage, (unsigned long long)prims,
+                plan[i].othersrc_forced ? " -> BUILD (UPD_SRC)"
+                : infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR ? " -> BUILD (layer, other reason)" : "");
+        }
+    }
+
+    uint32_t as_idx = atomic_fetch_add(&g_as_build_count, 1);   /* was a racy static counter */
+    const uint32_t blog_n = rt_env()->build_log;
+    bool blog = false;
+    if (blog_n) {
+        uint32_t mark = atomic_load(&g_rt_first_trace_call);
+        blog = as_idx < blog_n || (mark != UINT32_MAX && as_idx >= mark && as_idx - mark < blog_n);
+    }
+    uint32_t nbatches = rt_assign_as_scratch(d, count, infos, pInfos, ppBuildRangeInfos,
+                                             has_safe_scratch ? safe_scratch_bda : 0ULL, plan, blog);
+
+    /* lead-1110c: per destination track, the driver's real AS size of this BUILD (0 if the query was unavailable) - the
+     * layer's CLONE copies exactly that many bytes - and the handle is BUILD-made again (refittable). An in-place
+     * UPDATE keeps both; an UPDATE from another AS takes the source's size. Dropped builds change nothing. */
+    pthread_mutex_lock(&g_rt_as_lock);
+    for (uint32_t i = 0; i < count; i++) {
+        if (plan[i].drop) continue;
+        struct RtAsTrack *t = rt_as_lookup_locked(infos[i].dstAccelerationStructure);
+        if (!t) continue;
+        if (infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR) {
+            t->as_size = plan[i].drv_as;
+            t->refit_ready = true;
+        } else {
+            struct RtAsTrack *s_t = rt_as_lookup_locked(infos[i].srcAccelerationStructure);
+            if (s_t && s_t != t) t->as_size = s_t->as_size;
+        }
+    }
+    pthread_mutex_unlock(&g_rt_as_lock);
 
     /* Deep geometry and range info sanitization:
      * 1. Protect against CPU user-space pointers (>= 0x6000000000ULL, e.g. FEXAllocator PROT_NONE pages)
@@ -6004,31 +7171,6 @@ compat_CmdBuildAccelerationStructuresKHR(
      *      set instance.mask = 0 (so ray traversal skips it completely without affecting valid instances)
      *      and point accelerationStructureReference to rt_zero_bda so the driver BVH builder never faults!
      */
-    uint32_t total_geoms = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        total_geoms += infos[i].geometryCount;
-    }
-
-    VkAccelerationStructureGeometryKHR stack_all_geoms[32];
-    VkAccelerationStructureBuildRangeInfoKHR stack_all_ranges[32];
-    const VkAccelerationStructureBuildRangeInfoKHR *stack_ppRangeInfos[16];
-
-    VkAccelerationStructureGeometryKHR *all_geoms = stack_all_geoms;
-    VkAccelerationStructureBuildRangeInfoKHR *all_ranges = stack_all_ranges;
-    const VkAccelerationStructureBuildRangeInfoKHR **new_ppBuildRangeInfos = stack_ppRangeInfos;
-
-    if (total_geoms > 32) {
-        all_geoms = (VkAccelerationStructureGeometryKHR *)malloc(total_geoms * sizeof(*all_geoms));
-        all_ranges = (VkAccelerationStructureBuildRangeInfoKHR *)malloc(total_geoms * sizeof(*all_ranges));
-        if (!all_geoms) all_geoms = stack_all_geoms;
-        if (!all_ranges) all_ranges = stack_all_ranges;
-    }
-
-    if (count > 16) {
-        new_ppBuildRangeInfos = (const VkAccelerationStructureBuildRangeInfoKHR **)malloc(count * sizeof(*new_ppBuildRangeInfos));
-        if (!new_ppBuildRangeInfos) new_ppBuildRangeInfos = stack_ppRangeInfos;
-    }
-
     uint32_t curr_geom_idx = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t g_count = infos[i].geometryCount;
@@ -6071,6 +7213,8 @@ compat_CmdBuildAccelerationStructuresKHR(
                 if (rt_is_invalid_gpu_bda(tri->vertexData.deviceAddress) || tri->vertexData.deviceAddress == 0ULL) {
                     tri->vertexData.deviceAddress = rt_get_zero_bda(d);
                     if (tri->vertexStride < 12) tri->vertexStride = 12;
+                    /* 1110b: nothing may be read past the 4 KB zero buffer (> ~113 tris did): no primitives */
+                    all_ranges[idx].primitiveCount = 0;
                 }
                 if (tri->indexType != VK_INDEX_TYPE_NONE_KHR &&
                     (rt_is_invalid_gpu_bda(tri->indexData.deviceAddress) || tri->indexData.deviceAddress == 0ULL)) {
@@ -6082,6 +7226,7 @@ compat_CmdBuildAccelerationStructuresKHR(
                 if (rt_is_invalid_gpu_bda(aabb->data.deviceAddress) || aabb->data.deviceAddress == 0ULL) {
                     aabb->data.deviceAddress = rt_get_zero_bda(d);
                     if (aabb->stride < 24) aabb->stride = 24;
+                    all_ranges[idx].primitiveCount = 0;   /* 1110b: as for triangles above */
                 }
             } else if (all_geoms[idx].geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
                 VkAccelerationStructureGeometryInstancesDataKHR *inst = &all_geoms[idx].geometry.instances;
@@ -6097,23 +7242,29 @@ compat_CmdBuildAccelerationStructuresKHR(
                     void *host_base = rt_resolve_gpu_bda_to_host(inst_bda + prim_off, sizeof(VkAccelerationStructureInstanceKHR));
                     if (host_base) {
                         VkAccelerationStructureInstanceKHR *inst_arr = (VkAccelerationStructureInstanceKHR *)host_base;
-                        uint32_t bad_refs = 0;
+                        uint32_t bad_refs = 0, null_refs = 0;
                         for (uint32_t k = 0; k < prim_cnt; k++) {
                             if ((k & 63u) == 0 && k > 0) {
                                 if (!rt_is_host_address_accessible((const void *)&inst_arr[k], sizeof(VkAccelerationStructureInstanceKHR))) {
                                     break;
                                 }
                             }
+                            /* 11-10: reference 0 = Vulkan-legal inactive instance, the blob builder handles it
+                             * (rq-probe `inactive` PASS 11-06): untouched. A non-zero invalid reference becomes 0
+                             * (+ mask 0). It used to point at the 4 KB zero buffer, from which the Mali builder read a
+                             * "BLAS header" of zeros and faulted at 0x0..0x480 (11-09: 34 READ faults). */
                             VkDeviceAddress as_ref = inst_arr[k].accelerationStructureReference;
-                            if (as_ref == 0ULL || rt_is_invalid_gpu_bda(as_ref)) {
+                            if (as_ref == 0ULL) {
+                                null_refs++;
+                            } else if (rt_is_invalid_gpu_bda(as_ref)) {
                                 inst_arr[k].mask = 0;
-                                inst_arr[k].accelerationStructureReference = rt_get_zero_bda(d);
+                                inst_arr[k].accelerationStructureReference = 0ULL;
                                 bad_refs++;
                             }
                         }
                         if (bad_refs > 0 || as_idx < 10 || (as_idx % 120) == 0) {
-                            COMPAT_INFO("RT_EMU: TLAS build #%u instances=%u bad_refs=%u (inst_bda=0x%llx, host=%p)",
-                                        as_idx, prim_cnt, bad_refs, (unsigned long long)inst_bda, host_base);
+                            COMPAT_INFO("RT_EMU: TLAS build #%u instances=%u bad_refs=%u inactive=%u (inst_bda=0x%llx, host=%p)",
+                                        as_idx, prim_cnt, bad_refs, null_refs, (unsigned long long)inst_bda, host_base);
                         }
                         cache_maintenance(host_base, (VkDeviceSize)prim_cnt * sizeof(VkAccelerationStructureInstanceKHR), false);
                     }
@@ -6121,10 +7272,12 @@ compat_CmdBuildAccelerationStructuresKHR(
                     void *ptr_base = rt_resolve_gpu_bda_to_host(inst_bda + prim_off, sizeof(VkDeviceAddress));
                     if (ptr_base) {
                         VkDeviceAddress *ptr_arr = (VkDeviceAddress *)ptr_base;
-                        uint32_t bad_refs = 0;
+                        uint32_t bad_refs = 0, null_refs = 0;
                         for (uint32_t k = 0; k < prim_cnt; k++) {
                             VkDeviceAddress inst_elem_bda = ptr_arr[k];
                             if (inst_elem_bda == 0ULL || rt_is_invalid_gpu_bda(inst_elem_bda)) {
+                                /* a bad POINTER to an instance: point it at the zero buffer = an all-zero instance,
+                                 * i.e. reference 0 (inactive), mask 0 - the builder reads no BLAS through it */
                                 ptr_arr[k] = rt_get_zero_bda(d);
                                 bad_refs++;
                                 continue;
@@ -6133,17 +7286,19 @@ compat_CmdBuildAccelerationStructuresKHR(
                             if (elem_host) {
                                 VkAccelerationStructureInstanceKHR *one_inst = (VkAccelerationStructureInstanceKHR *)elem_host;
                                 VkDeviceAddress as_ref = one_inst->accelerationStructureReference;
-                                if (as_ref == 0ULL || rt_is_invalid_gpu_bda(as_ref)) {
+                                if (as_ref == 0ULL) {
+                                    null_refs++;               /* legal inactive instance: untouched (11-10) */
+                                } else if (rt_is_invalid_gpu_bda(as_ref)) {
                                     one_inst->mask = 0;
-                                    one_inst->accelerationStructureReference = rt_get_zero_bda(d);
+                                    one_inst->accelerationStructureReference = 0ULL;   /* was rt_zero_bda (11-10) */
                                     bad_refs++;
                                 }
                                 cache_maintenance(elem_host, sizeof(VkAccelerationStructureInstanceKHR), false);
                             }
                         }
                         if (bad_refs > 0 || as_idx < 10 || (as_idx % 120) == 0) {
-                            COMPAT_INFO("RT_EMU: TLAS build #%u (array of ptrs) instances=%u bad_refs=%u (inst_bda=0x%llx, host=%p)",
-                                        as_idx, prim_cnt, bad_refs, (unsigned long long)inst_bda, ptr_base);
+                            COMPAT_INFO("RT_EMU: TLAS build #%u (array of ptrs) instances=%u bad_refs=%u inactive=%u (inst_bda=0x%llx, host=%p)",
+                                        as_idx, prim_cnt, bad_refs, null_refs, (unsigned long long)inst_bda, ptr_base);
                         }
                         cache_maintenance(ptr_base, (VkDeviceSize)prim_cnt * sizeof(VkDeviceAddress), false);
                     }
@@ -6183,57 +7338,133 @@ compat_CmdBuildAccelerationStructuresKHR(
         }
     }
 
-    if (d->fpCmdPipelineBarrier) {
-        VkMemoryBarrier pre_mb = {
-            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext         = NULL,
-            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
-                             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
-                             VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
-                             VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
-                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
-        };
-        d->fpCmdPipelineBarrier(commandBuffer,
-                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                0,
-                                1, &pre_mb,
-                                0, NULL,
-                                0, NULL);
+    if (blog) {
+        for (uint32_t i = 0; i < count; i++) {
+            VkDeviceAddress dst_bda = 0ULL;
+            if (d->fpGetAccelerationStructureDeviceAddressKHR && infos[i].dstAccelerationStructure) {
+                VkAccelerationStructureDeviceAddressInfoKHR dai = {
+                    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                    .accelerationStructure = infos[i].dstAccelerationStructure,
+                };
+                dst_bda = d->fpGetAccelerationStructureDeviceAddressKHR(d->device, &dai);
+            }
+            uint64_t prims = 0;
+            const VkAccelerationStructureBuildRangeInfoKHR *ri = new_ppBuildRangeInfos[i];
+            for (uint32_t g = 0; ri && g < infos[i].geometryCount; g++) prims += ri[g].primitiveCount;
+            /* 1110b: first geometry's format (after the layer's sanitising) */
+            char g0s[160] = " g0=none";
+            const VkAccelerationStructureGeometryKHR *g0 = NULL;
+            if (infos[i].geometryCount)
+                g0 = infos[i].pGeometries ? &infos[i].pGeometries[0]
+                                          : (infos[i].ppGeometries ? infos[i].ppGeometries[0] : NULL);
+            if (g0 && g0->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+                const VkAccelerationStructureGeometryTrianglesDataKHR *t = &g0->geometry.triangles;
+                snprintf(g0s, sizeof(g0s), " g0=tri fmt=%u vstride=%llu idx=%u maxv=%u xform=%d gflags=0x%x",
+                         (unsigned)t->vertexFormat, (unsigned long long)t->vertexStride, (unsigned)t->indexType,
+                         t->maxVertex, t->transformData.deviceAddress != 0ULL, (unsigned)g0->flags);
+            } else if (g0 && g0->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+                snprintf(g0s, sizeof(g0s), " g0=aabb stride=%llu gflags=0x%x",
+                         (unsigned long long)g0->geometry.aabbs.stride, (unsigned)g0->flags);
+            } else if (g0 && g0->geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
+                snprintf(g0s, sizeof(g0s), " g0=inst aop=%u gflags=0x%x",
+                         (unsigned)g0->geometry.instances.arrayOfPointers, (unsigned)g0->flags);
+            }
+            VkDeviceAddress src_bda = 0ULL;   /* 1110b: the APP's source (also when a lever cleared it) */
+            if (d->fpGetAccelerationStructureDeviceAddressKHR && plan[i].src_drv) {
+                VkAccelerationStructureDeviceAddressInfoKHR sai = {
+                    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                    .accelerationStructure = plan[i].src_drv };
+                src_bda = d->fpGetAccelerationStructureDeviceAddressKHR(d->device, &sai);
+            }
+            LOG("rt_build: call=%u %u/%u type=%u mode=%u app_mode=%u flags=0x%x dst_bda=0x%llx storage=%llu src_bda=0x%llx "
+                "src_storage=%llu drv_as=%llu drv_scratch=%llu scratch=0x%llx prims=%llu batch=%u%s%s", as_idx, i + 1,
+                count, infos[i].type, infos[i].mode, pInfos[i].mode, infos[i].flags, (unsigned long long)dst_bda,
+                (unsigned long long)plan[i].storage, (unsigned long long)src_bda, (unsigned long long)plan[i].src_storage,
+                (unsigned long long)plan[i].drv_as, (unsigned long long)plan[i].drv_scratch,
+                (unsigned long long)infos[i].scratchData.deviceAddress, (unsigned long long)prims, plan[i].batch,
+                g0s, plan[i].drop ? " DROPPED" : "");
+        }
     }
 
-    const VkAccelerationStructureBuildRangeInfoKHR * const *pass_ranges =
-        ppBuildRangeInfos ? (const VkAccelerationStructureBuildRangeInfoKHR * const *)new_ppBuildRangeInfos : NULL;
-
-    d->fpCmdBuildAccelerationStructuresKHR(commandBuffer, count, infos, pass_ranges);
-
-    if (d->fpCmdPipelineBarrier) {
-        VkMemoryBarrier mb = {
-            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext         = NULL,
-            .srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
-                             VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                             VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
-                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
-                             VK_ACCESS_UNIFORM_READ_BIT,
-        };
-        d->fpCmdPipelineBarrier(commandBuffer,
-                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                0,
-                                1, &mb,
-                                0, NULL,
-                                0, NULL);
+    /* 11-10: dropped builds are removed (order kept); each batch from rt_assign_as_scratch goes out as its own driver
+     * call between the full pre/post barriers, so batch b+1 may reuse the scratch pool of batch b. */
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (plan[i].drop) continue;
+        if (live != i) {
+            infos[live] = infos[i];
+            new_ppBuildRangeInfos[live] = new_ppBuildRangeInfos[i];
+            plan[live] = plan[i];
+        }
+        live++;
+    }
+    if (nbatches > 1 && g_debug) {
+        static _Atomic int64_t split_ms = 0;
+        int64_t now = rt_now_ms(), pv = atomic_load(&split_ms);
+        if (now - pv >= 1000 && atomic_compare_exchange_strong(&split_ms, &pv, now))
+            LOG("rt_scratch: CmdBuildAS #%u split into %u driver calls (%u builds, %u dropped)",
+                as_idx, nbatches, live, count - live);
     }
 
+    for (uint32_t first = 0; first < live;) {
+        uint32_t n = 1;
+        while (first + n < live && plan[first + n].batch == plan[first].batch) n++;
+
+        rt_as_build_barrier(d, commandBuffer, true);
+
+        const VkAccelerationStructureBuildRangeInfoKHR * const *pass_ranges =
+            ppBuildRangeInfos ? (const VkAccelerationStructureBuildRangeInfoKHR * const *)&new_ppBuildRangeInfos[first]
+                              : NULL;
+
+        d->fpCmdBuildAccelerationStructuresKHR(commandBuffer, n, &infos[first], pass_ranges);
+
+        rt_as_build_barrier(d, commandBuffer, false);
+        first += n;
+    }
+
+out:
     if (all_geoms != stack_all_geoms) free(all_geoms);
     if (all_ranges != stack_all_ranges) free(all_ranges);
     if (new_ppBuildRangeInfos != stack_ppRangeInfos) free((void *)new_ppBuildRangeInfos);
     if (infos != stack_infos) free(infos);
+    if (plan != stack_plan) free(plan);
 }
 
+/* lead-1110c: full barriers around the layer's CLONE copy, the same kind as around AS builds. Before: every earlier
+ * write (source built, destination last used) is done and visible to the transfer, nothing still reads the
+ * destination. After: the copied bytes are visible to AS builds/refits, ray queries, shaders and later transfers. */
+static void rt_as_copy_barrier(struct DeviceData *d, VkCommandBuffer cmd, bool pre) {
+    if (!d->fpCmdPipelineBarrier) return;
+    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    if (pre) {
+        mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                           VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    } else {
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                           VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                           VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    }
+    d->fpCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+/* lead-1110c: as-probe 11-10 (blob, no layer): vkCmdCopyAccelerationStructureKHR CLONE copies the SOURCE handle's
+ * created size (vkd3d-proton: rest of the buffer), starting up to 3840 B before the destination and running past the
+ * destination VkBuffer - the W3 GPU write faults (L2: clone=212 then in-place refits of the clones). A freshly built
+ * AS occupies exactly its own bytes, at most the driver's accelerationStructureSize of its build.
+ * Lever MALI_COMPAT_RT_CLONE=1 (default): a CLONE is done by the layer: vkCmdCopyBuffer of
+ * min(source AS size, source storage, destination storage) bytes from (source buffer, offset) to (destination
+ * buffer, offset) between rt_as_copy_barrier. Falls back to the driver's copy (logged how=drv reason=) when a track is
+ * missing, the source's AS size is unknown (0), a buffer lacks the transfer usage the layer adds in compat_CreateBuffer,
+ * vkCmdCopyBuffer is unavailable, or source and destination ranges overlap in one buffer. COMPACT always goes to the
+ * driver (as-probe: it stays inside the destination's 64 KB-rounded compacted size).
+ * Tracks: the destination takes the source's built type and AS size and is not refittable until its next BUILD
+ * (MALI_COMPAT_RT_CLONE_REFIT). */
 static VKAPI_ATTR void VKAPI_CALL
 compat_CmdCopyAccelerationStructureKHR(
     VkCommandBuffer                             commandBuffer,
@@ -6246,12 +7477,91 @@ compat_CmdCopyAccelerationStructureKHR(
         return;
     }
     VkCopyAccelerationStructureInfoKHR copy = *pInfo;
+    VkDeviceSize src_storage = 0, dst_storage = 0, dst_rest = 0, src_as = 0, size = 0;
+    VkBuffer sbuf = VK_NULL_HANDLE, dbuf = VK_NULL_HANDLE;
+    VkDeviceSize soff = 0, doff = 0;
+    const bool is_clone = copy.mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR;
+    const char *reason = NULL;   /* NULL = the layer copies (how=buf) */
     pthread_mutex_lock(&g_rt_as_lock);
     struct RtAsTrack *st = rt_as_lookup_locked(pInfo->src);
-    if (st) copy.src = st->active_handle;
+    if (st) { copy.src = st->active_handle; src_storage = st->size; src_as = st->as_size; sbuf = st->buffer; soff = st->offset; }
     struct RtAsTrack *dt = rt_as_lookup_locked(pInfo->dst);
-    if (dt) copy.dst = dt->active_handle;
+    if (dt) { copy.dst = dt->active_handle; dst_storage = dt->size; dst_rest = dt->buf_rest; dbuf = dt->buffer; doff = dt->offset; }
+    if (!is_clone) reason = "mode";
+    else if (!rt_env()->clone) reason = "lever";
+    else if (!st || !dt) reason = "untracked";
+    else if (!src_as) reason = "size";
+    else if (!sbuf || !dbuf || !src_storage || !dst_storage) reason = "buffer";
+    else if (!st->xfer_ok || !dt->xfer_ok) reason = "usage";
+    else if (!d->fpCmdCopyBuffer) reason = "nofn";
+    else {
+        size = src_as;
+        if (size > src_storage) size = src_storage;
+        if (size > dst_storage) size = dst_storage;
+        if (sbuf == dbuf && soff < doff + size && doff < soff + size) reason = "overlap";
+    }
+    if (reason) size = 0;
+    /* 1110b: the copy leaves dst built with the source's type (it stayed UNBUILT before, so its first UPDATE was
+     * silently turned into a BUILD; with MALI_COMPAT_RT_AS_TRUST=1 no such forcing happens at all).
+     * lead-1110c: + the source's AS size, and the destination is not refittable until its next BUILD. */
+    if (st && dt && st != dt) {
+        if (st->built_type != RT_AS_TYPE_UNBUILT) dt->built_type = st->built_type;
+        dt->as_size = st->as_size;
+        dt->refit_ready = false;
+    }
     pthread_mutex_unlock(&g_rt_as_lock);
+
+    /* 1110b, MALI_COMPAT_DEBUG: what the app copies; lead-1110c: + how=buf|drv size= reason= */
+    static _Atomic uint64_t c_total = 0, c_clone = 0, c_compact = 0, c_buf = 0, c_drv = 0;
+    uint64_t cn = atomic_fetch_add(&c_total, 1) + 1;
+    if (is_clone) atomic_fetch_add(&c_clone, 1);
+    else if (copy.mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR) atomic_fetch_add(&c_compact, 1);
+    uint64_t nbuf = reason ? atomic_load(&c_buf) : atomic_fetch_add(&c_buf, 1) + 1;
+    uint64_t ndrv = reason ? atomic_fetch_add(&c_drv, 1) + 1 : atomic_load(&c_drv);
+    const char *mn = is_clone ? "CLONE"
+                   : copy.mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR ? "COMPACT"
+                   : copy.mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_SERIALIZE_KHR ? "SERIALIZE"
+                   : copy.mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_DESERIALIZE_KHR ? "DESERIALIZE" : "?";
+    if (g_debug) {
+        if (cn <= 64) {
+            VkDeviceAddress sb = 0, db = 0;
+            if (d->fpGetAccelerationStructureDeviceAddressKHR) {
+                VkAccelerationStructureDeviceAddressInfoKHR dai = {
+                    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR };
+                if (copy.src) { dai.accelerationStructure = copy.src; sb = d->fpGetAccelerationStructureDeviceAddressKHR(d->device, &dai); }
+                if (copy.dst) { dai.accelerationStructure = copy.dst; db = d->fpGetAccelerationStructureDeviceAddressKHR(d->device, &dai); }
+            }
+            LOG("rt_copy: #%llu mode=%s src=0x%llx src_storage=%llu src_as=%llu dst=0x%llx dst_storage=%llu "
+                "dst_buf_rest=%llu how=%s size=%llu%s%s", (unsigned long long)cn, mn, (unsigned long long)sb,
+                (unsigned long long)src_storage, (unsigned long long)src_as, (unsigned long long)db,
+                (unsigned long long)dst_storage, (unsigned long long)dst_rest, reason ? "drv" : "buf",
+                (unsigned long long)size, reason ? " reason=" : "", reason ? reason : "");
+        }
+        static _Atomic int64_t c_ms = 0;
+        int64_t now = rt_now_ms(), pv = atomic_load(&c_ms);
+        if (now - pv >= 1000 && atomic_compare_exchange_strong(&c_ms, &pv, now))
+            LOG("rt_copy: total=%llu clone=%llu compact=%llu buf=%llu drv=%llu", (unsigned long long)cn,
+                (unsigned long long)atomic_load(&c_clone), (unsigned long long)atomic_load(&c_compact),
+                (unsigned long long)nbuf, (unsigned long long)ndrv);
+    }
+    if (is_clone && reason && strcmp(reason, "lever") != 0) {   /* a CLONE the driver does: always logged, <= 1/s */
+        static _Atomic int64_t f_ms = 0;
+        static _Atomic uint64_t f_n = 0;
+        uint64_t fn = atomic_fetch_add(&f_n, 1) + 1;
+        int64_t now = rt_now_ms(), pv = atomic_load(&f_ms);
+        if ((fn == 1 || now - pv >= 1000) && atomic_compare_exchange_strong(&f_ms, &pv, now))
+            LOG("rt_copy: CLONE how=drv reason=%s src_storage=%llu src_as=%llu dst_storage=%llu (driver clones so far: %llu)",
+                reason, (unsigned long long)src_storage, (unsigned long long)src_as, (unsigned long long)dst_storage,
+                (unsigned long long)fn);
+    }
+
+    if (!reason) {
+        VkBufferCopy region = { .srcOffset = soff, .dstOffset = doff, .size = size };
+        rt_as_copy_barrier(d, commandBuffer, true);
+        d->fpCmdCopyBuffer(commandBuffer, sbuf, dbuf, 1, &region);
+        rt_as_copy_barrier(d, commandBuffer, false);
+        return;
+    }
 
     d->fpCmdCopyAccelerationStructureKHR(commandBuffer, &copy);
 
@@ -6304,6 +7614,27 @@ compat_CmdWriteAccelerationStructuresPropertiesKHR(
     }
     pthread_mutex_unlock(&g_rt_as_lock);
 
+    /* 1110b, MALI_COMPAT_DEBUG: which AS properties the app queries (first 16 calls + a summary <= 1/s) */
+    static _Atomic uint64_t q_total = 0, q_compacted = 0, q_serial = 0;
+    uint64_t qn = atomic_fetch_add(&q_total, 1) + 1;
+    if (queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR) atomic_fetch_add(&q_compacted, 1);
+    else if (queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR) atomic_fetch_add(&q_serial, 1);
+    if (g_debug) {
+        if (qn <= 16) {
+            const char *tn = queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ? "COMPACTED_SIZE"
+                           : queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR ? "SERIALIZATION_SIZE"
+                           : queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ? "SIZE"
+                           : queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR
+                               ? "SERIALIZATION_BOTTOM_LEVEL_POINTERS" : "?";
+            LOG("rt_query: #%llu type=%s count=%u", (unsigned long long)qn, tn, accelerationStructureCount);
+        }
+        static _Atomic int64_t q_ms = 0;
+        int64_t now = rt_now_ms(), pv = atomic_load(&q_ms);
+        if (now - pv >= 1000 && atomic_compare_exchange_strong(&q_ms, &pv, now))
+            LOG("rt_query: total=%llu compacted=%llu serialization=%llu", (unsigned long long)qn,
+                (unsigned long long)atomic_load(&q_compacted), (unsigned long long)atomic_load(&q_serial));
+    }
+
     d->fpCmdWriteAccelerationStructuresPropertiesKHR(commandBuffer, cnt, as_arr, queryType, queryPool, firstQuery);
 
     if (as_arr != stack_as) free(as_arr);
@@ -6325,9 +7656,11 @@ compat_GetAccelerationStructureDeviceAddressKHR(
 
     VkDeviceAddress bda = d->fpGetAccelerationStructureDeviceAddressKHR(device, &info);
     if (rt_is_invalid_gpu_bda(bda)) {
-        COMPAT_INFO("RT_EMU: GetASDeviceAddress returned invalid BDA 0x%llx for AS %p, clamping to rt_zero_bda",
+        /* 1110b: 0 (= an inactive instance in a TLAS), no longer rt_zero_bda: that zero buffer is in range, passed the
+         * TLAS instance check, and the Mali builder read it as a BLAS header (faults at 0x0..0x480). */
+        COMPAT_INFO("RT_EMU: GetASDeviceAddress returned invalid BDA 0x%llx for AS %p, returning 0 (inactive)",
                     (unsigned long long)bda, (void *)pInfo->accelerationStructure);
-        return rt_get_zero_bda(d);
+        return 0ULL;
     }
     return bda;
 }
@@ -6344,6 +7677,9 @@ compat_GetAccelerationStructureBuildSizesKHR(
     if (!d || !d->fpGetAccelerationStructureBuildSizesKHR || !pSizeInfo) return;
 
     d->fpGetAccelerationStructureBuildSizesKHR(device, buildType, pBuildInfo, pMaxPrimitiveCounts, pSizeInfo);
+    /* 1110b lever MALI_COMPAT_RT_SIZE_PAD=0: the driver's own sizes (as-probe 11-10: the blob builder stays inside
+     * the storage and scratch it reports). Default 1 = the inflation below. */
+    if (!rt_env()->size_pad) return;
 
     /* Mali proprietary CSF driver underestimates scratch and AS storage
      * requirements for complex geometry and TLAS builds, causing hardware
