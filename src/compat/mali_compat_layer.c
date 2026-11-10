@@ -1519,7 +1519,7 @@ struct DeviceData {
     struct DcFns *dcf;  // desc-capture-1 driver entry points, NULL when off
     struct CtDev *ct;   // cover-trim (MALI_COMPAT_COVER_TRIM), NULL when off
     struct SdDev *sd;   // sync-diag next/driver entry points, NULL when off
-#define SAL_NEXT_MAX 9
+#define SAL_NEXT_MAX 16
     PFN_vkVoidFunction sal_next[SAL_NEXT_MAX]; // MALI_COMPAT_SSBO_ALIGN_LOG: next entry points (sal_proc), NULL when off
     VkPipelineLayout rt_ind_layout;
     VkPipeline rt_ind_pipeline;
@@ -8342,7 +8342,9 @@ static PFN_vkVoidFunction sd_proc(VkDevice device, const char *pName) {
 // ("mali-compat: ssbo-align: ..."). Off: no hook is handed out (only the g_sal_on test in vkGetDeviceProcAddr). The hooks
 // wrap whatever the rest of vkGetDeviceProcAddr hands out (this layer's own hook or the driver's), as sync-diag does.
 // Nothing is changed. [night keeper, Claude Opus 5.5] 2026-11-10
-enum { SAL_UPD, SAL_UPD_TPL, SAL_PUSH, SAL_PUSH2, SAL_PUSH_TPL, SAL_PUSH_TPL2, SAL_TPL_NEW, SAL_TPL_DEL, SAL_GETDESC, SAL_N };
+// One next pointer per entry-point NAME (core and KHR aliases may resolve to different entry points below).
+enum { SAL_UPD, SAL_UPD_TPL, SAL_UPD_TPL_K, SAL_PUSH_K, SAL_PUSH, SAL_PUSH2, SAL_PUSH2_K, SAL_PUSH_TPL, SAL_PUSH_TPL_K,
+       SAL_PUSH_TPL2, SAL_PUSH_TPL2_K, SAL_TPL_NEW, SAL_TPL_NEW_K, SAL_TPL_DEL, SAL_TPL_DEL_K, SAL_GETDESC, SAL_N };
 _Static_assert(SAL_N <= SAL_NEXT_MAX, "DeviceData.sal_next too small");
 enum { SALP_SET, SALP_TPL, SALP_PUSH, SALP_DBUF, SALP_N }; // per path: sets, set templates, push (all kinds), vkGetDescriptorEXT
 static bool g_sal_on;
@@ -8472,45 +8474,100 @@ static VKAPI_ATTR void VKAPI_CALL sal_UpdateDescriptorSets(VkDevice device, uint
     sal_writes(SALP_SET, nw, w);
     ((PFN_vkUpdateDescriptorSets)sal_next(get_device_data(device), SAL_UPD))(device, nw, w, nc, c);
 }
-static VKAPI_ATTR void VKAPI_CALL sal_UpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet set,
-                                                                      VkDescriptorUpdateTemplate t, const void *data) {
+static inline void sal_upd_tpl(int kind, VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void *data) {
     sal_tpl_data(SALP_TPL, device, t, data);
-    ((PFN_vkUpdateDescriptorSetWithTemplate)sal_next(get_device_data(device), SAL_UPD_TPL))(device, set, t, data);
+    ((PFN_vkUpdateDescriptorSetWithTemplate)sal_next(get_device_data(device), kind))(device, set, t, data);
 }
-static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSet(VkCommandBuffer cmd, VkPipelineBindPoint bp, VkPipelineLayout layout,
-                                                           uint32_t set, uint32_t n, const VkWriteDescriptorSet *w) {
+static inline void sal_push(int kind, VkCommandBuffer cmd, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set,
+                            uint32_t n, const VkWriteDescriptorSet *w) {
     sal_writes(SALP_PUSH, n, w);
-    ((PFN_vkCmdPushDescriptorSetKHR)sal_next(get_device_data_by_cmd(cmd), SAL_PUSH))(cmd, bp, layout, set, n, w);
+    ((PFN_vkCmdPushDescriptorSetKHR)sal_next(get_device_data_by_cmd(cmd), kind))(cmd, bp, layout, set, n, w);
 }
-static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSet2(VkCommandBuffer cmd, const VkPushDescriptorSetInfo *i) {
+static inline void sal_push2(int kind, VkCommandBuffer cmd, const VkPushDescriptorSetInfo *i) {
     if (i) sal_writes(SALP_PUSH, i->descriptorWriteCount, i->pDescriptorWrites);
-    ((PFN_vkCmdPushDescriptorSet2)sal_next(get_device_data_by_cmd(cmd), SAL_PUSH2))(cmd, i);
+    ((PFN_vkCmdPushDescriptorSet2)sal_next(get_device_data_by_cmd(cmd), kind))(cmd, i);
 }
-static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSetWithTemplate(VkCommandBuffer cmd, VkDescriptorUpdateTemplate t,
-                                                                       VkPipelineLayout layout, uint32_t set, const void *data) {
+static inline void sal_push_tpl(int kind, VkCommandBuffer cmd, VkDescriptorUpdateTemplate t, VkPipelineLayout layout,
+                                uint32_t set, const void *data) {
     struct DeviceData *d = get_device_data_by_cmd(cmd);
     sal_tpl_data(SALP_PUSH, d ? d->device : VK_NULL_HANDLE, t, data);
-    ((PFN_vkCmdPushDescriptorSetWithTemplate)sal_next(d, SAL_PUSH_TPL))(cmd, t, layout, set, data);
+    ((PFN_vkCmdPushDescriptorSetWithTemplate)sal_next(d, kind))(cmd, t, layout, set, data);
 }
-static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSetWithTemplate2(VkCommandBuffer cmd, const VkPushDescriptorSetWithTemplateInfo *i) {
+static inline void sal_push_tpl2(int kind, VkCommandBuffer cmd, const VkPushDescriptorSetWithTemplateInfo *i) {
     struct DeviceData *d = get_device_data_by_cmd(cmd);
     if (i) sal_tpl_data(SALP_PUSH, d ? d->device : VK_NULL_HANDLE, i->descriptorUpdateTemplate, i->pData);
-    ((PFN_vkCmdPushDescriptorSetWithTemplate2)sal_next(d, SAL_PUSH_TPL2))(cmd, i);
+    ((PFN_vkCmdPushDescriptorSetWithTemplate2)sal_next(d, kind))(cmd, i);
 }
-static VKAPI_ATTR VkResult VKAPI_CALL sal_CreateDescriptorUpdateTemplate(VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *ci,
-                                                                         const VkAllocationCallbacks *a, VkDescriptorUpdateTemplate *t) {
-    VkResult r = ((PFN_vkCreateDescriptorUpdateTemplate)sal_next(get_device_data(device), SAL_TPL_NEW))(device, ci, a, t);
+static inline VkResult sal_tpl_create(int kind, VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *ci,
+                                      const VkAllocationCallbacks *a, VkDescriptorUpdateTemplate *t) {
+    VkResult r = ((PFN_vkCreateDescriptorUpdateTemplate)sal_next(get_device_data(device), kind))(device, ci, a, t);
     if (r == VK_SUCCESS && ci && t) sal_tpl_new(device, *t, ci);
     return r;
 }
-static VKAPI_ATTR void VKAPI_CALL sal_DestroyDescriptorUpdateTemplate(VkDevice device, VkDescriptorUpdateTemplate t,
-                                                                      const VkAllocationCallbacks *a) {
+static inline void sal_tpl_destroy(int kind, VkDevice device, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks *a) {
     if (t) {
         pthread_mutex_lock(&g_sal_tpl_m);
         sal_tpl_del_locked(device, (uint64_t)t);
         pthread_mutex_unlock(&g_sal_tpl_m);
     }
-    ((PFN_vkDestroyDescriptorUpdateTemplate)sal_next(get_device_data(device), SAL_TPL_DEL))(device, t, a);
+    ((PFN_vkDestroyDescriptorUpdateTemplate)sal_next(get_device_data(device), kind))(device, t, a);
+}
+// one wrapper per name (core and KHR), each with its own next pointer
+static VKAPI_ATTR void VKAPI_CALL sal_UpdateDescriptorSetWithTemplate(
+    VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void *data) {
+    sal_upd_tpl(SAL_UPD_TPL, device, set, t, data);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_UpdateDescriptorSetWithTemplateKHR(
+    VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void *data) {
+    sal_upd_tpl(SAL_UPD_TPL_K, device, set, t, data);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSet(
+    VkCommandBuffer cmd, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set, uint32_t n, const VkWriteDescriptorSet *w) {
+    sal_push(SAL_PUSH, cmd, bp, layout, set, n, w);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSetKHR(
+    VkCommandBuffer cmd, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set, uint32_t n, const VkWriteDescriptorSet *w) {
+    sal_push(SAL_PUSH_K, cmd, bp, layout, set, n, w);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSet2(
+    VkCommandBuffer cmd, const VkPushDescriptorSetInfo *i) {
+    sal_push2(SAL_PUSH2, cmd, i);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSet2KHR(
+    VkCommandBuffer cmd, const VkPushDescriptorSetInfo *i) {
+    sal_push2(SAL_PUSH2_K, cmd, i);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSetWithTemplate(
+    VkCommandBuffer cmd, VkDescriptorUpdateTemplate t, VkPipelineLayout layout, uint32_t set, const void *data) {
+    sal_push_tpl(SAL_PUSH_TPL, cmd, t, layout, set, data);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSetWithTemplateKHR(
+    VkCommandBuffer cmd, VkDescriptorUpdateTemplate t, VkPipelineLayout layout, uint32_t set, const void *data) {
+    sal_push_tpl(SAL_PUSH_TPL_K, cmd, t, layout, set, data);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSetWithTemplate2(
+    VkCommandBuffer cmd, const VkPushDescriptorSetWithTemplateInfo *i) {
+    sal_push_tpl2(SAL_PUSH_TPL2, cmd, i);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_CmdPushDescriptorSetWithTemplate2KHR(
+    VkCommandBuffer cmd, const VkPushDescriptorSetWithTemplateInfo *i) {
+    sal_push_tpl2(SAL_PUSH_TPL2_K, cmd, i);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL sal_CreateDescriptorUpdateTemplate(
+    VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorUpdateTemplate *t) {
+    return sal_tpl_create(SAL_TPL_NEW, device, ci, a, t);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL sal_CreateDescriptorUpdateTemplateKHR(
+    VkDevice device, const VkDescriptorUpdateTemplateCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorUpdateTemplate *t) {
+    return sal_tpl_create(SAL_TPL_NEW_K, device, ci, a, t);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_DestroyDescriptorUpdateTemplate(
+    VkDevice device, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks *a) {
+    sal_tpl_destroy(SAL_TPL_DEL, device, t, a);
+}
+static VKAPI_ATTR void VKAPI_CALL sal_DestroyDescriptorUpdateTemplateKHR(
+    VkDevice device, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks *a) {
+    sal_tpl_destroy(SAL_TPL_DEL_K, device, t, a);
 }
 static VKAPI_ATTR void VKAPI_CALL sal_GetDescriptorEXT(VkDevice device, const VkDescriptorGetInfoEXT *gi, size_t size, void *out) {
     if (gi && sal_is_ssbo(gi->type) && gi->data.pStorageBuffer) {
@@ -8520,24 +8577,19 @@ static VKAPI_ATTR void VKAPI_CALL sal_GetDescriptorEXT(VkDevice device, const Vk
     }
     ((PFN_vkGetDescriptorEXT)sal_next(get_device_data(device), SAL_GETDESC))(device, gi, size, out);
 }
+#define SAL_N2(name, kind) {"vk" #name, kind, (PFN_vkVoidFunction)sal_##name}
 static const struct { const char *name; uint8_t kind; PFN_vkVoidFunction fn; } g_sal_names[] = {
-    {"vkUpdateDescriptorSets", SAL_UPD, (PFN_vkVoidFunction)sal_UpdateDescriptorSets},
-    {"vkUpdateDescriptorSetWithTemplate", SAL_UPD_TPL, (PFN_vkVoidFunction)sal_UpdateDescriptorSetWithTemplate},
-    {"vkUpdateDescriptorSetWithTemplateKHR", SAL_UPD_TPL, (PFN_vkVoidFunction)sal_UpdateDescriptorSetWithTemplate},
-    {"vkCmdPushDescriptorSetKHR", SAL_PUSH, (PFN_vkVoidFunction)sal_CmdPushDescriptorSet},
-    {"vkCmdPushDescriptorSet", SAL_PUSH, (PFN_vkVoidFunction)sal_CmdPushDescriptorSet},
-    {"vkCmdPushDescriptorSet2", SAL_PUSH2, (PFN_vkVoidFunction)sal_CmdPushDescriptorSet2},
-    {"vkCmdPushDescriptorSet2KHR", SAL_PUSH2, (PFN_vkVoidFunction)sal_CmdPushDescriptorSet2},
-    {"vkCmdPushDescriptorSetWithTemplate", SAL_PUSH_TPL, (PFN_vkVoidFunction)sal_CmdPushDescriptorSetWithTemplate},
-    {"vkCmdPushDescriptorSetWithTemplateKHR", SAL_PUSH_TPL, (PFN_vkVoidFunction)sal_CmdPushDescriptorSetWithTemplate},
-    {"vkCmdPushDescriptorSetWithTemplate2", SAL_PUSH_TPL2, (PFN_vkVoidFunction)sal_CmdPushDescriptorSetWithTemplate2},
-    {"vkCmdPushDescriptorSetWithTemplate2KHR", SAL_PUSH_TPL2, (PFN_vkVoidFunction)sal_CmdPushDescriptorSetWithTemplate2},
-    {"vkCreateDescriptorUpdateTemplate", SAL_TPL_NEW, (PFN_vkVoidFunction)sal_CreateDescriptorUpdateTemplate},
-    {"vkCreateDescriptorUpdateTemplateKHR", SAL_TPL_NEW, (PFN_vkVoidFunction)sal_CreateDescriptorUpdateTemplate},
-    {"vkDestroyDescriptorUpdateTemplate", SAL_TPL_DEL, (PFN_vkVoidFunction)sal_DestroyDescriptorUpdateTemplate},
-    {"vkDestroyDescriptorUpdateTemplateKHR", SAL_TPL_DEL, (PFN_vkVoidFunction)sal_DestroyDescriptorUpdateTemplate},
-    {"vkGetDescriptorEXT", SAL_GETDESC, (PFN_vkVoidFunction)sal_GetDescriptorEXT},
+    SAL_N2(UpdateDescriptorSets, SAL_UPD),
+    SAL_N2(UpdateDescriptorSetWithTemplate, SAL_UPD_TPL), SAL_N2(UpdateDescriptorSetWithTemplateKHR, SAL_UPD_TPL_K),
+    SAL_N2(CmdPushDescriptorSet, SAL_PUSH), SAL_N2(CmdPushDescriptorSetKHR, SAL_PUSH_K),
+    SAL_N2(CmdPushDescriptorSet2, SAL_PUSH2), SAL_N2(CmdPushDescriptorSet2KHR, SAL_PUSH2_K),
+    SAL_N2(CmdPushDescriptorSetWithTemplate, SAL_PUSH_TPL), SAL_N2(CmdPushDescriptorSetWithTemplateKHR, SAL_PUSH_TPL_K),
+    SAL_N2(CmdPushDescriptorSetWithTemplate2, SAL_PUSH_TPL2), SAL_N2(CmdPushDescriptorSetWithTemplate2KHR, SAL_PUSH_TPL2_K),
+    SAL_N2(CreateDescriptorUpdateTemplate, SAL_TPL_NEW), SAL_N2(CreateDescriptorUpdateTemplateKHR, SAL_TPL_NEW_K),
+    SAL_N2(DestroyDescriptorUpdateTemplate, SAL_TPL_DEL), SAL_N2(DestroyDescriptorUpdateTemplateKHR, SAL_TPL_DEL_K),
+    SAL_N2(GetDescriptorEXT, SAL_GETDESC),
 };
+#undef SAL_N2
 // Called near the top of vkGetDeviceProcAddr while MALI_COMPAT_SSBO_ALIGN_LOG is on: the counting wrapper around the entry
 // point the rest of vkGetDeviceProcAddr hands out. NULL = not ours, or the name does not exist below.
 static PFN_vkVoidFunction sal_proc(VkDevice device, const char *pName) {
@@ -8551,17 +8603,12 @@ static PFN_vkVoidFunction sal_proc(VkDevice device, const char *pName) {
     PFN_vkVoidFunction inner = vkGetDeviceProcAddr(device, pName);
     tl_sal_inner = false;
     if (!inner) return NULL;
-    // One next pointer per kind (core and KHR name share it). An alias whose entry point below differs from the one already
-    // recorded is handed out unwrapped (not counted) instead of being routed to the other name's entry point.
     int kind = g_sal_names[k].kind;
-    bool wrap;
     pthread_mutex_lock(&g_sal_tpl_m);
     if (!d->sal_next[kind]) d->sal_next[kind] = inner;
-    wrap = d->sal_next[kind] == inner;
-    if (wrap && !g_sal_next_any[kind]) g_sal_next_any[kind] = inner;
+    if (!g_sal_next_any[kind]) g_sal_next_any[kind] = inner;
     pthread_mutex_unlock(&g_sal_tpl_m);
-    if (!wrap) fprintf(stderr, "mali-compat: ssbo-align: %s resolves to another entry point than its alias, not counted\n", pName);
-    return wrap ? g_sal_names[k].fn : inner;
+    return g_sal_names[k].fn;
 }
 
 static void gt_render_begin(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t colors, const VkRenderingInfo *ri) {
