@@ -3118,22 +3118,25 @@ static const char *g_device_name;
 // The old MALI_COMPAT_REAL_SUBGROUP / _REAL_ALIGN / _REAL_LIMITS keys force the real values (they win over FAKE_*), so old
 // env entries stay harmless. [keeper, Claude Opus 5.5] 2026-11-07
 static int real_on(const char *e) { return e && *e && strcmp(e, "0") != 0; }
+static int g_real_limits[2]; // [0] subgroup, [1] align: 1 when the REAL value is reported (set once, real_limits_init)
+static void real_limits_init(void) {
+    int fake_both = real_on(getenv("MALI_COMPAT_FAKE_LIMITS"));
+    int fake_sg = fake_both || real_on(getenv("MALI_COMPAT_FAKE_SUBGROUP"));
+    int fake_al = fake_both || real_on(getenv("MALI_COMPAT_FAKE_ALIGN"));
+    int real_both = real_on(getenv("MALI_COMPAT_REAL_LIMITS"));
+    int real_sg = real_both || real_on(getenv("MALI_COMPAT_REAL_SUBGROUP"));
+    int real_al = real_both || real_on(getenv("MALI_COMPAT_REAL_ALIGN"));
+    g_real_limits[0] = !fake_sg || real_sg;
+    g_real_limits[1] = !fake_al || real_al;
+    fprintf(stderr, "mali-compat: limits mode: subgroup %s, storage-buffer offset alignment %s (FAKE_SUBGROUP=%d FAKE_ALIGN=%d%s)\n",
+            g_real_limits[0] ? "real" : "widened (FAKE)", g_real_limits[1] ? "real" : "clamped to 16 (FAKE)", fake_sg, fake_al,
+            (real_sg || real_al) ? ", a REAL_* key forces real" : "");
+}
+// pthread_once: two threads asking first must not see half the config (Codex 1110-234039: v[1] still -1 read as "real").
 static int real_limits_cfg(int which) { // 0 = subgroup, 1 = align; returns 1 when the REAL value is reported
-    static int v[2] = {-1, -1};
-    if (v[0] < 0) {
-        int fake_both = real_on(getenv("MALI_COMPAT_FAKE_LIMITS"));
-        int fake_sg = fake_both || real_on(getenv("MALI_COMPAT_FAKE_SUBGROUP"));
-        int fake_al = fake_both || real_on(getenv("MALI_COMPAT_FAKE_ALIGN"));
-        int real_both = real_on(getenv("MALI_COMPAT_REAL_LIMITS"));
-        int real_sg = real_both || real_on(getenv("MALI_COMPAT_REAL_SUBGROUP"));
-        int real_al = real_both || real_on(getenv("MALI_COMPAT_REAL_ALIGN"));
-        v[0] = !fake_sg || real_sg;
-        v[1] = !fake_al || real_al;
-        fprintf(stderr, "mali-compat: limits mode: subgroup %s, storage-buffer offset alignment %s (FAKE_SUBGROUP=%d FAKE_ALIGN=%d%s)\n",
-                v[0] ? "real" : "widened (FAKE)", v[1] ? "real" : "clamped to 16 (FAKE)", fake_sg, fake_al,
-                (real_sg || real_al) ? ", a REAL_* key forces real" : "");
-    }
-    return v[which];
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, real_limits_init);
+    return g_real_limits[which];
 }
 #define real_subgroup() real_limits_cfg(0)
 #define real_align() real_limits_cfg(1)
