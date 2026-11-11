@@ -428,6 +428,7 @@ struct RtPipeline {
      * stage. A trace runs a 1-thread select kernel that reads the raygen record's stage id on the GPU and writes one
      * VkDispatchIndirectCommand per child (0x0x0 for all but the matching one). */
 #define RT_SPLIT_MAX 8
+#define RT_PC_LOCAL1D 0x100u   /* local1d-1112: flag bit in RtDispatchPushConstants.indirect_mode (direct traces only) */
     struct RtPipeline     *split[RT_SPLIT_MAX];
     uint32_t               split_rgen[RT_SPLIT_MAX];
     uint32_t               split_n;
@@ -509,6 +510,9 @@ struct RtEnv {
     uint32_t split_min; /* MALI_COMPAT_RT_SPLIT_MIN=N: smallest pipeline (stage count) that is split (default 12) */
     uint32_t split_jobs;/* MALI_COMPAT_RT_SPLIT_JOBS=N (1..16): split-child megakernels compiled at the same time (default 2;
                          * an unsplit W3 load compiles its 80- and 82-stage kernels on 2 threads, a split one has 8 children) */
+    int local1d;        /* local1d-1112 MALI_COMPAT_RT_LOCAL1D=1: a direct trace with height < 4 runs 32 consecutive x per
+                         * workgroup (launch id = (wg.x*32 + LocalInvocationIndex, wg.y, wg.z)) instead of 8x4 tiles, of
+                         * which 3 of 4 rows are out of bounds for a height-1 launch (default 0) */
 };
 static struct RtEnv    g_rt_env;
 static pthread_once_t  g_rt_env_once = PTHREAD_ONCE_INIT;
@@ -542,6 +546,7 @@ static void rt_env_init(void) {
     e = getenv("MALI_COMPAT_RT_MEM_LOG_S");    g_rt_env.mem_log_s    = e ? (uint32_t)(atoi(e) > 0 ? atoi(e) : 0) : 10u;
     e = getenv("MALI_COMPAT_RT_SPLIT");        g_rt_env.split        = (e && e[0] == '1') ? 1 : 0;
     e = getenv("MALI_COMPAT_RT_SPLIT_MIN");    g_rt_env.split_min    = (e && atoi(e) > 0) ? (uint32_t)atoi(e) : 12u;
+    e = getenv("MALI_COMPAT_RT_LOCAL1D");      g_rt_env.local1d      = (e && e[0] == '1') ? 1 : 0;
     e = getenv("MALI_COMPAT_RT_SPLIT_JOBS");   g_rt_env.split_jobs   = (e && atoi(e) >= 1 && atoi(e) <= 16) ? (uint32_t)atoi(e) : 2u;
     e = getenv("MALI_COMPAT_RT_GUARD_ITERS");
     int gv = e ? atoi(e) : 0;
@@ -586,6 +591,9 @@ static void rt_env_init(void) {
         LOG("rt_split: MALI_COMPAT_RT_SPLIT=1 -> pipelines with >= %u stages and 2..%d raygen stages get one megakernel "
             "per raygen (GPU-side select + indirect dispatch per trace), %u child compiles at a time", g_rt_env.split_min,
             RT_SPLIT_MAX, g_rt_env.split_jobs);
+    if (g_rt_env.local1d)
+        LOG("rt_local1d: MALI_COMPAT_RT_LOCAL1D=1 -> direct traces with height < 4 dispatch (ceil(w/32), h, d) groups, "
+            "launch id x = workgroup x * 32 + local index (8x4 tiles otherwise)");
     if (g_rt_env.build_log)
         LOG("rt_build: MALI_COMPAT_RT_BUILD_LOG=%u -> per-build lines for the first %u calls and %u calls after the "
             "first TraceRays", g_rt_env.build_log, g_rt_env.build_log, g_rt_env.build_log);
@@ -648,6 +656,7 @@ static const char *const g_ray_cls_name[RT_RAY_CLASSES] = { "1-6", "7-8", "9-14"
 static _Atomic uint64_t g_ray_traces, g_ray_rays, g_ray_cls_tr[RT_RAY_CLASSES], g_ray_cls_rays[RT_RAY_CLASSES],
                         g_ray_ind, g_ray_skip_zero, g_ray_skip_nostate;
 static _Atomic uint64_t g_split_traces, g_split_select, g_split_fallback;   /* split-1112 (record time) */
+static _Atomic uint64_t g_local1d_traces;                                   /* local1d-1112 (record time) */
 static inline unsigned rt_ray_class(uint32_t stages) {
     return stages <= 6 ? 0u : stages <= 8 ? 1u : stages <= 14 ? 2u : stages <= 40 ? 3u : 4u;
 }
@@ -4582,6 +4591,18 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     uint32_t lh          = rt_emit_load_pc_member(mb, b, 13, false);
     uint32_t ld          = rt_emit_load_pc_member(mb, b, 14, false);
     uint32_t ind_mode    = rt_emit_load_pc_member(mb, b, 15, false);
+    /* local1d-1112: bit RT_PC_LOCAL1D of indirect_mode = this direct dispatch uses the 1-D launch-id mapping; only
+     * emitted with MALI_COMPAT_RT_LOCAL1D=1 (without it the SPIR-V is unchanged) */
+    const bool local1d = rt_env()->local1d != 0;
+    uint32_t l1d_flag = 0;
+    if (local1d) {
+        uint32_t raw = ind_mode, fl = rt_alloc_id(mb), md = rt_alloc_id(mb);
+        spv_emit_op4(b, RT_OP_BITWISE_AND, mb->t_u32, fl, raw, rt_get_const_u32(mb, RT_PC_LOCAL1D));
+        spv_emit_op4(b, RT_OP_BITWISE_AND, mb->t_u32, md, raw, rt_get_const_u32(mb, 0xffu));
+        l1d_flag = rt_alloc_id(mb);
+        spv_emit_op4(b, RT_OP_INOT_EQUAL, mb->t_bool, l1d_flag, fl, mb->c_u32_0);
+        ind_mode = md;
+    }
     uint32_t pc_bda      = rt_emit_load_pc_member(mb, b, 16, true);
     uint32_t ind_bda     = rt_emit_load_pc_member(mb, b, 17, true);
 
@@ -4679,6 +4700,31 @@ static void rt_emit_main_fn(struct RtMegaBuilder *mb,
     uint32_t gid   = rt_alloc_id(mb);
     uint32_t lsize = rt_alloc_id(mb);
     spv_emit_op3(b, RT_OP_LOAD, mb->t_v3u32, gid,   mb->v_gl_global_inv_id);
+    if (local1d) {   /* gid = flag ? (wg.x*32 + local index, wg.y, wg.z) : GlobalInvocationId */
+        uint32_t t_pin_u32 = rt_find_or_emit_type(mb, RT_OP_TYPE_POINTER, RT_SC_INPUT, mb->t_u32, 0);
+        uint32_t v_wg = rt_emit_global_var(mb, mb->t_ptr_input_v3u32, RT_SC_INPUT);
+        spv_emit_op3(&mb->decorations, RT_OP_DECORATE, v_wg, RT_DEC_BUILTIN, 26u /* WorkgroupId */);
+        uint32_t v_li = rt_emit_global_var(mb, t_pin_u32, RT_SC_INPUT);
+        spv_emit_op3(&mb->decorations, RT_OP_DECORATE, v_li, RT_DEC_BUILTIN, 29u /* LocalInvocationIndex */);
+        uint32_t wg = rt_alloc_id(mb), li = rt_alloc_id(mb);
+        spv_emit_op3(b, RT_OP_LOAD, mb->t_v3u32, wg, v_wg);
+        spv_emit_op3(b, RT_OP_LOAD, mb->t_u32, li, v_li);
+        uint32_t c[3], g[3], o[3];
+        for (uint32_t q = 0; q < 3; q++) {
+            c[q] = rt_alloc_id(mb); g[q] = rt_alloc_id(mb); o[q] = rt_alloc_id(mb);
+            spv_emit_op4(b, RT_OP_COMPOSITE_EXTRACT, mb->t_u32, c[q], wg, q);
+            spv_emit_op4(b, RT_OP_COMPOSITE_EXTRACT, mb->t_u32, g[q], gid, q);
+        }
+        uint32_t x32 = rt_alloc_id(mb), x1 = rt_alloc_id(mb);
+        spv_emit_op4(b, RT_OP_IMUL, mb->t_u32, x32, c[0], mb->c_u32_32);
+        spv_emit_op4(b, RT_OP_IADD, mb->t_u32, x1, x32, li);
+        spv_emit_op5(b, RT_OP_SELECT, mb->t_u32, o[0], l1d_flag, x1, g[0]);
+        spv_emit_op5(b, RT_OP_SELECT, mb->t_u32, o[1], l1d_flag, c[1], g[1]);
+        spv_emit_op5(b, RT_OP_SELECT, mb->t_u32, o[2], l1d_flag, c[2], g[2]);
+        uint32_t gid2 = rt_alloc_id(mb);
+        spv_emit_op5(b, RT_OP_COMPOSITE_CONSTRUCT, mb->t_v3u32, gid2, o[0], o[1], o[2]);
+        gid = gid2;
+    }
     spv_emit_op3(b, RT_OP_LOAD, mb->t_v3u32, lsize, mb->g_launch_size);
 
     uint32_t gx = rt_alloc_id(mb), gy = rt_alloc_id(mb), gz = rt_alloc_id(mb);
@@ -6105,9 +6151,14 @@ static void rt_split_dispatch(struct DeviceData *d, VkCommandBuffer cmd, struct 
         sp.dst_bda   = dst;
         sp.ind_bda   = pc->indirect_mode ? pc->indirect_bda : 0ULL;
         sp.zero_bda  = zero;
-        sp.mode      = pc->indirect_mode;
+        sp.mode      = pc->indirect_mode & 0xffu;
         sp.count     = rp->split_n;
         sp.w = w; sp.h = h; sp.d = dpt;
+        if (pc->indirect_mode & RT_PC_LOCAL1D) {   /* local1d-1112: the select kernel computes ((w+7)>>3, (h+3)>>2, d):
+                                                    * feed it values that give (ceil(w/32), h, d) */
+            sp.w = ((w + 31u) / 32u) * 8u;
+            sp.h = h * 4u;
+        }
         sp.rgen_size = pc->rgen_size;
         for (uint32_t k = 0; k < rp->split_n; k++) sp.ids[k] = rp->split_rgen[k];
         d->fpCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->rt_split_pipeline);
@@ -6144,9 +6195,11 @@ static void rt_split_dispatch(struct DeviceData *d, VkCommandBuffer cmd, struct 
                                     0, 1, &ib, 0, NULL, 0, NULL);
         }
     }
+    const bool l1d = (pc->indirect_mode & RT_PC_LOCAL1D) != 0;
     for (uint32_t k = 0; k < rp->split_n; k++) {
         rt_prepare_and_bind_megakernel(d, cmd, cs, rp->split[k], pc);
-        if (!pc->indirect_mode) d->fpCmdDispatch(cmd, (w + 7u) / 8u, (h + 3u) / 4u, dpt);
+        if (l1d) d->fpCmdDispatch(cmd, (w + 31u) / 32u, h, dpt);
+        else if (!pc->indirect_mode) d->fpCmdDispatch(cmd, (w + 7u) / 8u, (h + 3u) / 4u, dpt);
         else if (ind_dst) d->fpCmdDispatchIndirect(cmd, d->rt_ring_buf, (VkDeviceSize)ind_off);
         else d->fpCmdDispatch(cmd, 256, 256, 1);
     }
@@ -6269,12 +6322,18 @@ compat_CmdTraceRaysKHR(
                                 0, NULL);
     }
 
+    /* local1d-1112: a direct trace with height < 4 runs 32 consecutive x per workgroup (see RT_PC_LOCAL1D) */
+    const bool l1d = rt_env()->local1d && height < 4u;
+    if (l1d) {
+        pc.indirect_mode |= RT_PC_LOCAL1D;
+        atomic_fetch_add_explicit(&g_local1d_traces, 1, memory_order_relaxed);
+    }
     if (rp->split_n) {
         rt_split_dispatch(d, commandBuffer, cs, rp, &pc, width, height, depth);   /* split-1112 */
     } else {
         rt_prepare_and_bind_megakernel(d, commandBuffer, cs, rp, &pc);
-        uint32_t gx = (width  + 7u) / 8u;
-        uint32_t gy = (height + 3u) / 4u;
+        uint32_t gx = l1d ? (width + 31u) / 32u : (width + 7u) / 8u;
+        uint32_t gy = l1d ? height : (height + 3u) / 4u;
         uint32_t gz = depth;
         d->fpCmdDispatch(commandBuffer, gx, gy, gz);
     }
@@ -8774,6 +8833,9 @@ static void rt_report(struct DeviceData *d, bool final) {
         (unsigned long long)atomic_load(&g_rt_skip_nopipe), (unsigned long long)atomic_load(&g_ray_skip_zero),
         (unsigned long long)atomic_load(&g_ray_skip_nostate), (unsigned long long)tr, (unsigned long long)rays,
         (unsigned long long)ind);
+    if (rt_env()->local1d)
+        LOG("rt_local1d: t=%lld ms%s 1-D direct traces total=%llu (record time)", (long long)now, tag,
+            (unsigned long long)atomic_load(&g_local1d_traces));
     if (rt_env()->split)
         LOG("rt_split: t=%lld ms%s split traces total=%llu gpu_select=%llu fallback=%llu (record time)", (long long)now,
             tag, (unsigned long long)atomic_load(&g_split_traces), (unsigned long long)atomic_load(&g_split_select),
