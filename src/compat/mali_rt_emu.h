@@ -1197,7 +1197,7 @@ static void rt_free_pipeline_obj_fp(VkDevice dev, PFN_vkDestroyPipeline fp_dp, P
         fp_dp(dev, victim->compute_pipeline, pAllocator);
     }
     if (victim->compute_module && fp_dm) {
-        fp_dm(dev, victim->compute_module, victim->compile_null_alloc ? NULL : pAllocator);
+        fp_dm(dev, victim->compute_module, NULL);   /* round 4: always created with NULL callbacks */
     }
     for (uint32_t i = 0; i < victim->stage_count; i++) {
         rt_free_stage_record(&victim->stages[i]);
@@ -5214,11 +5214,13 @@ compat_CreateRayTracingPipelinesKHR(
                     .pCode    = mega_spv,
                 };
                 COMPAT_INFO("CRTP [%u/%u]: calling fpCreateShaderModule...", i + 1, createInfoCount);
-                VkResult sm_res = d->fpCreateShaderModule(device, &smci, pAllocator, &rp->compute_module);
+                /* round 4 (Codex r4b #3): a layer-internal object - created and destroyed with NULL callbacks on every path
+                 * (the async worker cannot use the app's allocator; before, async compiles destroyed it with NULL anyway) */
+                VkResult sm_res = d->fpCreateShaderModule(device, &smci, NULL, &rp->compute_module);
                 COMPAT_INFO("CRTP [%u/%u]: fpCreateShaderModule result=%d module=%p", i + 1, createInfoCount, sm_res, (void *)rp->compute_module);
                 free(mega_spv);
                 if (sm_res == VK_SUCCESS && rp->compute_module) {
-                    rp->module_app_alloc = pAllocator != NULL;
+                    rp->module_app_alloc = false;   /* round 4: created with NULL callbacks */
                     rp->mega_bytes = mega_words * sizeof(uint32_t);
                     rt_acct_add(&g_acct_mega_mod, (int64_t)rp->mega_bytes);
                 }
@@ -5303,7 +5305,7 @@ compat_CreateRayTracingPipelinesKHR(
                         }
                         /* round 4 lever MALI_COMPAT_RT_FREE_STAGES=1 (sync compile: created with pAllocator) */
                         if (rt_env()->free_stages && rp->compute_module && d->fpDestroyShaderModule) {
-                            d->fpDestroyShaderModule(device, rp->compute_module, pAllocator);
+                            d->fpDestroyShaderModule(device, rp->compute_module, NULL);
                             rp->compute_module = VK_NULL_HANDLE;
                             if (rp->mega_bytes) rt_acct_sub(&g_acct_mega_mod, (int64_t)rp->mega_bytes);
                         }
@@ -7017,7 +7019,8 @@ static uint32_t rt_assign_as_scratch(struct DeviceData *d, uint32_t count,
         atomic_fetch_add(&g_rt_scr_builds, 1);
         /* round 4 (Codex r4 #1): a BUILD the LAYER made from an UPDATE must fit its destination's storage; now that the
          * driver's size for this build is known (also when the track's build_size was unknown) - otherwise dropped */
-        if (plan[i].need_pool && plan[i].drv_as && plan[i].storage && plan[i].drv_as > plan[i].storage) {
+        /* (Codex r4b #1: a failed size query, drv_as 0, cannot prove the fit either -> dropped too) */
+        if (plan[i].need_pool && plan[i].storage && (!plan[i].drv_as || plan[i].drv_as > plan[i].storage)) {
             uint64_t n = atomic_fetch_add(&g_rt_build_nofit, 1) + 1;
             static _Atomic int64_t bn_ms = 0;
             int64_t now = rt_now_ms(), pv = atomic_load(&bn_ms);
@@ -7281,6 +7284,8 @@ static void rt_build_passthrough(struct DeviceData *d, VkCommandBuffer cmd, uint
                     why = "type does not match the active handle";
                 else if (upd && t->built_type != RT_AS_TYPE_UNBUILT && t->built_type != pInfos[i].type)
                     why = "UPDATE of another type";
+                else if (upd && t->built_type == RT_AS_TYPE_UNBUILT)   /* round 4 (Codex r4b #2) */
+                    why = "UPDATE of an unbuilt AS";
                 else if (upd && clone_refit && !t->refit_ready && (!st || st == t))
                     why = "first UPDATE after a copy";
                 /* round 4 (Codex r3 #6): an untracked source different from dst counts as other-source too */
