@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * mali_rt_emu.h — VK_KHR_ray_tracing_pipeline Emulation over VK_KHR_ray_query
  *
@@ -6706,6 +6707,9 @@ static int rt_fex_phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
 }
 
 static void rt_patch_fex_thunks(void) {
+    /* rt-gate-1112: only for the RT emulation. Without MALI_COMPAT_RT_PIPELINE the FEX thunk table keeps what FEX
+     * resolved (MALI_COMPAT_AS_FIX alone reaches the AS hooks through vkGetDeviceProcAddr, as every layer hook). */
+    if (!g_rt_pipeline) return;
     static _Atomic int s_patched = 0;
     if (atomic_exchange(&s_patched, 1) != 0) return;
 

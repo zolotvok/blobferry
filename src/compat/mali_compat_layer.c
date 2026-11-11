@@ -123,6 +123,12 @@ static bool g_dump_spirv, g_dump_inflight, g_log_pipelines, g_log_images; // che
 // device/feature/extension reporting code advertises VK_KHR_ray_tracing_pipeline + rayTracingPipeline when
 // g_rt_pipeline && rt_pipeline_emulation_available(). Keep src/compat/capabilities.json.in ("rt_pipeline") in step.
 static bool g_rt_pipeline;
+// rt-gate-1112 [RTX keeper, Claude Opus 5.5] 2026-11-11: g_as_hooks = g_rt_pipeline || MALI_COMPAT_AS_FIX=1 (default 0).
+// It gates the acceleration-structure part of the RT emulation (AS tracking, the layer-side CLONE copy that avoids the
+// blob's CLONE overrun (as-probe 11-10), build planning/scratch, AS BDA checks, the AS-buffer transfer bits) separately
+// from the RT pipeline emulation, so a ray-query game can opt in to it without MALI_COMPAT_RT_PIPELINE. With both keys
+// unset every AS call goes to the next layer untouched, also through the exported entry points (no FEX thunk patch).
+static bool g_as_hooks;
 static bool rt_pipeline_emulation_available(void) { return true; }
 static bool g_bc_afrc = true; // MALI_COMPAT_BC_AFRC=0 turns the fixed-rate BC shadows off
 static void dump_spirv(const uint32_t *orig, size_t orig_bytes, const uint32_t *patched, size_t patched_bytes) {
@@ -6132,6 +6138,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
         if (mod.usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT)) {
             mod.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         }
+    }
+    if (g_as_hooks) {   /* rt-gate-1112: the AS part, also with MALI_COMPAT_AS_FIX=1 alone */
         /* lead-1110c: the layer clones ASes with vkCmdCopyBuffer (mali_rt_emu.h compat_CmdCopyAccelerationStructureKHR):
          * every AS storage buffer gets both transfer bits (after the rules above, so they add nothing else). With a
          * VkBufferUsageFlags2CreateInfo in pNext (maintenance5: it replaces .usage) the buffer is left as it is and is
@@ -6155,7 +6163,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
     return r;
 }
 
-/* lead-1110c: only with MALI_COMPAT_RT_PIPELINE: forgets the buffer in the layer's AS-transfer set (a reused handle
+/* lead-1110c: only with MALI_COMPAT_RT_PIPELINE (rt-gate-1112: or MALI_COMPAT_AS_FIX): forgets the buffer in the layer's AS-transfer set (a reused handle
  * must not inherit the record), then the normal destroy (desc-capture's when it is on). */
 static VKAPI_ATTR void VKAPI_CALL compat_RtDestroyBuffer(VkDevice device, VkBuffer b, const VkAllocationCallbacks *a) {
     if (b) rt_xfer_buf_remove(b);
@@ -6443,7 +6451,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
     uint32_t heap = fd_import || mod.memoryTypeIndex >= VK_MAX_MEMORY_TYPES ? BUDGET_NO_HEAP : d->type_heap[mod.memoryTypeIndex];
     if (res == VK_SUCCESS) {
         atomic_fetch_add(&g_allocated_bytes, pAllocateInfo->allocationSize);
-        if (mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex, heap) && g_rt_pipeline)
+        if (mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex, heap) && g_as_hooks)
             rt_vkmem_alloc(mod.memoryTypeIndex, heap, pAllocateInfo->allocationSize);   /* round 4: vk_mem line */
         if (g_dc_on) dc_mem_alloc(d, device, *pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex, dc_mem_devaddr(mod.pNext));
         if (g_memlog) {
@@ -6530,7 +6538,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_FreeMemory(
     }
     struct MemInfo *e = memory ? mem_remove(memory) : NULL;
     if (e) budget_sub(e->heap, e->size);
-    if (e && g_rt_pipeline) rt_vkmem_free(e->type, e->heap, e->size);   /* round 4: vk_mem line */
+    if (e && g_as_hooks) rt_vkmem_free(e->type, e->heap, e->size);   /* round 4: vk_mem line */
     if (g_dc_on) dc_dead(DCK_MEM, (uint64_t)memory);
     if (g_memlog && memory)
         ml_event('F', (uint64_t)(uintptr_t)memory, e ? e->size : 0, e ? e->type : ML_NONE, e ? e->heap : BUDGET_NO_HEAP,
@@ -9087,6 +9095,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     g_dsl_stage_retry = getenv("MALI_COMPAT_DSL_STAGE_RETRY") && atoi(getenv("MALI_COMPAT_DSL_STAGE_RETRY")) > 0;
     g_log_images = access("/root/mali-images.txt", W_OK) == 0;
     g_rt_pipeline = getenv("MALI_COMPAT_RT_PIPELINE") && strcmp(getenv("MALI_COMPAT_RT_PIPELINE"), "0") != 0;
+    g_as_hooks = g_rt_pipeline || (getenv("MALI_COMPAT_AS_FIX") && strcmp(getenv("MALI_COMPAT_AS_FIX"), "0") != 0);
     sal_init(); // MALI_COMPAT_SSBO_ALIGN_LOG (pthread_once)
     g_bc_afrc = !getenv("MALI_COMPAT_BC_AFRC") || strcmp(getenv("MALI_COMPAT_BC_AFRC"), "0") != 0;
     bool rt = getenv("MALI_COMPAT_RT_COMPRESS") && strcmp(getenv("MALI_COMPAT_RT_COMPRESS"), "0") != 0;
@@ -9235,6 +9244,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
     if (g_rt_pipeline) {
         fprintf(stderr, "mali-compat: RT pipeline (VK_KHR_ray_tracing_pipeline -> VK_KHR_ray_query megakernel) enabled\n");
         rt_patch_fex_thunks();
+    } else if (g_as_hooks) {
+        fprintf(stderr, "mali-compat: AS fix (MALI_COMPAT_AS_FIX=1): acceleration-structure hooks on, RT pipeline emulation off\n");
     }
     LOG("created VkInstance %p (key=%p)", (void *)*pInstance, *pInstance ? *(void **)*pInstance : NULL);
     return VK_SUCCESS;
@@ -9918,7 +9929,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
         }
         if (d->rt_scratch_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_scratch_buf, NULL);
         if (d->rt_scratch_mem && d->fpFreeMemory) d->fpFreeMemory(device, d->rt_scratch_mem, NULL);
-        if (g_rt_pipeline) rt_device_gone(d);   /* round 4: the layer's RT allocations leave rt_mem; final lines */
+        if (g_as_hooks) rt_device_gone(d);   /* round 4: the layer's RT allocations leave rt_mem; final lines */
         pthread_mutex_destroy(&d->bc_lock);
         destroy_staging_pool(d);
         if (d->fpDestroyDevice && device)
@@ -10018,7 +10029,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     }
     // round 4 (Codex r3 #5): with RT_PIPELINE the AS-buffer map must see every destroy, also in desc-capture mode
     // (compat_RtDestroyBuffer chains to desc-capture's destroy itself), so this comes before dc_proc.
-    if (g_rt_pipeline && !strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;
+    if (g_as_hooks && !strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;
     if (g_dc_on) { PFN_vkVoidFunction dh = dc_proc(device, pName); if (dh) return dh; } // desc-capture-1
     #define MATCH_DEV(fn) if (!strcmp(pName, "vk" #fn)) return (PFN_vkVoidFunction)compat_##fn
     if (g_memlog) { // MALI_COMPAT_MEMLOG only: vkMapMemory for the M events, queue submits for the S events
@@ -10092,7 +10103,6 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     }
     if (g_rt_pipeline) {
         rt_patch_fex_thunks();
-        if (!strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;   /* lead-1110c */
         if (!strcmp(pName, "vkCreateRayTracingPipelinesKHR") || !strcmp(pName, "vkCreateRayTracingPipelinesNV")) return (PFN_vkVoidFunction)compat_CreateRayTracingPipelinesKHR;
         if (!strcmp(pName, "vkGetRayTracingShaderGroupHandlesKHR") || !strcmp(pName, "vkGetRayTracingShaderGroupHandlesNV")) return (PFN_vkVoidFunction)compat_GetRayTracingShaderGroupHandlesKHR;
         if (!strcmp(pName, "vkGetRayTracingCaptureReplayShaderGroupHandlesKHR")) return (PFN_vkVoidFunction)compat_GetRayTracingCaptureReplayShaderGroupHandlesKHR;
@@ -10116,6 +10126,9 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
             struct DeviceData *dd = get_device_data(device);
             if (dd && dd->fpCmdSetDescriptorBufferOffsetsEXT) return (PFN_vkVoidFunction)compat_RtCmdSetDescriptorBufferOffsetsEXT;
         }
+    }
+    if (g_as_hooks) {   /* rt-gate-1112: the AS hooks, also with MALI_COMPAT_AS_FIX=1 alone */
+        if (!strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;   /* lead-1110c */
         if (!strcmp(pName, "vkCreateAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_CreateAccelerationStructureKHR;
         if (!strcmp(pName, "vkDestroyAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_DestroyAccelerationStructureKHR;
         if (!strcmp(pName, "vkCmdBuildAccelerationStructuresKHR")) return (PFN_vkVoidFunction)compat_CmdBuildAccelerationStructuresKHR;
@@ -10246,7 +10259,6 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
     MATCH_DEV2(FreeCommandBuffers);
     if (g_rt_pipeline) {
         rt_patch_fex_thunks();
-        if (!strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;   /* lead-1110c */
         MATCH_DEV2(CreateRayTracingPipelinesKHR);
         MATCH_DEV2(GetRayTracingShaderGroupHandlesKHR);
         if (!strcmp(pName, "vkCreateRayTracingPipelinesNV")) return (PFN_vkVoidFunction)compat_CreateRayTracingPipelinesKHR;
@@ -10269,6 +10281,9 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
         if (!strcmp(pName, "vkDestroyPipelineLayout")) return (PFN_vkVoidFunction)compat_RtDestroyPipelineLayout;
         if (!strcmp(pName, "vkCmdBindDescriptorSets")) return (PFN_vkVoidFunction)compat_RtCmdBindDescriptorSets;
         if (!strcmp(pName, "vkCmdSetDescriptorBufferOffsetsEXT")) return (PFN_vkVoidFunction)compat_RtCmdSetDescriptorBufferOffsetsEXT;
+    }
+    if (g_as_hooks) {   /* rt-gate-1112: the AS hooks, also with MALI_COMPAT_AS_FIX=1 alone */
+        if (!strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;   /* lead-1110c */
         if (!strcmp(pName, "vkCreateAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_CreateAccelerationStructureKHR;
         if (!strcmp(pName, "vkDestroyAccelerationStructureKHR")) return (PFN_vkVoidFunction)compat_DestroyAccelerationStructureKHR;
         if (!strcmp(pName, "vkCmdBuildAccelerationStructuresKHR")) return (PFN_vkVoidFunction)compat_CmdBuildAccelerationStructuresKHR;
@@ -10324,10 +10339,30 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(
 }
 
 /* ── Exported RT Entry Points (for FEX dlsym global resolution fallback) ──── */
+/* rt-gate-1112 [RTX keeper, Claude Opus 5.5] 2026-11-11: these 16 symbols are exported in every build, so the RT/AS
+ * emulation must not be reachable through them with RT off. The 9 RT-pipeline exports reach the emulation (and patch
+ * the FEX thunks) only with MALI_COMPAT_RT_PIPELINE; otherwise they forward by name to the next layer (the blob has no
+ * VK_KHR_ray_tracing_pipeline, so there they end as VK_ERROR_EXTENSION_NOT_PRESENT / 0 / no-op). The 7 AS exports reach
+ * the AS hooks only with g_as_hooks (RT_PIPELINE or MALI_COMPAT_AS_FIX), otherwise the next layer's function, which
+ * vkCreateDevice loaded for every device - the same route vkGetDeviceProcAddr gives in that mode. */
+
+static PFN_vkVoidFunction rt_export_next(VkDevice device, const char *name) {
+    struct DeviceData *d = device ? get_device_data(device) : NULL;
+    return d && d->get_device_proc_addr ? d->get_device_proc_addr(d->device, name) : NULL;
+}
+static PFN_vkVoidFunction rt_export_next_cmd(VkCommandBuffer cmd, const char *name) {
+    struct DeviceData *d = cmd ? get_device_data_by_cmd(cmd) : NULL;
+    return d && d->get_device_proc_addr ? d->get_device_proc_addr(d->device, name) : NULL;
+}
 
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetRayTracingShaderGroupHandlesKHR(
     VkDevice device, VkPipeline pipeline, uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void *pData)
 {
+    if (!g_rt_pipeline) {
+        PFN_vkGetRayTracingShaderGroupHandlesKHR f = (PFN_vkGetRayTracingShaderGroupHandlesKHR)
+            rt_export_next(device, "vkGetRayTracingShaderGroupHandlesKHR");
+        return f ? f(device, pipeline, firstGroup, groupCount, dataSize, pData) : VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
     rt_patch_fex_thunks();
     return compat_GetRayTracingShaderGroupHandlesKHR(device, pipeline, firstGroup, groupCount, dataSize, pData);
 }
@@ -10335,6 +10370,11 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetRayTracingShaderGroupHandlesKHR(
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetRayTracingShaderGroupHandlesNV(
     VkDevice device, VkPipeline pipeline, uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void *pData)
 {
+    if (!g_rt_pipeline) {
+        PFN_vkGetRayTracingShaderGroupHandlesKHR f = (PFN_vkGetRayTracingShaderGroupHandlesKHR)
+            rt_export_next(device, "vkGetRayTracingShaderGroupHandlesNV");
+        return f ? f(device, pipeline, firstGroup, groupCount, dataSize, pData) : VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
     rt_patch_fex_thunks();
     return compat_GetRayTracingShaderGroupHandlesKHR(device, pipeline, firstGroup, groupCount, dataSize, pData);
 }
@@ -10347,6 +10387,12 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdTraceRaysKHR(
     const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
     uint32_t width, uint32_t height, uint32_t depth)
 {
+    if (!g_rt_pipeline) {
+        PFN_vkCmdTraceRaysKHR f = (PFN_vkCmdTraceRaysKHR)rt_export_next_cmd(commandBuffer, "vkCmdTraceRaysKHR");
+        if (f) f(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable,
+                 pCallableShaderBindingTable, width, height, depth);
+        return;
+    }
     rt_patch_fex_thunks();
     compat_CmdTraceRaysKHR(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable,
                            pHitShaderBindingTable, pCallableShaderBindingTable, width, height, depth);
@@ -10357,6 +10403,12 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRayTracingPipelinesKHR(
     uint32_t createInfoCount, const VkRayTracingPipelineCreateInfoKHR *pCreateInfos,
     const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines)
 {
+    if (!g_rt_pipeline) {
+        PFN_vkCreateRayTracingPipelinesKHR f = (PFN_vkCreateRayTracingPipelinesKHR)
+            rt_export_next(device, "vkCreateRayTracingPipelinesKHR");
+        return f ? f(device, deferredOperation, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines)
+                 : VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
     rt_patch_fex_thunks();
     return compat_CreateRayTracingPipelinesKHR(device, deferredOperation, pipelineCache,
                                                createInfoCount, pCreateInfos, pAllocator, pPipelines);
@@ -10365,6 +10417,11 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRayTracingPipelinesKHR(
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(
     VkDevice device, VkPipeline pipeline, uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void *pData)
 {
+    if (!g_rt_pipeline) {
+        PFN_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR f = (PFN_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR)
+            rt_export_next(device, "vkGetRayTracingCaptureReplayShaderGroupHandlesKHR");
+        return f ? f(device, pipeline, firstGroup, groupCount, dataSize, pData) : VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
     rt_patch_fex_thunks();
     return compat_GetRayTracingCaptureReplayShaderGroupHandlesKHR(device, pipeline, firstGroup,
                                                                  groupCount, dataSize, pData);
@@ -10378,6 +10435,13 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdTraceRaysIndirectKHR(
     const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
     VkDeviceAddress indirectDeviceAddress)
 {
+    if (!g_rt_pipeline) {
+        PFN_vkCmdTraceRaysIndirectKHR f = (PFN_vkCmdTraceRaysIndirectKHR)
+            rt_export_next_cmd(commandBuffer, "vkCmdTraceRaysIndirectKHR");
+        if (f) f(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable,
+                 pCallableShaderBindingTable, indirectDeviceAddress);
+        return;
+    }
     rt_patch_fex_thunks();
     compat_CmdTraceRaysIndirectKHR(commandBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable,
                                    pHitShaderBindingTable, pCallableShaderBindingTable, indirectDeviceAddress);
@@ -10386,6 +10450,12 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdTraceRaysIndirectKHR(
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdTraceRaysIndirect2KHR(
     VkCommandBuffer commandBuffer, VkDeviceAddress indirectDeviceAddress)
 {
+    if (!g_rt_pipeline) {
+        PFN_vkCmdTraceRaysIndirect2KHR f = (PFN_vkCmdTraceRaysIndirect2KHR)
+            rt_export_next_cmd(commandBuffer, "vkCmdTraceRaysIndirect2KHR");
+        if (f) f(commandBuffer, indirectDeviceAddress);
+        return;
+    }
     rt_patch_fex_thunks();
     compat_CmdTraceRaysIndirect2KHR(commandBuffer, indirectDeviceAddress);
 }
@@ -10393,6 +10463,11 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdTraceRaysIndirect2KHR(
 EXPORT VKAPI_ATTR VkDeviceSize VKAPI_CALL vkGetRayTracingShaderGroupStackSizeKHR(
     VkDevice device, VkPipeline pipeline, uint32_t group, VkShaderGroupShaderKHR groupShader)
 {
+    if (!g_rt_pipeline) {
+        PFN_vkGetRayTracingShaderGroupStackSizeKHR f = (PFN_vkGetRayTracingShaderGroupStackSizeKHR)
+            rt_export_next(device, "vkGetRayTracingShaderGroupStackSizeKHR");
+        return f ? f(device, pipeline, group, groupShader) : 0;
+    }
     rt_patch_fex_thunks();
     return compat_GetRayTracingShaderGroupStackSizeKHR(device, pipeline, group, groupShader);
 }
@@ -10400,6 +10475,12 @@ EXPORT VKAPI_ATTR VkDeviceSize VKAPI_CALL vkGetRayTracingShaderGroupStackSizeKHR
 EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRayTracingPipelineStackSizeKHR(
     VkCommandBuffer commandBuffer, uint32_t pipelineStackSize)
 {
+    if (!g_rt_pipeline) {
+        PFN_vkCmdSetRayTracingPipelineStackSizeKHR f = (PFN_vkCmdSetRayTracingPipelineStackSizeKHR)
+            rt_export_next_cmd(commandBuffer, "vkCmdSetRayTracingPipelineStackSizeKHR");
+        if (f) f(commandBuffer, pipelineStackSize);
+        return;
+    }
     rt_patch_fex_thunks();
     compat_CmdSetRayTracingPipelineStackSizeKHR(commandBuffer, pipelineStackSize);
 }
@@ -10410,6 +10491,12 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateAccelerationStructureKHR(
     const VkAllocationCallbacks *pAllocator,
     VkAccelerationStructureKHR *pAccelerationStructure)
 {
+    if (!g_as_hooks) {
+        struct DeviceData *d = get_device_data(device);
+        return d && d->fpCreateAccelerationStructureKHR
+            ? d->fpCreateAccelerationStructureKHR(device, pCreateInfo, pAllocator, pAccelerationStructure)
+            : VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
     rt_patch_fex_thunks();
     return compat_CreateAccelerationStructureKHR(device, pCreateInfo, pAllocator, pAccelerationStructure);
 }
@@ -10419,6 +10506,11 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyAccelerationStructureKHR(
     VkAccelerationStructureKHR accelerationStructure,
     const VkAllocationCallbacks *pAllocator)
 {
+    if (!g_as_hooks) {
+        struct DeviceData *d = get_device_data(device);
+        if (d && d->fpDestroyAccelerationStructureKHR) d->fpDestroyAccelerationStructureKHR(device, accelerationStructure, pAllocator);
+        return;
+    }
     rt_patch_fex_thunks();
     compat_DestroyAccelerationStructureKHR(device, accelerationStructure, pAllocator);
 }
@@ -10429,6 +10521,12 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBuildAccelerationStructuresKHR(
     const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
     const VkAccelerationStructureBuildRangeInfoKHR * const *ppBuildRangeInfos)
 {
+    if (!g_as_hooks) {
+        struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
+        if (d && d->fpCmdBuildAccelerationStructuresKHR)
+            d->fpCmdBuildAccelerationStructuresKHR(commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
+        return;
+    }
     rt_patch_fex_thunks();
     compat_CmdBuildAccelerationStructuresKHR(commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
 }
@@ -10437,6 +10535,11 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyAccelerationStructureKHR(
     VkCommandBuffer commandBuffer,
     const VkCopyAccelerationStructureInfoKHR *pInfo)
 {
+    if (!g_as_hooks) {
+        struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
+        if (d && d->fpCmdCopyAccelerationStructureKHR) d->fpCmdCopyAccelerationStructureKHR(commandBuffer, pInfo);
+        return;
+    }
     rt_patch_fex_thunks();
     compat_CmdCopyAccelerationStructureKHR(commandBuffer, pInfo);
 }
@@ -10449,6 +10552,13 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteAccelerationStructuresPropertiesKHR(
     VkQueryPool queryPool,
     uint32_t firstQuery)
 {
+    if (!g_as_hooks) {
+        struct DeviceData *d = get_device_data_by_cmd(commandBuffer);
+        if (d && d->fpCmdWriteAccelerationStructuresPropertiesKHR)
+            d->fpCmdWriteAccelerationStructuresPropertiesKHR(commandBuffer, accelerationStructureCount,
+                                                             pAccelerationStructures, queryType, queryPool, firstQuery);
+        return;
+    }
     rt_patch_fex_thunks();
     compat_CmdWriteAccelerationStructuresPropertiesKHR(commandBuffer, accelerationStructureCount,
                                                        pAccelerationStructures, queryType, queryPool, firstQuery);
@@ -10458,6 +10568,10 @@ EXPORT VKAPI_ATTR VkDeviceAddress VKAPI_CALL vkGetAccelerationStructureDeviceAdd
     VkDevice device,
     const VkAccelerationStructureDeviceAddressInfoKHR *pInfo)
 {
+    if (!g_as_hooks) {
+        struct DeviceData *d = get_device_data(device);
+        return d && d->fpGetAccelerationStructureDeviceAddressKHR ? d->fpGetAccelerationStructureDeviceAddressKHR(device, pInfo) : 0;
+    }
     rt_patch_fex_thunks();
     return compat_GetAccelerationStructureDeviceAddressKHR(device, pInfo);
 }
@@ -10469,6 +10583,12 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkGetAccelerationStructureBuildSizesKHR(
     const uint32_t *pMaxPrimitiveCounts,
     VkAccelerationStructureBuildSizesInfoKHR *pSizeInfo)
 {
+    if (!g_as_hooks) {
+        struct DeviceData *d = get_device_data(device);
+        if (d && d->fpGetAccelerationStructureBuildSizesKHR)
+            d->fpGetAccelerationStructureBuildSizesKHR(device, buildType, pBuildInfo, pMaxPrimitiveCounts, pSizeInfo);
+        return;
+    }
     rt_patch_fex_thunks();
     compat_GetAccelerationStructureBuildSizesKHR(device, buildType, pBuildInfo, pMaxPrimitiveCounts, pSizeInfo);
 }
