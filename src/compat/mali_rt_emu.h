@@ -5059,14 +5059,21 @@ static uint32_t *rt_build_split_select_spirv(size_t *out_word_count) {
     uint32_t c_z64 = rt_get_const_u64(&mb, 0ULL);
     uint32_t is_m1 = BIN(RT_OP_IEQUAL, mb.t_bool, p_mode, mb.c_u32_1);
     uint32_t is_m2 = BIN(RT_OP_IEQUAL, mb.t_bool, p_mode, mb.c_u32_2);
-    uint32_t is_ind = BIN(RT_OP_LOGICAL_OR, mb.t_bool, is_m1, is_m2);
     uint32_t ind_ok = BIN(RT_OP_INOT_EQUAL, mb.t_bool, p_ind, c_z64);
-    uint32_t use_ind = BIN(RT_OP_LOGICAL_AND, mb.t_bool, is_ind, ind_ok);
-    uint32_t ind = SEL(mb.t_u64, use_ind, p_ind, p_zero);
+    /* each command is read only through its own address: Indirect1 is 12 B (an Indirect2 read there could run past
+     * the app's buffer), Indirect2 104 B; the other one reads the zero buffer */
+    uint32_t ind1 = SEL(mb.t_u64, BIN(RT_OP_LOGICAL_AND, mb.t_bool, is_m1, ind_ok), p_ind, p_zero);
+    uint32_t ind2 = SEL(mb.t_u64, BIN(RT_OP_LOGICAL_AND, mb.t_bool, is_m2, ind_ok), p_ind, p_zero);
     /* Indirect2: raygen base/size at 0/8, w/h/d at 88/92/96; Indirect1: w/h/d at 0/4/8 */
-    uint32_t i2_rb = LD64(ind, 0u), i2_rs = LD64(ind, 8u);
-    uint32_t i2_w = LD32(ind, 88u), i2_h = LD32(ind, 92u), i2_d = LD32(ind, 96u);
-    uint32_t i1_w = LD32(ind, 0u), i1_h = LD32(ind, 4u), i1_d = LD32(ind, 8u);
+    /* 64-bit fields as two 32-bit loads: the command address is only required to be 4-byte aligned */
+    #define LD64_4(addr, off) ({ uint32_t lo_ = LD32(addr, off), hi_ = LD32(addr, (off) + 4u); \
+        uint32_t l64_ = rt_alloc_id(&mb), h64_ = rt_alloc_id(&mb), sh_ = rt_alloc_id(&mb), r_ = rt_alloc_id(&mb); \
+        spv_emit_op3(b, RT_OP_UCONVERT, mb.t_u64, l64_, lo_); spv_emit_op3(b, RT_OP_UCONVERT, mb.t_u64, h64_, hi_); \
+        spv_emit_op4(b, 196u /* OpShiftLeftLogical */, mb.t_u64, sh_, h64_, rt_get_const_u64(&mb, 32ULL)); \
+        spv_emit_op4(b, 197u /* OpBitwiseOr */, mb.t_u64, r_, sh_, l64_); r_; })
+    uint32_t i2_rb = LD64_4(ind2, 0u), i2_rs = LD64_4(ind2, 8u);
+    uint32_t i2_w = LD32(ind2, 88u), i2_h = LD32(ind2, 92u), i2_d = LD32(ind2, 96u);
+    uint32_t i1_w = LD32(ind1, 0u), i1_h = LD32(ind1, 4u), i1_d = LD32(ind1, 8u);
     uint32_t rsz64 = rt_alloc_id(&mb);
     spv_emit_op3(b, RT_OP_UCONVERT, mb.t_u64, rsz64, p_rsz);
     uint32_t rbase = SEL(mb.t_u64, is_m2, i2_rb, p_rgen);
@@ -5106,6 +5113,7 @@ static uint32_t *rt_build_split_select_spirv(size_t *out_word_count) {
     #undef BIN
     #undef LD32
     #undef LD64
+    #undef LD64_4
     spv_emit_op0(b, RT_OP_RETURN);
     spv_emit_op0(b, RT_OP_FUNCTION_END);
 
@@ -6058,6 +6066,7 @@ static void rt_ensure_split_select_pipeline(struct DeviceData *d) {
 /* split-1112: record one emulated trace of a split pipeline. Called where the unsplit path binds the megakernel and
  * dispatches (after the pre-trace barrier, before the post-trace barrier); w/h/dpt = direct launch size (indirect: 0,
  * the select kernel reads the command). */
+static void rt_ensure_indirect_setup_pipeline(struct DeviceData *d);
 static void rt_split_dispatch(struct DeviceData *d, VkCommandBuffer cmd, struct RtCmdState *cs, struct RtPipeline *rp,
                               const struct RtDispatchPushConstants *pc, uint32_t w, uint32_t h, uint32_t dpt) {
     atomic_fetch_add_explicit(&g_split_traces, 1, memory_order_relaxed);
@@ -6092,11 +6101,30 @@ static void rt_split_dispatch(struct DeviceData *d, VkCommandBuffer cmd, struct 
         return;
     }
     /* fallback: every child at the launch size; a child's megakernel runs only its own raygen (its switch has one
-     * case), so exactly one of them does work - correct, only slower. Indirect: the old fallback size. */
+     * case), so exactly one of them does work - correct, only slower. Indirect: the launch size from the unsplit path's
+     * indirect setup kernel (Codex 1111-201541 #2), its old 256x256 fallback only when that kernel is missing too. */
+    uint32_t ind_off = 0;
+    VkDeviceAddress ind_dst = 0ULL;
+    if (pc->indirect_mode) {
+        rt_ensure_indirect_setup_pipeline(d);
+        if (d->rt_ind_pipeline && d->fpCmdDispatchIndirect && d->rt_ring_buf)
+            ind_dst = rt_ring_alloc(d, 64, 64, NULL, &ind_off);
+        if (ind_dst) {
+            uint64_t setup_pc[2] = { pc->indirect_bda + (pc->indirect_mode == 2 ? 88ULL : 0ULL), ind_dst };
+            d->fpCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->rt_ind_pipeline);
+            d->fpCmdPushConstants(cmd, d->rt_ind_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, setup_pc);
+            d->fpCmdDispatch(cmd, 1, 1, 1);
+            VkMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                                   .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT };
+            d->fpCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                                    0, 1, &ib, 0, NULL, 0, NULL);
+        }
+    }
     for (uint32_t k = 0; k < rp->split_n; k++) {
         rt_prepare_and_bind_megakernel(d, cmd, cs, rp->split[k], pc);
-        if (pc->indirect_mode) d->fpCmdDispatch(cmd, 256, 256, 1);
-        else d->fpCmdDispatch(cmd, (w + 7u) / 8u, (h + 3u) / 4u, dpt);
+        if (!pc->indirect_mode) d->fpCmdDispatch(cmd, (w + 7u) / 8u, (h + 3u) / 4u, dpt);
+        else if (ind_dst) d->fpCmdDispatchIndirect(cmd, d->rt_ring_buf, (VkDeviceSize)ind_off);
+        else d->fpCmdDispatch(cmd, 256, 256, 1);
     }
     atomic_fetch_add_explicit(&g_split_fallback, 1, memory_order_relaxed);
 }
