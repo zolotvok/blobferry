@@ -420,6 +420,7 @@ struct RtPipeline {
     pthread_t              compile_thread;
     _Atomic int            compile_handshake;   /* 11-08 keeper: worker vs DestroyPipeline, second one cleans up */
     size_t                 mega_bytes;          /* round 4: SPIR-V bytes of compute_module (counted in g_acct_mega_mod) */
+    bool                   module_app_alloc;    /* round 4: compute_module was created with the app's allocator */
     size_t                 acct_bytes;          /* round 4: bytes counted in g_acct_pipes (object + group table) */
     struct RtPipeline     *next;
 };
@@ -5217,6 +5218,7 @@ compat_CreateRayTracingPipelinesKHR(
                 COMPAT_INFO("CRTP [%u/%u]: fpCreateShaderModule result=%d module=%p", i + 1, createInfoCount, sm_res, (void *)rp->compute_module);
                 free(mega_spv);
                 if (sm_res == VK_SUCCESS && rp->compute_module) {
+                    rp->module_app_alloc = pAllocator != NULL;
                     rp->mega_bytes = mega_words * sizeof(uint32_t);
                     rt_acct_add(&g_acct_mega_mod, (int64_t)rp->mega_bytes);
                 }
@@ -5257,7 +5259,9 @@ compat_CreateRayTracingPipelinesKHR(
                             job->fpGetPipelineExecutablePropertiesKHR = d->fpGetPipelineExecutablePropertiesKHR;
                             job->fpGetPipelineExecutableStatisticsKHR = d->fpGetPipelineExecutableStatisticsKHR;
                         }
-                        job->release_module = rt_env()->free_stages != 0;
+                        /* Codex r4 #4: the worker can only destroy with NULL callbacks (the app may free its allocator
+                         * meanwhile), so a module made with the app's allocator is kept until vkDestroyPipeline */
+                        job->release_module = rt_env()->free_stages != 0 && !rp->module_app_alloc;
                     }
                     if (g_debug)
                         LOG("rt_compile: request t=%lld ms pipe=%p stages=%u groups=%u words=%zu mode=%s",
@@ -6951,8 +6955,10 @@ struct RtBuildPlan {
                                 * the UPDATE, so the pool slice (BUILD-sized) is used even with MALI_COMPAT_RT_OWN_SCRATCH=0 */
     bool         drop_type;    /* round 4 (Codex r3 #7): no driver handle of the build's type -> dropped */
     VkAccelerationStructureTypeKHR prev_built;   /* round 4: dst track's built type before this call (restored on drop) */
+    VkAccelerationStructureKHR prev_active;      /* round 4: dst track's active handle before this call */
 };
 static _Atomic uint64_t g_rt_updsrc_nofit = 0;   /* round 4 (Codex r3 #1): other-source UPDATEs kept (BUILD would not fit) */
+static _Atomic uint64_t g_rt_build_nofit = 0;    /* round 4 (Codex r4 #1): layer-made BUILDs dropped (driver size > storage) */
 static _Atomic uint64_t g_rt_scr_builds = 0, g_rt_scr_own = 0, g_rt_scr_nofit = 0, g_rt_scr_short = 0,
                         g_rt_scr_blind = 0, g_rt_scr_maxcall = 0, g_rt_scr_dropped = 0, g_rt_scr_bigapp = 0,
                         g_rt_scr_dstshort = 0;
@@ -7009,6 +7015,21 @@ static uint32_t rt_assign_as_scratch(struct DeviceData *d, uint32_t count,
             }
         }
         atomic_fetch_add(&g_rt_scr_builds, 1);
+        /* round 4 (Codex r4 #1): a BUILD the LAYER made from an UPDATE must fit its destination's storage; now that the
+         * driver's size for this build is known (also when the track's build_size was unknown) - otherwise dropped */
+        if (plan[i].need_pool && plan[i].drv_as && plan[i].storage && plan[i].drv_as > plan[i].storage) {
+            uint64_t n = atomic_fetch_add(&g_rt_build_nofit, 1) + 1;
+            static _Atomic int64_t bn_ms = 0;
+            int64_t now = rt_now_ms(), pv = atomic_load(&bn_ms);
+            if ((n == 1 || now - pv >= 1000) && atomic_compare_exchange_strong(&bn_ms, &pv, now))
+                LOG("rt_build: a layer-made BUILD (app UPDATE) needs %llu B but the destination storage is %llu B -> "
+                    "DROPPED (build-nofit=%llu)", (unsigned long long)plan[i].drv_as, (unsigned long long)plan[i].storage,
+                    (unsigned long long)n);
+            plan[i].drop_type = true;   /* not a scratch drop: logged here */
+            plan[i].drop = true;
+            plan[i].batch = batch;
+            continue;
+        }
         if (g_debug && !bad_app && need > 0) {
             bool s0 = rt_is_host_address_accessible((const void *)(uintptr_t)app, 1);
             bool s1 = rt_is_host_address_accessible((const void *)(uintptr_t)(app + need - 1), 1);
@@ -7394,6 +7415,7 @@ compat_CmdBuildAccelerationStructuresKHR(
         struct RtAsTrack *track = rt_as_lookup_locked(dst);
         plan[i].storage = track ? track->size : 0;
         plan[i].prev_built = track ? track->built_type : RT_AS_TYPE_UNBUILT;
+        plan[i].prev_active = track ? track->active_handle : VK_NULL_HANDLE;
         const bool app_update = infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
         if (track) {
             bool recreate = false;
@@ -7570,9 +7592,12 @@ compat_CmdBuildAccelerationStructuresKHR(
         struct RtAsTrack *t = rt_as_lookup_locked(infos[i].dstAccelerationStructure);
         if (!t) continue;
         if (plan[i].drop) {
-            /* round 4: a dropped build leaves the old content: an AS that was unbuilt before this call is unbuilt again
-             * (its next UPDATE becomes a BUILD) */
-            if (plan[i].prev_built == RT_AS_TYPE_UNBUILT) t->built_type = RT_AS_TYPE_UNBUILT;
+            /* round 4: a dropped build leaves the old content: an AS that was unbuilt before this call, or whose handle
+             * or built type this call changed (a fresh handle that was never built, Codex r4 #2), is unbuilt (its next
+             * UPDATE becomes a BUILD) */
+            if (plan[i].prev_built == RT_AS_TYPE_UNBUILT || t->built_type != plan[i].prev_built ||
+                t->active_handle != plan[i].prev_active)
+                t->built_type = RT_AS_TYPE_UNBUILT;
         } else if (infos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR) {
             t->as_size = plan[i].drv_as;
             t->build_size = plan[i].drv_as;
@@ -8154,11 +8179,13 @@ static void rt_report(struct DeviceData *d, bool final) {
     static _Atomic int64_t next_ms = 0;
     int64_t now = rt_now_ms();
     if (!final) {
+        int64_t t0 = 0;   /* Codex r4 #6: the window starts at the first call also with MALI_COMPAT_RT_MEM_LOG_S=0 */
+        if (!atomic_load_explicit(&g_rt_report_t0, memory_order_relaxed))
+            atomic_compare_exchange_strong(&g_rt_report_t0, &t0, now);
         if (!every) return;
         int64_t nx = atomic_load_explicit(&next_ms, memory_order_relaxed);
-        if (nx == 0) {   /* first call: start the window, print after one interval */
-            if (atomic_compare_exchange_strong(&next_ms, &nx, now + (int64_t)every * 1000))
-                atomic_store(&g_rt_report_t0, now);
+        if (nx == 0) {   /* first call: print after one interval */
+            atomic_compare_exchange_strong(&next_ms, &nx, now + (int64_t)every * 1000);
             return;
         }
         if (now < nx) return;

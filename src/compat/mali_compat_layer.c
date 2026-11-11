@@ -9379,7 +9379,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             if (!have) ext_names[mod_ci.enabledExtensionCount++] = "VK_KHR_pipeline_executable_properties";
             app_pep = (VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR *)find_struct(pCreateInfo->pNext,
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
-            if (app_pep) { app_pep_saved = app_pep->pipelineExecutableInfo; app_pep->pipelineExecutableInfo = VK_TRUE; }
+            if (app_pep) {   /* written only when the app left it off (as the layer does for rayQuery etc.) */
+                app_pep_saved = app_pep->pipelineExecutableInfo;
+                if (!app_pep_saved) app_pep->pipelineExecutableInfo = VK_TRUE; else app_pep = NULL;
+            }
             else { pep_feat.pNext = (void *)mod_ci.pNext; mod_ci.pNext = &pep_feat; }
         }
     }
