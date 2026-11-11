@@ -432,6 +432,7 @@ struct RtPipeline {
     uint32_t               split_rgen[RT_SPLIT_MAX];
     uint32_t               split_n;
     uint32_t               mega_stages;         /* split-1112: stages in this object's megakernel (child: the subset) */
+    bool                   split_child;         /* split-1112: a hidden child (its async compile takes a split-job slot) */
     struct RtPipeline     *next;
 };
 
@@ -506,6 +507,8 @@ struct RtEnv {
     int split;          /* MALI_COMPAT_RT_SPLIT=1: a pipeline with 2..RT_SPLIT_MAX distinct raygen stages and >= split_min
                          * stages gets one megakernel per raygen (default 0 = one megakernel for the whole pipeline) */
     uint32_t split_min; /* MALI_COMPAT_RT_SPLIT_MIN=N: smallest pipeline (stage count) that is split (default 12) */
+    uint32_t split_jobs;/* MALI_COMPAT_RT_SPLIT_JOBS=N (1..16): split-child megakernels compiled at the same time (default 2;
+                         * an unsplit W3 load compiles its 80- and 82-stage kernels on 2 threads, a split one has 8 children) */
 };
 static struct RtEnv    g_rt_env;
 static pthread_once_t  g_rt_env_once = PTHREAD_ONCE_INIT;
@@ -539,6 +542,7 @@ static void rt_env_init(void) {
     e = getenv("MALI_COMPAT_RT_MEM_LOG_S");    g_rt_env.mem_log_s    = e ? (uint32_t)(atoi(e) > 0 ? atoi(e) : 0) : 10u;
     e = getenv("MALI_COMPAT_RT_SPLIT");        g_rt_env.split        = (e && e[0] == '1') ? 1 : 0;
     e = getenv("MALI_COMPAT_RT_SPLIT_MIN");    g_rt_env.split_min    = (e && atoi(e) > 0) ? (uint32_t)atoi(e) : 12u;
+    e = getenv("MALI_COMPAT_RT_SPLIT_JOBS");   g_rt_env.split_jobs   = (e && atoi(e) >= 1 && atoi(e) <= 16) ? (uint32_t)atoi(e) : 2u;
     e = getenv("MALI_COMPAT_RT_GUARD_ITERS");
     int gv = e ? atoi(e) : 0;
     g_rt_guard_max = gv > 0 ? (uint32_t)gv : 4096u;   /* was a racy lazy write in CRTP */
@@ -580,7 +584,8 @@ static void rt_env_init(void) {
         LOG("rt_build: MALI_COMPAT_RT_CLONE_REFIT=0 -> the first in-place UPDATE of a copied-into AS is passed through");
     if (g_rt_env.split)
         LOG("rt_split: MALI_COMPAT_RT_SPLIT=1 -> pipelines with >= %u stages and 2..%d raygen stages get one megakernel "
-            "per raygen (GPU-side select + indirect dispatch per trace)", g_rt_env.split_min, RT_SPLIT_MAX);
+            "per raygen (GPU-side select + indirect dispatch per trace), %u child compiles at a time", g_rt_env.split_min,
+            RT_SPLIT_MAX, g_rt_env.split_jobs);
     if (g_rt_env.build_log)
         LOG("rt_build: MALI_COMPAT_RT_BUILD_LOG=%u -> per-build lines for the first %u calls and %u calls after the "
             "first TraceRays", g_rt_env.build_log, g_rt_env.build_log, g_rt_env.build_log);
@@ -1199,6 +1204,9 @@ static void rt_compile_finish(struct RtCompileJob *j, VkResult r, VkPipeline p, 
 }
 static void rt_free_pipeline_obj_fp(VkDevice dev, PFN_vkDestroyPipeline fp_dp, PFN_vkDestroyShaderModule fp_dm,
                                     struct RtPipeline *victim, const VkAllocationCallbacks *pAllocator);
+static pthread_mutex_t g_rt_split_slot_lock = PTHREAD_MUTEX_INITIALIZER;   /* split-1112 child compile limiter */
+static pthread_cond_t  g_rt_split_slot_cv   = PTHREAD_COND_INITIALIZER;
+static uint32_t        g_rt_split_slots_used;
 static void *rt_compile_worker(void *arg) {
     struct RtCompileJob *j = (struct RtCompileJob *)arg;
     if (j->cpci.pNext) j->cpci.pNext = &j->f2;
@@ -1207,8 +1215,23 @@ static void *rt_compile_worker(void *arg) {
             (long long)rt_now_ms(), (long long)(rt_now_ms() - j->t_req), (void *)j->rp, j->stages, j->words,
             (long)syscall(SYS_gettid));
     VkPipeline p = VK_NULL_HANDLE;
+    /* split-1112: at most MALI_COMPAT_RT_SPLIT_JOBS split-child compiles run at once (peak compiler RAM/CPU during the
+     * load); unsplit pipelines are not limited (as before) */
+    const bool slot = j->rp->split_child;
+    if (slot) {
+        pthread_mutex_lock(&g_rt_split_slot_lock);
+        while (g_rt_split_slots_used >= rt_env()->split_jobs) pthread_cond_wait(&g_rt_split_slot_cv, &g_rt_split_slot_lock);
+        g_rt_split_slots_used++;
+        pthread_mutex_unlock(&g_rt_split_slot_lock);
+    }
     /* NULL cache + NULL allocator: the app may destroy its cache/allocator while we compile. */
     VkResult r = j->fpCreateComputePipelines(j->device, VK_NULL_HANDLE, 1, &j->cpci, NULL, &p);
+    if (slot) {
+        pthread_mutex_lock(&g_rt_split_slot_lock);
+        g_rt_split_slots_used--;
+        pthread_cond_signal(&g_rt_split_slot_cv);
+        pthread_mutex_unlock(&g_rt_split_slot_lock);
+    }
     rt_compile_finish(j, r, p, "worker");
     struct RtPipeline *rp = j->rp;
     /* round 4 lever MALI_COMPAT_RT_FREE_STAGES=1: the megakernel module is not needed once the compute pipeline exists
@@ -5441,6 +5464,7 @@ static bool rt_split_pipeline(struct DeviceData *d, VkDevice device, VkPipelineC
         c->layout = rp->layout;               /* pinned by the parent for its whole life; the job pins it too */
         c->max_recursion_depth = rp->max_recursion_depth;
         c->acct_bytes = sizeof(*c);
+        c->split_child = true;
         rt_acct_add(&g_acct_pipes, (int64_t)c->acct_bytes);
         rp->split[k] = c;
         rp->split_rgen[k] = rp->stages[rg_idx[k]].stage_id;
