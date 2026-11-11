@@ -1547,6 +1547,12 @@ struct DeviceData {
     VkDeviceMemory rt_scratch_mem;
     VkDeviceAddress rt_scratch_bda;
     _Atomic uint32_t rt_scratch_offset;
+    /* round 4 (MALI_COMPAT_RT_PIPELINE only): sizes of the layer's RT allocations (rt_mem accounting) and the
+     * MALI_COMPAT_RT_STATS driver entry points (set only when the device enabled pipelineExecutableInfo) */
+    VkDeviceSize rt_scratch_size, rt_ring_size, rt_zero_size;
+    bool rt_stats_ok;
+    PFN_vkGetPipelineExecutablePropertiesKHR fpGetPipelineExecutablePropertiesKHR;
+    PFN_vkGetPipelineExecutableStatisticsKHR fpGetPipelineExecutableStatisticsKHR;
     pthread_mutex_t bc_lock;
 };
 
@@ -6112,6 +6118,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
         mod.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
     bool as_xfer = false;   /* lead-1110c: an AS storage buffer that got TRANSFER_SRC|TRANSFER_DST (layer CLONE) */
+    bool as_buf = false;    /* round 4: any AS storage buffer (counted in rt_mem asbuf=) */
     if (g_rt_pipeline) {
         if (mod.usage & VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR) {
             mod.usage &= ~VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR;
@@ -6130,16 +6137,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
             find_struct(mod.pNext, VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR);
         const VkBufferUsageFlags2KHR xfer2 = VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT_KHR | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR;
         if (u2) {
-            as_xfer = (u2->usage & VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) && (u2->usage & xfer2) == xfer2;
+            as_buf = (u2->usage & VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) != 0;
+            as_xfer = as_buf && (u2->usage & xfer2) == xfer2;
         } else if (mod.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) {
             mod.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             as_xfer = true;
+            as_buf = true;
         }
     }
 
     VkResult r = d->fpCreateBuffer(device, &mod, pAllocator, pBuffer);
     if (g_dc_on && r == VK_SUCCESS) dc_buf_create(d, *pBuffer, &mod);
-    if (as_xfer && r == VK_SUCCESS) rt_xfer_buf_add(*pBuffer);
+    if (as_buf && r == VK_SUCCESS) rt_as_buf_add(*pBuffer, mod.size, as_xfer);   /* round 4: + size, all AS buffers */
     return r;
 }
 
@@ -6160,9 +6169,9 @@ static VKAPI_ATTR void VKAPI_CALL compat_RtDestroyBuffer(VkDevice device, VkBuff
 // hit anything else (test/map-probe.c: CPU and GPU see the same data through the moved mapping, also after a remap).
 // The driver's flush/invalidate work on its own address, so for moved mappings the layer does the cache maintenance.
 // -----------------------------------------------------------------------------
-static void mem_add(VkDeviceMemory m, VkDeviceSize size, uint32_t type, uint32_t heap) {
+static bool mem_add(VkDeviceMemory m, VkDeviceSize size, uint32_t type, uint32_t heap) {
     struct MemInfo *e = calloc(1, sizeof *e);
-    if (!e) return; // no entry = never counted, so the free does not subtract either
+    if (!e) return false; // no entry = never counted, so the free does not subtract either
     e->memory = m;
     e->size = size;
     e->type = type;
@@ -6173,6 +6182,7 @@ static void mem_add(VkDeviceMemory m, VkDeviceSize size, uint32_t type, uint32_t
     e->next = g_mem[b];
     g_mem[b] = e;
     pthread_mutex_unlock(&g_mem_mutex);
+    return true;
 }
 
 static struct MemInfo *mem_remove(VkDeviceMemory m) {
@@ -6430,7 +6440,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
     uint32_t heap = fd_import || mod.memoryTypeIndex >= VK_MAX_MEMORY_TYPES ? BUDGET_NO_HEAP : d->type_heap[mod.memoryTypeIndex];
     if (res == VK_SUCCESS) {
         atomic_fetch_add(&g_allocated_bytes, pAllocateInfo->allocationSize);
-        mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex, heap);
+        if (mem_add(*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex, heap) && g_rt_pipeline)
+            rt_vkmem_alloc(mod.memoryTypeIndex, heap, pAllocateInfo->allocationSize);   /* round 4: vk_mem line */
         if (g_dc_on) dc_mem_alloc(d, device, *pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex, dc_mem_devaddr(mod.pNext));
         if (g_memlog) {
             uint64_t va = 0;
@@ -6516,6 +6527,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_FreeMemory(
     }
     struct MemInfo *e = memory ? mem_remove(memory) : NULL;
     if (e) budget_sub(e->heap, e->size);
+    if (e && g_rt_pipeline) rt_vkmem_free(e->type, e->heap, e->size);   /* round 4: vk_mem line */
     if (g_dc_on) dc_dead(DCK_MEM, (uint64_t)memory);
     if (g_memlog && memory)
         ml_event('F', (uint64_t)(uintptr_t)memory, e ? e->size : 0, e ? e->type : ML_NONE, e ? e->heap : BUDGET_NO_HEAP,
@@ -9300,6 +9312,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     mod_ci.enabledExtensionCount = 0;
     bool div_ext = false, div_khr = false;
     bool drv_has_rq = false, drv_has_as = false, drv_has_dho = false, drv_has_plib = false;
+    bool drv_has_pep = false;   /* round 4: VK_KHR_pipeline_executable_properties (MALI_COMPAT_RT_STATS=1 only) */
     if (g_rt_pipeline && inst && inst->fpEnumerateDeviceExtensionProperties) {
         uint32_t n = 0;
         inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &n, NULL);
@@ -9310,6 +9323,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
                 drv_has_as   |= !strcmp(props[i].extensionName, "VK_KHR_acceleration_structure");
                 drv_has_dho  |= !strcmp(props[i].extensionName, "VK_KHR_deferred_host_operations");
                 drv_has_plib |= !strcmp(props[i].extensionName, "VK_KHR_pipeline_library");
+                drv_has_pep  |= !strcmp(props[i].extensionName, "VK_KHR_pipeline_executable_properties");
             }
         }
         free(props);
@@ -9341,6 +9355,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
             for (uint32_t i = 0; i < mod_ci.enabledExtensionCount; i++)
                 have |= !strcmp(ext_names[i], need_rt[k]);
             if (!have) ext_names[mod_ci.enabledExtensionCount++] = need_rt[k];
+        }
+    }
+    /* round 4: MALI_COMPAT_RT_STATS=1 (RT_PIPELINE=1 only): VK_KHR_pipeline_executable_properties + its feature for the
+     * megakernels' CAPTURE_STATISTICS, only when the driver has both; otherwise one line and the key does nothing. */
+    bool rt_stats_on = false;
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pep_feat = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, NULL, VK_TRUE};
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR *app_pep = NULL;
+    VkBool32 app_pep_saved = VK_FALSE;
+    if (g_rt_pipeline && rt_env()->stats) {
+        VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR q = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 f2q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &q};
+        if (drv_has_pep && inst && inst->fpGetPhysicalDeviceFeatures2) inst->fpGetPhysicalDeviceFeatures2(physicalDevice, &f2q);
+        rt_stats_on = drv_has_pep && q.pipelineExecutableInfo;
+        LOG("rt_stats: MALI_COMPAT_RT_STATS=1: driver extension %s, pipelineExecutableInfo %s -> %s", drv_has_pep ? "yes" : "no",
+            q.pipelineExecutableInfo ? "true" : "false", rt_stats_on ? "ON" : "OFF (no statistics)");
+        if (rt_stats_on) {
+            bool have = false;
+            for (uint32_t i = 0; i < mod_ci.enabledExtensionCount; i++)
+                have |= !strcmp(ext_names[i], "VK_KHR_pipeline_executable_properties");
+            if (!have) ext_names[mod_ci.enabledExtensionCount++] = "VK_KHR_pipeline_executable_properties";
+            app_pep = (VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR *)find_struct(pCreateInfo->pNext,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
+            if (app_pep) { app_pep_saved = app_pep->pipelineExecutableInfo; app_pep->pipelineExecutableInfo = VK_TRUE; }
+            else { pep_feat.pNext = (void *)mod_ci.pNext; mod_ci.pNext = &pep_feat; }
         }
     }
     // BC shadows get fixed-rate compression (AFRC) and the image log queries compression: both need
@@ -9600,6 +9640,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         }
     }
     VkResult res = fpCreateDevice(physicalDevice, &mod_ci, pAllocator, pDevice);
+    if (app_pep) app_pep->pipelineExecutableInfo = app_pep_saved;
     if (app_rq) app_rq->rayQuery = saved_app_rq;
     if (app_ct) app_ct->conditionalRendering = app_ct_saved;
     if (app_div) app_div->vertexAttributeInstanceRateZeroDivisor = app_zero_div;
@@ -9745,6 +9786,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         d->fpCmdBuildAccelerationStructuresKHR = (PFN_vkCmdBuildAccelerationStructuresKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdBuildAccelerationStructuresKHR");
         d->fpCmdCopyAccelerationStructureKHR = (PFN_vkCmdCopyAccelerationStructureKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdCopyAccelerationStructureKHR");
         d->fpCmdCopyBuffer = (PFN_vkCmdCopyBuffer)fpGetDeviceProcAddr(*pDevice, "vkCmdCopyBuffer");
+        if (rt_stats_on) {   /* round 4: MALI_COMPAT_RT_STATS=1 */
+            d->fpGetPipelineExecutablePropertiesKHR = (PFN_vkGetPipelineExecutablePropertiesKHR)
+                fpGetDeviceProcAddr(*pDevice, "vkGetPipelineExecutablePropertiesKHR");
+            d->fpGetPipelineExecutableStatisticsKHR = (PFN_vkGetPipelineExecutableStatisticsKHR)
+                fpGetDeviceProcAddr(*pDevice, "vkGetPipelineExecutableStatisticsKHR");
+            d->rt_stats_ok = d->fpGetPipelineExecutablePropertiesKHR && d->fpGetPipelineExecutableStatisticsKHR;
+        }
         d->fpCmdWriteAccelerationStructuresPropertiesKHR = (PFN_vkCmdWriteAccelerationStructuresPropertiesKHR)fpGetDeviceProcAddr(*pDevice, "vkCmdWriteAccelerationStructuresPropertiesKHR");
         d->fpGetAccelerationStructureDeviceAddressKHR = (PFN_vkGetAccelerationStructureDeviceAddressKHR)fpGetDeviceProcAddr(*pDevice, "vkGetAccelerationStructureDeviceAddressKHR");
         d->fpGetAccelerationStructureBuildSizesKHR = (PFN_vkGetAccelerationStructureBuildSizesKHR)fpGetDeviceProcAddr(*pDevice, "vkGetAccelerationStructureBuildSizesKHR");
@@ -9862,6 +9910,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
         }
         if (d->rt_scratch_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_scratch_buf, NULL);
         if (d->rt_scratch_mem && d->fpFreeMemory) d->fpFreeMemory(device, d->rt_scratch_mem, NULL);
+        if (g_rt_pipeline) rt_device_gone(d);   /* round 4: the layer's RT allocations leave rt_mem; final lines */
         pthread_mutex_destroy(&d->bc_lock);
         destroy_staging_pool(d);
         if (d->fpDestroyDevice && device)
@@ -9959,6 +10008,9 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         struct DeviceData *dd = get_device_data(device);
         if (!dd || !dd->fpMapMemory2KHR) return dd ? dd->get_device_proc_addr(device, pName) : NULL;
     }
+    // round 4 (Codex r3 #5): with RT_PIPELINE the AS-buffer map must see every destroy, also in desc-capture mode
+    // (compat_RtDestroyBuffer chains to desc-capture's destroy itself), so this comes before dc_proc.
+    if (g_rt_pipeline && !strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;
     if (g_dc_on) { PFN_vkVoidFunction dh = dc_proc(device, pName); if (dh) return dh; } // desc-capture-1
     #define MATCH_DEV(fn) if (!strcmp(pName, "vk" #fn)) return (PFN_vkVoidFunction)compat_##fn
     if (g_memlog) { // MALI_COMPAT_MEMLOG only: vkMapMemory for the M events, queue submits for the S events
