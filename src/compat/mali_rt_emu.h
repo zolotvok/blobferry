@@ -422,6 +422,16 @@ struct RtPipeline {
     size_t                 mega_bytes;          /* round 4: SPIR-V bytes of compute_module (counted in g_acct_mega_mod) */
     bool                   module_app_alloc;    /* round 4: compute_module was created with the app's allocator */
     size_t                 acct_bytes;          /* round 4: bytes counted in g_acct_pipes (object + group table) */
+    /* split-1112 (MALI_COMPAT_RT_SPLIT=1): one megakernel per raygen stage instead of one for all raygens. The parent
+     * (the app's VkPipeline) then has no compute pipeline of its own; split[k] is a hidden child RtPipeline (not in
+     * g_rt_pipelines, no stage copies, no layout pin) whose megakernel holds raygen split_rgen[k] + every non-raygen
+     * stage. A trace runs a 1-thread select kernel that reads the raygen record's stage id on the GPU and writes one
+     * VkDispatchIndirectCommand per child (0x0x0 for all but the matching one). */
+#define RT_SPLIT_MAX 8
+    struct RtPipeline     *split[RT_SPLIT_MAX];
+    uint32_t               split_rgen[RT_SPLIT_MAX];
+    uint32_t               split_n;
+    uint32_t               mega_stages;         /* split-1112: stages in this object's megakernel (child: the subset) */
     struct RtPipeline     *next;
 };
 
@@ -492,6 +502,10 @@ struct RtEnv {
                          * the key's directory, /tmp if unset - unchanged) */
     uint32_t mem_log_s; /* MALI_COMPAT_RT_MEM_LOG_S=N: rt_mem / vk_mem / rt_rays lines every N s (default 10; 0 = only
                          * the final lines at vkDestroyDevice) */
+    /* split-1112 (11-11) [RTX keeper, Claude Opus 5.5] */
+    int split;          /* MALI_COMPAT_RT_SPLIT=1: a pipeline with 2..RT_SPLIT_MAX distinct raygen stages and >= split_min
+                         * stages gets one megakernel per raygen (default 0 = one megakernel for the whole pipeline) */
+    uint32_t split_min; /* MALI_COMPAT_RT_SPLIT_MIN=N: smallest pipeline (stage count) that is split (default 12) */
 };
 static struct RtEnv    g_rt_env;
 static pthread_once_t  g_rt_env_once = PTHREAD_ONCE_INIT;
@@ -523,6 +537,8 @@ static void rt_env_init(void) {
     e = getenv("MALI_COMPAT_RT_FREE_STAGES");  g_rt_env.free_stages  = (e && e[0] == '1') ? 1 : 0;
     e = getenv("MALI_COMPAT_DUMP_RT_SPV");     g_rt_env.dump_spv     = (e && (!strcmp(e, "0") || !strcmp(e, "off"))) ? 0 : 1;
     e = getenv("MALI_COMPAT_RT_MEM_LOG_S");    g_rt_env.mem_log_s    = e ? (uint32_t)(atoi(e) > 0 ? atoi(e) : 0) : 10u;
+    e = getenv("MALI_COMPAT_RT_SPLIT");        g_rt_env.split        = (e && e[0] == '1') ? 1 : 0;
+    e = getenv("MALI_COMPAT_RT_SPLIT_MIN");    g_rt_env.split_min    = (e && atoi(e) > 0) ? (uint32_t)atoi(e) : 12u;
     e = getenv("MALI_COMPAT_RT_GUARD_ITERS");
     int gv = e ? atoi(e) : 0;
     g_rt_guard_max = gv > 0 ? (uint32_t)gv : 4096u;   /* was a racy lazy write in CRTP */
@@ -562,6 +578,9 @@ static void rt_env_init(void) {
             "(it copies the source's whole created size)");
     if (!g_rt_env.clone_refit)
         LOG("rt_build: MALI_COMPAT_RT_CLONE_REFIT=0 -> the first in-place UPDATE of a copied-into AS is passed through");
+    if (g_rt_env.split)
+        LOG("rt_split: MALI_COMPAT_RT_SPLIT=1 -> pipelines with >= %u stages and 2..%d raygen stages get one megakernel "
+            "per raygen (GPU-side select + indirect dispatch per trace)", g_rt_env.split_min, RT_SPLIT_MAX);
     if (g_rt_env.build_log)
         LOG("rt_build: MALI_COMPAT_RT_BUILD_LOG=%u -> per-build lines for the first %u calls and %u calls after the "
             "first TraceRays", g_rt_env.build_log, g_rt_env.build_log, g_rt_env.build_log);
@@ -623,6 +642,7 @@ static _Atomic int64_t g_rt_scr_maxslice;   /* largest single pool slice handed 
 static const char *const g_ray_cls_name[RT_RAY_CLASSES] = { "1-6", "7-8", "9-14", "15-40", "41+" };
 static _Atomic uint64_t g_ray_traces, g_ray_rays, g_ray_cls_tr[RT_RAY_CLASSES], g_ray_cls_rays[RT_RAY_CLASSES],
                         g_ray_ind, g_ray_skip_zero, g_ray_skip_nostate;
+static _Atomic uint64_t g_split_traces, g_split_select, g_split_fallback;   /* split-1112 (record time) */
 static inline unsigned rt_ray_class(uint32_t stages) {
     return stages <= 6 ? 0u : stages <= 8 ? 1u : stages <= 14 ? 2u : stages <= 40 ? 3u : 4u;
 }
@@ -854,10 +874,30 @@ static inline int64_t rt_now_ms(void) {
 static inline bool rt_mega_ready(struct RtPipeline *rp) {
     return rp && __atomic_load_n(&rp->compute_pipeline, __ATOMIC_ACQUIRE) != VK_NULL_HANDLE;
 }
+/* split-1112: a split parent is ready when every child megakernel is (a trace may select any of them) */
+static inline bool rt_pipe_ready(struct RtPipeline *rp) {
+    if (!rp) return false;
+    if (!rp->split_n) return rt_mega_ready(rp);
+    for (uint32_t k = 0; k < rp->split_n; k++)
+        if (!rt_mega_ready(rp->split[k])) return false;
+    return true;
+}
+/* split-1112: compile state of a split parent = 3/4 if a child failed/was capped, else 1 while one still compiles */
+static inline int rt_pipe_state(struct RtPipeline *rp) {
+    if (!rp->split_n) return __atomic_load_n(&rp->compile_state, __ATOMIC_ACQUIRE);
+    int st = 2;
+    for (uint32_t k = 0; k < rp->split_n; k++) {
+        int c = __atomic_load_n(&rp->split[k]->compile_state, __ATOMIC_ACQUIRE);
+        if (c == 3 || c == 4) return c;
+        if (c == 0) return 3;   /* never queued (SPIR-V/module failure): the parent is visible only after CRTP */
+        if (c != 2) st = 1;
+    }
+    return st;
+}
 static _Atomic uint64_t g_rt_skip_pending = 0;   /* compile still running on the worker */
 static _Atomic uint64_t g_rt_skip_nopipe  = 0;   /* capped (MALI_COMPAT_RT_MAX_STAGES) or compile failed */
 static void rt_count_skip(struct RtPipeline *rp) {
-    int st = __atomic_load_n(&rp->compile_state, __ATOMIC_ACQUIRE);
+    int st = rt_pipe_state(rp);
     uint64_t pend = (st == 1) ? atomic_fetch_add(&g_rt_skip_pending, 1) + 1 : atomic_load(&g_rt_skip_pending);
     uint64_t nop  = (st == 1) ? atomic_load(&g_rt_skip_nopipe) : atomic_fetch_add(&g_rt_skip_nopipe, 1) + 1;
     if (!g_debug) return;
@@ -1190,8 +1230,29 @@ static void *rt_compile_worker(void *arg) {
     return NULL;
 }
 
+/* split-1112: release the split children of a parent that is being freed. Same worker handshake as
+ * rt_destroy_pipeline: a child whose megakernel still compiles is freed by its worker (the second to arrive frees). */
+static void rt_split_release_children(VkDevice dev, PFN_vkDestroyPipeline fp_dp, PFN_vkDestroyShaderModule fp_dm,
+                                      struct RtPipeline *rp, const VkAllocationCallbacks *pAllocator) {
+    for (uint32_t k = 0; k < rp->split_n; k++) {
+        struct RtPipeline *c = rp->split[k];
+        rp->split[k] = NULL;
+        if (!c) continue;
+        if (c->compile_thread_live) {
+            c->compile_thread_live = false;
+            pthread_detach(c->compile_thread);
+            if (atomic_fetch_add(&c->compile_handshake, 1) == 0) {
+                LOG("rt_split: child %p still compiling while its pipeline is freed; its worker frees it", (void *)c);
+                continue;
+            }
+        }
+        rt_free_pipeline_obj_fp(dev, fp_dp, fp_dm, c, pAllocator);
+    }
+    rp->split_n = 0;
+}
 static void rt_free_pipeline_obj_fp(VkDevice dev, PFN_vkDestroyPipeline fp_dp, PFN_vkDestroyShaderModule fp_dm,
                                     struct RtPipeline *victim, const VkAllocationCallbacks *pAllocator) {
+    if (victim->split_n) rt_split_release_children(dev, fp_dp, fp_dm, victim, pAllocator);
     if (victim->compile_null_alloc) pAllocator = NULL;
     if (victim->compute_pipeline && fp_dp) {
         fp_dp(dev, victim->compute_pipeline, pAllocator);
@@ -1826,6 +1887,14 @@ static uint32_t rt_emit_global_var(struct RtMegaBuilder *mb, uint32_t ptr_type, 
     spv_emit_op3(&mb->types_consts_globals, RT_OP_VARIABLE, ptr_type, id, sc);
     rt_add_iface_var(mb, id);
     return id;
+}
+/* split-1112: drop a global from the OpEntryPoint interface. The small helper kernels declare their own push-constant
+ * block; the preamble's megakernel block (v_rt_pc) stays declared but must not be listed: SPIR-V >= 1.4 lists every
+ * global, and two PushConstant variables in one interface is invalid (VUID-StandaloneSpirv-OpVariable-06673;
+ * lavapipe rejected the indirect setup kernel for it, so every TraceRaysIndirect used the 256x256 fallback). */
+static void rt_iface_drop(struct RtMegaBuilder *mb, uint32_t var_id) {
+    for (uint32_t i = 0; i < mb->iface_var_count; i++)
+        if (mb->iface_vars[i] == var_id) { mb->iface_vars[i] = mb->iface_vars[--mb->iface_var_count]; return; }
 }
 
 /* ── Megakernel Preamble Initialization ───────────────────────────────────── */
@@ -4855,6 +4924,7 @@ static uint32_t *rt_build_indirect_setup_spirv(size_t *out_word_count) {
 
     uint32_t t_ptr_pc = rt_find_or_emit_type(&mb, RT_OP_TYPE_POINTER, RT_SC_PUSH_CONSTANT, t_pc, 0);
     uint32_t v_pc = rt_emit_global_var(&mb, t_ptr_pc, RT_SC_PUSH_CONSTANT);
+    if (rt_env()->split) rt_iface_drop(&mb, mb.v_rt_pc);   /* split-1112: see rt_iface_drop (behind the split key) */
 
     struct SpvBuf *b = &mb.functions;
     uint32_t lbl = rt_alloc_id(&mb);
@@ -4930,6 +5000,139 @@ static uint32_t *rt_build_indirect_setup_spirv(size_t *out_word_count) {
     spv_emit_words(&final_spv, mb.types_consts_globals.words, mb.types_consts_globals.count);
     spv_emit_words(&final_spv, mb.functions.words,            mb.functions.count);
 
+    rt_mega_free(&mb);
+    *out_word_count = final_spv.count;
+    return final_spv.words;
+}
+
+/* ── split-1112: 1-thread raygen select kernel for split pipelines ─────────────
+ * Push constants (88 B, struct RtSplitSelectPC): reads the raygen record the way the megakernel's main does
+ * (direct / Indirect1: rgen base+size from the push constants; Indirect2: from the VkTraceRaysIndirectCommand2KHR)
+ * and the launch size (push constants / indirect command), then writes count VkDispatchIndirectCommands at
+ * dst + 16*k: {(w+7)>>3, (h+3)>>2, d} for the child whose raygen id equals the record's id, {0,0,0} otherwise.
+ * Every load goes through `zero_bda` (the layer's 4 KB zero buffer) when its source is not valid, so the kernel never
+ * reads an unchecked address. */
+struct RtSplitSelectPC {
+    uint64_t rgen_base;   /*  0: direct/Indirect1 raygen record (already sanitised like the megakernel's pc) */
+    uint64_t dst_bda;     /*  8: RT_SPLIT_MAX x 16 B of VkDispatchIndirectCommand (ring slot) */
+    uint64_t ind_bda;     /* 16: indirect command (0 = direct) */
+    uint64_t zero_bda;    /* 24: 4 KB zero buffer */
+    uint32_t mode;        /* 32: 0 direct, 1 Indirect1, 2 Indirect2 */
+    uint32_t count;       /* 36: children */
+    uint32_t w, h, d;     /* 40, 44, 48: direct launch size */
+    uint32_t rgen_size;   /* 52: direct/Indirect1 raygen region size */
+    uint32_t ids[RT_SPLIT_MAX]; /* 56..87 */
+};
+static uint32_t *rt_build_split_select_spirv(size_t *out_word_count) {
+    struct RtMegaBuilder mb;
+    rt_mega_init_preamble(&mb);
+    struct SpvBuf *b = &mb.functions;
+    enum { NM = 10 + RT_SPLIT_MAX };
+    uint32_t t_pc = rt_alloc_id(&mb);
+    spv_emit_word(&mb.types_consts_globals, ((2u + NM) << 16) | RT_OP_TYPE_STRUCT);
+    spv_emit_word(&mb.types_consts_globals, t_pc);
+    for (uint32_t m = 0; m < NM; m++) spv_emit_word(&mb.types_consts_globals, m < 4 ? mb.t_u64 : mb.t_u32);
+    spv_emit_op2(&mb.decorations, RT_OP_DECORATE, t_pc, RT_DEC_BLOCK);
+    for (uint32_t m = 0; m < NM; m++)
+        spv_emit_op4(&mb.decorations, RT_OP_MEMBER_DECORATE, t_pc, m, RT_DEC_OFFSET, m < 4 ? m * 8u : 32u + (m - 4u) * 4u);
+    uint32_t t_ptr_pc = rt_find_or_emit_type(&mb, RT_OP_TYPE_POINTER, RT_SC_PUSH_CONSTANT, t_pc, 0);
+    uint32_t v_pc = rt_emit_global_var(&mb, t_ptr_pc, RT_SC_PUSH_CONSTANT);
+    rt_iface_drop(&mb, mb.v_rt_pc);   /* one PushConstant variable per interface */
+
+    uint32_t lbl = rt_alloc_id(&mb);
+    spv_emit_op4(b, RT_OP_FUNCTION, mb.t_void, mb.fn_main, 0u, mb.t_fn_void);
+    spv_emit_op1(b, RT_OP_LABEL, lbl);
+    uint32_t pcm[NM];
+    for (uint32_t m = 0; m < NM; m++) {
+        uint32_t ptr = rt_alloc_id(&mb);
+        pcm[m] = rt_alloc_id(&mb);
+        spv_emit_op4(b, RT_OP_ACCESS_CHAIN, m < 4 ? mb.t_ptr_pc_u64 : mb.t_ptr_pc_u32, ptr, v_pc,
+                     rt_get_const_i32(&mb, (int32_t)m));
+        spv_emit_op3(b, RT_OP_LOAD, m < 4 ? mb.t_u64 : mb.t_u32, pcm[m], ptr);
+    }
+    const uint32_t p_rgen = pcm[0], p_dst = pcm[1], p_ind = pcm[2], p_zero = pcm[3], p_mode = pcm[4], p_cnt = pcm[5];
+    const uint32_t p_w = pcm[6], p_h = pcm[7], p_d = pcm[8], p_rsz = pcm[9];
+    #define SEL(T, c, x, y) ({ uint32_t r_ = rt_alloc_id(&mb); spv_emit_op5(b, RT_OP_SELECT, (T), r_, (c), (x), (y)); r_; })
+    #define BIN(op, T, x, y) ({ uint32_t r_ = rt_alloc_id(&mb); spv_emit_op4(b, (op), (T), r_, (x), (y)); r_; })
+    #define LD32(addr, off) ({ uint32_t r_ = rt_alloc_id(&mb); rt_emit_psb_load_u32(&mb, b, r_, (addr), (off)); r_; })
+    #define LD64(addr, off) ({ uint32_t r_ = rt_alloc_id(&mb); rt_emit_psb_load_u64(&mb, b, r_, (addr), (off)); r_; })
+    uint32_t c_z64 = rt_get_const_u64(&mb, 0ULL);
+    uint32_t is_m1 = BIN(RT_OP_IEQUAL, mb.t_bool, p_mode, mb.c_u32_1);
+    uint32_t is_m2 = BIN(RT_OP_IEQUAL, mb.t_bool, p_mode, mb.c_u32_2);
+    uint32_t is_ind = BIN(RT_OP_LOGICAL_OR, mb.t_bool, is_m1, is_m2);
+    uint32_t ind_ok = BIN(RT_OP_INOT_EQUAL, mb.t_bool, p_ind, c_z64);
+    uint32_t use_ind = BIN(RT_OP_LOGICAL_AND, mb.t_bool, is_ind, ind_ok);
+    uint32_t ind = SEL(mb.t_u64, use_ind, p_ind, p_zero);
+    /* Indirect2: raygen base/size at 0/8, w/h/d at 88/92/96; Indirect1: w/h/d at 0/4/8 */
+    uint32_t i2_rb = LD64(ind, 0u), i2_rs = LD64(ind, 8u);
+    uint32_t i2_w = LD32(ind, 88u), i2_h = LD32(ind, 92u), i2_d = LD32(ind, 96u);
+    uint32_t i1_w = LD32(ind, 0u), i1_h = LD32(ind, 4u), i1_d = LD32(ind, 8u);
+    uint32_t rsz64 = rt_alloc_id(&mb);
+    spv_emit_op3(b, RT_OP_UCONVERT, mb.t_u64, rsz64, p_rsz);
+    uint32_t rbase = SEL(mb.t_u64, is_m2, i2_rb, p_rgen);
+    uint32_t rsize = SEL(mb.t_u64, is_m2, i2_rs, rsz64);
+    uint32_t w = SEL(mb.t_u32, is_m2, i2_w, SEL(mb.t_u32, is_m1, i1_w, p_w));
+    uint32_t h = SEL(mb.t_u32, is_m2, i2_h, SEL(mb.t_u32, is_m1, i1_h, p_h));
+    uint32_t dd = SEL(mb.t_u32, is_m2, i2_d, SEL(mb.t_u32, is_m1, i1_d, p_d));
+    /* the megakernel main's raygen checks: base != 0, size >= 32, BDA window, magic */
+    uint32_t c_32_64 = rt_get_const_u64(&mb, 32ULL);
+    uint32_t ok1 = BIN(RT_OP_INOT_EQUAL, mb.t_bool, rbase, c_z64);
+    uint32_t ok2 = BIN(RT_OP_UGREATER_THAN_EQUAL, mb.t_bool, rsize, c_32_64);
+    uint32_t ok3 = BIN(RT_OP_UGREATER_THAN_EQUAL, mb.t_bool, rbase, rt_get_const_u64(&mb, RT_MIN_VALID_GPU_BDA));
+    uint32_t ok4 = BIN(RT_OP_ULESS_THAN, mb.t_bool, rbase, rt_get_const_u64(&mb, RT_MAX_VALID_GPU_BDA));
+    uint32_t okr = BIN(RT_OP_LOGICAL_AND, mb.t_bool, BIN(RT_OP_LOGICAL_AND, mb.t_bool, ok1, ok2),
+                       BIN(RT_OP_LOGICAL_AND, mb.t_bool, ok3, ok4));
+    uint32_t hdr = SEL(mb.t_u64, okr, rbase, p_zero);
+    uint32_t magic = LD32(hdr, 0u), rid = LD32(hdr, 8u);
+    uint32_t okm = BIN(RT_OP_IEQUAL, mb.t_bool, magic, rt_get_const_u32(&mb, RT_GROUP_HANDLE_MAGIC));
+    uint32_t run = BIN(RT_OP_LOGICAL_AND, mb.t_bool, okr, okm);
+    uint32_t c_u7 = rt_get_const_u32(&mb, 7u), c_u3 = rt_get_const_u32(&mb, 3u);
+    uint32_t gx = BIN(194u /* OpShiftRightLogical */, mb.t_u32, BIN(RT_OP_IADD, mb.t_u32, w, c_u7), c_u3);
+    uint32_t gy = BIN(194u, mb.t_u32, BIN(RT_OP_IADD, mb.t_u32, h, c_u3), mb.c_u32_2);
+    for (uint32_t k = 0; k < RT_SPLIT_MAX; k++) {
+        uint32_t in_n = BIN(RT_OP_ULESS_THAN, mb.t_bool, rt_get_const_u32(&mb, k), p_cnt);
+        uint32_t idm = BIN(RT_OP_IEQUAL, mb.t_bool, rid, pcm[10 + k]);
+        uint32_t m = BIN(RT_OP_LOGICAL_AND, mb.t_bool, run, BIN(RT_OP_LOGICAL_AND, mb.t_bool, in_n, idm));
+        uint32_t vals[3] = { SEL(mb.t_u32, m, gx, mb.c_u32_0), SEL(mb.t_u32, m, gy, mb.c_u32_0),
+                             SEL(mb.t_u32, m, dd, mb.c_u32_0) };
+        for (uint32_t q = 0; q < 3; q++) {
+            uint32_t addr = BIN(RT_OP_IADD, mb.t_u64, p_dst, rt_get_const_u64(&mb, (uint64_t)(k * 16u + q * 4u)));
+            uint32_t ptr = rt_alloc_id(&mb);
+            spv_emit_op3(b, RT_OP_CONVERT_U_TO_PTR, mb.t_ptr_psb_u32, ptr, addr);
+            spv_emit_op4(b, RT_OP_STORE, ptr, vals[q], 0x2u /* Aligned */, 4u);
+        }
+    }
+    #undef SEL
+    #undef BIN
+    #undef LD32
+    #undef LD64
+    spv_emit_op0(b, RT_OP_RETURN);
+    spv_emit_op0(b, RT_OP_FUNCTION_END);
+
+    struct SpvBuf final_spv;
+    spv_buf_init(&final_spv);
+    spv_emit_word(&final_spv, RT_SPV_MAGIC);
+    spv_emit_word(&final_spv, 0x00010500u);
+    spv_emit_word(&final_spv, 0x4D414C49u);
+    spv_emit_word(&final_spv, mb.next_id);
+    spv_emit_word(&final_spv, 0u);
+    spv_emit_words(&final_spv, mb.capabilities.words, mb.capabilities.count);
+    spv_emit_words(&final_spv, mb.extensions.words,   mb.extensions.count);
+    spv_emit_words(&final_spv, mb.ext_imports.words,  mb.ext_imports.count);
+    spv_emit_op2(&final_spv, RT_OP_MEMORY_MODEL, 5348u, 1u);
+    {
+        uint32_t ep_wc = 5u + mb.iface_var_count;
+        spv_emit_word(&final_spv, (ep_wc << 16) | RT_OP_ENTRY_POINT);
+        spv_emit_word(&final_spv, RT_EXEC_MODEL_GLCOMPUTE);
+        spv_emit_word(&final_spv, mb.fn_main);
+        spv_emit_word(&final_spv, 0x6E69616Du);
+        spv_emit_word(&final_spv, 0x00000000u);
+        for (uint32_t i = 0; i < mb.iface_var_count; i++) spv_emit_word(&final_spv, mb.iface_vars[i]);
+    }
+    spv_emit_op5(&final_spv, RT_OP_EXECUTION_MODE, mb.fn_main, 17u, 1u, 1u, 1u);
+    spv_emit_words(&final_spv, mb.decorations.words,          mb.decorations.count);
+    spv_emit_words(&final_spv, mb.types_consts_globals.words, mb.types_consts_globals.count);
+    spv_emit_words(&final_spv, mb.functions.words,            mb.functions.count);
     rt_mega_free(&mb);
     *out_word_count = final_spv.count;
     return final_spv.words;
@@ -5028,6 +5231,223 @@ static bool rt_clone_stage_record(const struct RtStageRecord *src, struct RtStag
 }
 
 /* ── Vulkan Ray Tracing Pipeline Entry Points ─────────────────────────────── */
+
+/* split-1112: build + compile ONE megakernel for `rp` from stages[0..n) (was inline in CRTP step 4). For a normal
+ * pipeline stages = rp->stages; for a split child the subset (raygen k + every non-raygen stage, shallow copies of
+ * the parent's records: only read while the SPIR-V is built, i.e. before this returns). Sets rp->compute_module,
+ * rp->mega_bytes, and either queues the async compile (compile_state 1) or compiles in place (2 / 3). */
+static void rt_mega_compile(struct DeviceData *d, VkDevice device, VkPipelineCache pipelineCache,
+                            const VkAllocationCallbacks *pAllocator, struct RtPipeline *rp,
+                            const struct RtStageRecord *stages, uint32_t n, uint32_t i, uint32_t createInfoCount) {
+    size_t mega_words = 0;
+    int64_t t_build0 = rt_now_ms();
+    rp->mega_stages = n;
+    uint32_t *mega_spv = rt_build_megakernel_spirv(stages, n, &mega_words);
+    if (mega_spv && mega_words > 5) {
+        atomic_fetch_add_explicit(&g_mega_spv_total, (int64_t)(mega_words * 4), memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mega_requested, 1, memory_order_relaxed);
+    }
+    if (g_debug)
+        LOG("rt_compile: SPIR-V built t=%lld ms dt=%lld ms stages=%u words=%zu",
+            (long long)rt_now_ms(), (long long)(rt_now_ms() - t_build0), n, mega_words);
+    COMPAT_INFO("CRTP [%u/%u]: megakernel SPIR-V built (%zu words, %p)",
+                i + 1, createInfoCount, mega_words, (void *)mega_spv);
+    if (mega_spv && mega_words > 5) {
+        const char *dump_dir = getenv("MALI_COMPAT_DUMP_RT_SPV");
+        if (!dump_dir || !dump_dir[0]) dump_dir = "/tmp";
+        char path[512];
+        uint64_t h = spv_hash(mega_spv, mega_words * 4);
+        snprintf(path, sizeof(path), "%s/rt_mega_p%u_%016llx.spv", dump_dir, i, (unsigned long long)h);
+        /* round 4 lever: MALI_COMPAT_DUMP_RT_SPV=0|off -> no file (default unchanged: dumped) */
+        FILE *fp = rt_env()->dump_spv ? fopen(path, "wb") : NULL;
+        if (fp) {
+            size_t nw = fwrite(mega_spv, 4, mega_words, fp);
+            fclose(fp);
+            rt_acct_add(&g_acct_dump, (int64_t)(nw * 4));   /* files are never "freed": count + bytes written */
+            COMPAT_INFO("CRTP [%u/%u]: dumped megakernel to %s", i + 1, createInfoCount, path);
+        }
+
+        VkShaderModuleCreateInfo smci = {
+            .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = mega_words * sizeof(uint32_t),
+            .pCode    = mega_spv,
+        };
+        COMPAT_INFO("CRTP [%u/%u]: calling fpCreateShaderModule...", i + 1, createInfoCount);
+        /* round 4 (Codex r4b #3): a layer-internal object - created and destroyed with NULL callbacks on every path
+         * (the async worker cannot use the app's allocator; before, async compiles destroyed it with NULL anyway) */
+        VkResult sm_res = d->fpCreateShaderModule(device, &smci, NULL, &rp->compute_module);
+        COMPAT_INFO("CRTP [%u/%u]: fpCreateShaderModule result=%d module=%p", i + 1, createInfoCount, sm_res, (void *)rp->compute_module);
+        free(mega_spv);
+        if (sm_res == VK_SUCCESS && rp->compute_module) {
+            rp->module_app_alloc = false;   /* round 4: created with NULL callbacks */
+            rp->mega_bytes = mega_words * sizeof(uint32_t);
+            rt_acct_add(&g_acct_mega_mod, (int64_t)rp->mega_bytes);
+        }
+
+        if (sm_res == VK_SUCCESS && rp->compute_module) {
+            VkPipelineCreateFlags comp_flags = 0;
+            if (rp->use_descriptor_buffer) {
+                comp_flags |= 0x20000000u /* VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT */;
+            }
+            /* round 4: MALI_COMPAT_RT_STATS=1 and the device enabled pipelineExecutableInfo */
+            if (d->rt_stats_ok) comp_flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+            VkPipelineCreateFlags2CreateInfoKHR comp_flags2 = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
+                .flags = (uint64_t)comp_flags,
+            };
+            VkComputePipelineCreateInfo cpci = {
+                .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .pNext  = rp->use_descriptor_buffer ? &comp_flags2 : NULL,
+                .flags  = comp_flags,
+                .stage  = {
+                    .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
+                    .module = rp->compute_module,
+                    .pName  = "main",
+                },
+                .layout = rp->layout,
+            };
+            struct RtCompileJob *job = (struct RtCompileJob *)calloc(1, sizeof(*job));
+            const int sync_compile = rt_env()->sync_compile;
+            if (job) {
+                job->device = device; job->rp = rp; job->cpci = cpci; job->f2 = comp_flags2;
+                job->fpCreateComputePipelines = d->fpCreateComputePipelines;
+                job->fpDestroyPipeline = d->fpDestroyPipeline;
+                job->fpDestroyShaderModule = d->fpDestroyShaderModule;
+                job->stages = n; job->groups = rp->group_count; job->words = mega_words;
+                job->t_req = rt_now_ms();
+                if (d->rt_stats_ok) {
+                    job->fpGetPipelineExecutablePropertiesKHR = d->fpGetPipelineExecutablePropertiesKHR;
+                    job->fpGetPipelineExecutableStatisticsKHR = d->fpGetPipelineExecutableStatisticsKHR;
+                }
+                /* Codex r4 #4: the worker can only destroy with NULL callbacks (the app may free its allocator
+                 * meanwhile), so a module made with the app's allocator is kept until vkDestroyPipeline */
+                job->release_module = rt_env()->free_stages != 0 && !rp->module_app_alloc;
+            }
+            if (g_debug)
+                LOG("rt_compile: request t=%lld ms pipe=%p stages=%u groups=%u words=%zu mode=%s",
+                    (long long)rt_now_ms(), (void *)rp, n, rp->group_count, mega_words,
+                    (sync_compile || !job) ? "sync" : "async");
+            bool queued = false;
+            if (job && !sync_compile && rt_job_register(job)) {
+                rp->compile_state = 1;
+                rp->compile_null_alloc = true;
+                job->async = true;
+                atomic_fetch_add_explicit(&g_mega_compiling, 1, memory_order_relaxed);
+                /* the job is fully initialised before the thread starts; the worker owns it */
+                if (pthread_create(&rp->compile_thread, NULL, rt_compile_worker, job) == 0) {
+                    rp->compile_thread_live = true;
+                    queued = true;
+                    COMPAT_INFO("CRTP [%u/%u]: megakernel compile queued on a worker (%u stages)",
+                                i + 1, createInfoCount, n);
+                } else {
+                    rt_job_end(job);   /* unpin + unlist; the layout cannot be app-destroyed during CRTP */
+                    rp->compile_state = 0;
+                    rp->compile_null_alloc = false;
+                    job->async = false;
+                    atomic_fetch_sub_explicit(&g_mega_compiling, 1, memory_order_relaxed);
+                }
+            }
+            if (!queued) {
+                COMPAT_INFO("CRTP [%u/%u]: calling fpCreateComputePipelines...", i + 1, createInfoCount);
+                VkPipeline cp = VK_NULL_HANDLE;
+                VkResult cp_res = d->fpCreateComputePipelines(device, pipelineCache, 1, &cpci,
+                                                              pAllocator, &cp);
+                COMPAT_INFO("CRTP [%u/%u]: fpCreateComputePipelines result=%d pipe=%p", i + 1, createInfoCount, cp_res, (void *)cp);
+                if (job) {
+                    rt_compile_finish(job, cp_res, cp, "sync");
+                    free(job);
+                } else if (cp_res == VK_SUCCESS) {
+                    rp->compute_pipeline = cp;
+                    rp->compile_state = 2;
+                    atomic_fetch_add_explicit(&g_mega_live, 1, memory_order_relaxed);
+                }
+                /* round 4 lever MALI_COMPAT_RT_FREE_STAGES=1 (sync compile: created with pAllocator) */
+                if (rt_env()->free_stages && rp->compute_module && d->fpDestroyShaderModule) {
+                    d->fpDestroyShaderModule(device, rp->compute_module, NULL);
+                    rp->compute_module = VK_NULL_HANDLE;
+                    if (rp->mega_bytes) rt_acct_sub(&g_acct_mega_mod, (int64_t)rp->mega_bytes);
+                }
+            }
+        } else {
+            COMPAT_INFO("RT megakernel vkCreateShaderModule failed (%d)", sm_res);
+        }
+    } else {
+        free(mega_spv);
+        COMPAT_INFO("RT megakernel SPIR-V builder failed for %u stages", n);
+    }
+}
+
+/* split-1112 (MALI_COMPAT_RT_SPLIT=1) [RTX keeper, Claude Opus 5.5]: one megakernel per raygen stage.
+ * Why: the W3 80-stage pipeline = 4 raygen + 38 closest-hit + 37 any-hit + 1 miss (switch case counts of the 11-08
+ * dumps); every raygen has one TraceRay site, so after the driver inlines everything the kernel holds FOUR copies of
+ * the trace loop with all 37 any-hit and 38 closest-hit shaders (~150k SPIR-V instructions inlined vs 39k in the
+ * module). One raygen per kernel = one copy (~37k): the register allocation, spills and code size of each kernel
+ * only cover the raygen it runs, and each compile is ~1/4 of the size. Semantics are unchanged: a child's megakernel
+ * is the same builder output for {raygen k} + all non-raygen stages, and the GPU-side select (rt_split_select_spirv)
+ * applies the exact raygen-record checks of the megakernel's main (base != 0, size >= 32, BDA window, magic) before
+ * it routes the launch to the child whose raygen id matches (no match = no dispatch, as the megakernel's switch).
+ * Returns false (nothing done) when the pipeline is not split: lever off, < split_min stages, < 2 or > RT_SPLIT_MAX
+ * distinct raygens, or out of host memory before any child exists. */
+static bool rt_split_pipeline(struct DeviceData *d, VkDevice device, VkPipelineCache pipelineCache,
+                              const VkAllocationCallbacks *pAllocator, struct RtPipeline *rp,
+                              uint32_t i, uint32_t createInfoCount) {
+    const struct RtEnv *env = rt_env();
+    if (!env->split || rp->stage_count < env->split_min || rp->split_n) return false;
+    uint32_t rg_idx[RT_SPLIT_MAX], nrg = 0;
+    for (uint32_t s = 0; s < rp->stage_count; s++) {
+        if (rp->stages[s].stage != VK_SHADER_STAGE_RAYGEN_BIT_KHR) continue;
+        bool dup = false;
+        for (uint32_t k = 0; k < nrg && !dup; k++) dup = rp->stages[rg_idx[k]].stage_id == rp->stages[s].stage_id;
+        if (dup) continue;
+        if (nrg == RT_SPLIT_MAX) {
+            LOG("rt_split: pipe=%p stages=%u has more than %d raygen stages -> NOT split", (void *)rp, rp->stage_count,
+                RT_SPLIT_MAX);
+            return false;
+        }
+        rg_idx[nrg++] = s;
+    }
+    if (nrg < 2) return false;
+    struct RtStageRecord *sub = (struct RtStageRecord *)malloc(rp->stage_count * sizeof(*sub));
+    if (!sub) return false;
+    struct RtPipeline *kids[RT_SPLIT_MAX] = { 0 };
+    for (uint32_t k = 0; k < nrg; k++) {
+        kids[k] = (struct RtPipeline *)calloc(1, sizeof(*kids[k]));
+        if (!kids[k]) {
+            for (uint32_t j = 0; j < k; j++) free(kids[j]);
+            free(sub);
+            return false;
+        }
+    }
+    uint32_t nonrg = 0;
+    for (uint32_t s = 0; s < rp->stage_count; s++)
+        if (rp->stages[s].stage != VK_SHADER_STAGE_RAYGEN_BIT_KHR) nonrg++;
+    LOG("rt_split: pipe=%p stages=%u groups=%u -> %u megakernels (1 raygen + %u other stages each)", (void *)rp,
+        rp->stage_count, rp->group_count, nrg, nonrg);
+    for (uint32_t k = 0; k < nrg; k++) {
+        struct RtPipeline *c = kids[k];
+        c->magic = rp->magic;
+        c->device = device;
+        c->is_library = false;
+        c->use_descriptor_buffer = rp->use_descriptor_buffer;
+        c->layout = rp->layout;               /* pinned by the parent for its whole life; the job pins it too */
+        c->max_recursion_depth = rp->max_recursion_depth;
+        c->acct_bytes = sizeof(*c);
+        rt_acct_add(&g_acct_pipes, (int64_t)c->acct_bytes);
+        rp->split[k] = c;
+        rp->split_rgen[k] = rp->stages[rg_idx[k]].stage_id;
+        rp->split_n = k + 1;
+        uint32_t n = 0;
+        sub[n++] = rp->stages[rg_idx[k]];   /* shallow: the builder only reads words/spec data, before return */
+        for (uint32_t s = 0; s < rp->stage_count; s++)
+            if (rp->stages[s].stage != VK_SHADER_STAGE_RAYGEN_BIT_KHR) sub[n++] = rp->stages[s];
+        rt_mega_compile(d, device, pipelineCache, pAllocator, c, sub, n, i, createInfoCount);
+        LOG("rt_split: pipe=%p child %u/%u=%p raygen id=0x%08x stages=%u state=%d", (void *)rp, k + 1, nrg, (void *)c,
+            rp->split_rgen[k], n, __atomic_load_n(&c->compile_state, __ATOMIC_ACQUIRE));
+    }
+    free(sub);
+    return true;
+}
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 compat_CreateRayTracingPipelinesKHR(
@@ -5176,146 +5596,15 @@ compat_CreateRayTracingPipelinesKHR(
             COMPAT_INFO("CRTP [%u/%u]: %u stages > MALI_COMPAT_RT_MAX_STAGES=%d -> megakernel NOT built, traces skipped",
                         i + 1, createInfoCount, rp->stage_count, rt_max_stages);
         } else if (!is_library && stage_ok && rp->stage_count > 0) {
-            size_t mega_words = 0;
-            int64_t t_build0 = rt_now_ms();
             if (!__atomic_load_n(&g_rt_guard_bda, __ATOMIC_ACQUIRE) && rt_ensure_ring_buffer(d)) {
                 VkDeviceAddress zero = 0ULL;   /* first device wins (was a racy plain write) */
                 __atomic_compare_exchange_n(&g_rt_guard_bda, &zero, d->rt_ring_bda + RT_GUARD_SLOT_OFF, false,
                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
             }
-            uint32_t *mega_spv = rt_build_megakernel_spirv(rp->stages, rp->stage_count, &mega_words);
-            if (mega_spv && mega_words > 5) {
-                atomic_fetch_add_explicit(&g_mega_spv_total, (int64_t)(mega_words * 4), memory_order_relaxed);
-                atomic_fetch_add_explicit(&g_mega_requested, 1, memory_order_relaxed);
-            }
-            if (g_debug)
-                LOG("rt_compile: SPIR-V built t=%lld ms dt=%lld ms stages=%u words=%zu",
-                    (long long)rt_now_ms(), (long long)(rt_now_ms() - t_build0), rp->stage_count, mega_words);
-            COMPAT_INFO("CRTP [%u/%u]: megakernel SPIR-V built (%zu words, %p)",
-                        i + 1, createInfoCount, mega_words, (void *)mega_spv);
-            if (mega_spv && mega_words > 5) {
-                const char *dump_dir = getenv("MALI_COMPAT_DUMP_RT_SPV");
-                if (!dump_dir || !dump_dir[0]) dump_dir = "/tmp";
-                char path[512];
-                uint64_t h = spv_hash(mega_spv, mega_words * 4);
-                snprintf(path, sizeof(path), "%s/rt_mega_p%u_%016llx.spv", dump_dir, i, (unsigned long long)h);
-                /* round 4 lever: MALI_COMPAT_DUMP_RT_SPV=0|off -> no file (default unchanged: dumped) */
-                FILE *fp = rt_env()->dump_spv ? fopen(path, "wb") : NULL;
-                if (fp) {
-                    size_t nw = fwrite(mega_spv, 4, mega_words, fp);
-                    fclose(fp);
-                    rt_acct_add(&g_acct_dump, (int64_t)(nw * 4));   /* files are never "freed": count + bytes written */
-                    COMPAT_INFO("CRTP [%u/%u]: dumped megakernel to %s", i + 1, createInfoCount, path);
-                }
-
-                VkShaderModuleCreateInfo smci = {
-                    .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                    .codeSize = mega_words * sizeof(uint32_t),
-                    .pCode    = mega_spv,
-                };
-                COMPAT_INFO("CRTP [%u/%u]: calling fpCreateShaderModule...", i + 1, createInfoCount);
-                /* round 4 (Codex r4b #3): a layer-internal object - created and destroyed with NULL callbacks on every path
-                 * (the async worker cannot use the app's allocator; before, async compiles destroyed it with NULL anyway) */
-                VkResult sm_res = d->fpCreateShaderModule(device, &smci, NULL, &rp->compute_module);
-                COMPAT_INFO("CRTP [%u/%u]: fpCreateShaderModule result=%d module=%p", i + 1, createInfoCount, sm_res, (void *)rp->compute_module);
-                free(mega_spv);
-                if (sm_res == VK_SUCCESS && rp->compute_module) {
-                    rp->module_app_alloc = false;   /* round 4: created with NULL callbacks */
-                    rp->mega_bytes = mega_words * sizeof(uint32_t);
-                    rt_acct_add(&g_acct_mega_mod, (int64_t)rp->mega_bytes);
-                }
-
-                if (sm_res == VK_SUCCESS && rp->compute_module) {
-                    VkPipelineCreateFlags comp_flags = 0;
-                    if (rp->use_descriptor_buffer) {
-                        comp_flags |= 0x20000000u /* VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT */;
-                    }
-                    /* round 4: MALI_COMPAT_RT_STATS=1 and the device enabled pipelineExecutableInfo */
-                    if (d->rt_stats_ok) comp_flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
-                    VkPipelineCreateFlags2CreateInfoKHR comp_flags2 = {
-                        .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
-                        .flags = (uint64_t)comp_flags,
-                    };
-                    VkComputePipelineCreateInfo cpci = {
-                        .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                        .pNext  = rp->use_descriptor_buffer ? &comp_flags2 : NULL,
-                        .flags  = comp_flags,
-                        .stage  = {
-                            .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                            .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
-                            .module = rp->compute_module,
-                            .pName  = "main",
-                        },
-                        .layout = rp->layout,
-                    };
-                    struct RtCompileJob *job = (struct RtCompileJob *)calloc(1, sizeof(*job));
-                    const int sync_compile = rt_env()->sync_compile;
-                    if (job) {
-                        job->device = device; job->rp = rp; job->cpci = cpci; job->f2 = comp_flags2;
-                        job->fpCreateComputePipelines = d->fpCreateComputePipelines;
-                        job->fpDestroyPipeline = d->fpDestroyPipeline;
-                        job->fpDestroyShaderModule = d->fpDestroyShaderModule;
-                        job->stages = rp->stage_count; job->groups = rp->group_count; job->words = mega_words;
-                        job->t_req = rt_now_ms();
-                        if (d->rt_stats_ok) {
-                            job->fpGetPipelineExecutablePropertiesKHR = d->fpGetPipelineExecutablePropertiesKHR;
-                            job->fpGetPipelineExecutableStatisticsKHR = d->fpGetPipelineExecutableStatisticsKHR;
-                        }
-                        /* Codex r4 #4: the worker can only destroy with NULL callbacks (the app may free its allocator
-                         * meanwhile), so a module made with the app's allocator is kept until vkDestroyPipeline */
-                        job->release_module = rt_env()->free_stages != 0 && !rp->module_app_alloc;
-                    }
-                    if (g_debug)
-                        LOG("rt_compile: request t=%lld ms pipe=%p stages=%u groups=%u words=%zu mode=%s",
-                            (long long)rt_now_ms(), (void *)rp, rp->stage_count, rp->group_count, mega_words,
-                            (sync_compile || !job) ? "sync" : "async");
-                    bool queued = false;
-                    if (job && !sync_compile && rt_job_register(job)) {
-                        rp->compile_state = 1;
-                        rp->compile_null_alloc = true;
-                        job->async = true;
-                        atomic_fetch_add_explicit(&g_mega_compiling, 1, memory_order_relaxed);
-                        /* the job is fully initialised before the thread starts; the worker owns it */
-                        if (pthread_create(&rp->compile_thread, NULL, rt_compile_worker, job) == 0) {
-                            rp->compile_thread_live = true;
-                            queued = true;
-                            COMPAT_INFO("CRTP [%u/%u]: megakernel compile queued on a worker (%u stages)",
-                                        i + 1, createInfoCount, rp->stage_count);
-                        } else {
-                            rt_job_end(job);   /* unpin + unlist; the layout cannot be app-destroyed during CRTP */
-                            rp->compile_state = 0;
-                            rp->compile_null_alloc = false;
-                            job->async = false;
-                            atomic_fetch_sub_explicit(&g_mega_compiling, 1, memory_order_relaxed);
-                        }
-                    }
-                    if (!queued) {
-                        COMPAT_INFO("CRTP [%u/%u]: calling fpCreateComputePipelines...", i + 1, createInfoCount);
-                        VkPipeline cp = VK_NULL_HANDLE;
-                        VkResult cp_res = d->fpCreateComputePipelines(device, pipelineCache, 1, &cpci,
-                                                                      pAllocator, &cp);
-                        COMPAT_INFO("CRTP [%u/%u]: fpCreateComputePipelines result=%d pipe=%p", i + 1, createInfoCount, cp_res, (void *)cp);
-                        if (job) {
-                            rt_compile_finish(job, cp_res, cp, "sync");
-                            free(job);
-                        } else if (cp_res == VK_SUCCESS) {
-                            rp->compute_pipeline = cp;
-                            rp->compile_state = 2;
-                            atomic_fetch_add_explicit(&g_mega_live, 1, memory_order_relaxed);
-                        }
-                        /* round 4 lever MALI_COMPAT_RT_FREE_STAGES=1 (sync compile: created with pAllocator) */
-                        if (rt_env()->free_stages && rp->compute_module && d->fpDestroyShaderModule) {
-                            d->fpDestroyShaderModule(device, rp->compute_module, NULL);
-                            rp->compute_module = VK_NULL_HANDLE;
-                            if (rp->mega_bytes) rt_acct_sub(&g_acct_mega_mod, (int64_t)rp->mega_bytes);
-                        }
-                    }
-                } else {
-                    COMPAT_INFO("RT megakernel vkCreateShaderModule failed (%d)", sm_res);
-                }
+            if (rt_split_pipeline(d, device, pipelineCache, pAllocator, rp, i, createInfoCount)) {
+                /* split-1112: children compiled/queued; the parent has no megakernel of its own */
             } else {
-                free(mega_spv);
-                COMPAT_INFO("RT megakernel SPIR-V builder failed for %u stages", rp->stage_count);
+                rt_mega_compile(d, device, pipelineCache, pAllocator, rp, rp->stages, rp->stage_count, i, createInfoCount);
             }
         }
         /* round 4 lever MALI_COMPAT_RT_FREE_STAGES=1: a non-library pipeline never needs its stage SPIR-V again (the
@@ -5709,6 +5998,109 @@ static void rt_restore_post_trace_state(struct DeviceData *d,
     }
 }
 
+/* split-1112: the select pipeline (one per device, like rt_ind_pipeline) */
+static void rt_ensure_split_select_pipeline(struct DeviceData *d) {
+    if (__atomic_load_n(&d->rt_split_pipeline, __ATOMIC_ACQUIRE)) return;
+    pthread_mutex_lock(&d->bc_lock);
+    if (d->rt_split_pipeline || d->rt_split_failed) {
+        pthread_mutex_unlock(&d->bc_lock);
+        return;
+    }
+    d->rt_split_failed = true;   /* one attempt; cleared on success */
+    size_t wc = 0;
+#ifdef RT_SPLIT_TEST_NOSELECT   /* PC test build only: exercise the fallback (every child at full size) */
+    uint32_t *spv = NULL;
+    (void)rt_build_split_select_spirv;
+#else
+    uint32_t *spv = rt_build_split_select_spirv(&wc);
+#endif
+    if (spv && wc > 5) {
+        VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0,
+                                    .size = sizeof(struct RtSplitSelectPC) };
+        VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                            .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+        if (!d->rt_split_layout && d->fpCreatePipelineLayout(d->device, &plci, NULL, &d->rt_split_layout) != VK_SUCCESS)
+            d->rt_split_layout = VK_NULL_HANDLE;
+        if (d->rt_split_layout) {
+            VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                              .codeSize = wc * sizeof(uint32_t), .pCode = spv };
+            VkShaderModule mod = VK_NULL_HANDLE;
+            if (d->fpCreateShaderModule(d->device, &smci, NULL, &mod) == VK_SUCCESS) {
+                VkComputePipelineCreateInfo cpci = {
+                    .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                    .stage  = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main" },
+                    .layout = d->rt_split_layout,
+                };
+                VkPipeline p = VK_NULL_HANDLE;
+                if (d->fpCreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &cpci, NULL, &p) == VK_SUCCESS && p) {
+                    __atomic_store_n(&d->rt_split_pipeline, p, __ATOMIC_RELEASE);
+                    d->rt_split_failed = false;
+                }
+                d->fpDestroyShaderModule(d->device, mod, NULL);
+            }
+        }
+    }
+    if (spv && (!d->rt_split_pipeline || g_debug) && rt_env()->dump_spv) {   /* failure or DEBUG: for spirv-val */
+        const char *dir = getenv("MALI_COMPAT_DUMP_RT_SPV");
+        char path[512];
+        snprintf(path, sizeof path, "%s/rt_split_select%s.spv", (dir && dir[0]) ? dir : "/tmp",
+                 d->rt_split_pipeline ? "" : "_failed");
+        FILE *fp = fopen(path, "wb");
+        if (fp) { fwrite(spv, 4, wc, fp); fclose(fp); }
+    }
+    free(spv);
+    LOG("rt_split: select pipeline %s (%zu words)", d->rt_split_pipeline ? "created" : "FAILED -> every child is "
+        "dispatched at full size (each runs only its own raygen)", wc);
+    pthread_mutex_unlock(&d->bc_lock);
+}
+
+/* split-1112: record one emulated trace of a split pipeline. Called where the unsplit path binds the megakernel and
+ * dispatches (after the pre-trace barrier, before the post-trace barrier); w/h/dpt = direct launch size (indirect: 0,
+ * the select kernel reads the command). */
+static void rt_split_dispatch(struct DeviceData *d, VkCommandBuffer cmd, struct RtCmdState *cs, struct RtPipeline *rp,
+                              const struct RtDispatchPushConstants *pc, uint32_t w, uint32_t h, uint32_t dpt) {
+    atomic_fetch_add_explicit(&g_split_traces, 1, memory_order_relaxed);
+    rt_ensure_split_select_pipeline(d);
+    uint32_t off = 0;
+    VkDeviceAddress dst = d->rt_split_pipeline ? rt_ring_alloc(d, RT_SPLIT_MAX * 16u, 16u, NULL, &off) : 0ULL;
+    VkDeviceAddress zero = rt_get_zero_bda(d);
+    if (d->rt_split_pipeline && d->fpCmdDispatchIndirect && d->rt_ring_buf && dst && zero) {
+        struct RtSplitSelectPC sp;
+        memset(&sp, 0, sizeof sp);
+        sp.rgen_base = pc->rgen_base;
+        sp.dst_bda   = dst;
+        sp.ind_bda   = pc->indirect_mode ? pc->indirect_bda : 0ULL;
+        sp.zero_bda  = zero;
+        sp.mode      = pc->indirect_mode;
+        sp.count     = rp->split_n;
+        sp.w = w; sp.h = h; sp.d = dpt;
+        sp.rgen_size = pc->rgen_size;
+        for (uint32_t k = 0; k < rp->split_n; k++) sp.ids[k] = rp->split_rgen[k];
+        d->fpCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->rt_split_pipeline);
+        d->fpCmdPushConstants(cmd, d->rt_split_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof sp, &sp);
+        d->fpCmdDispatch(cmd, 1, 1, 1);
+        VkMemoryBarrier mb_bar = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                                   .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT };
+        d->fpCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                                0, 1, &mb_bar, 0, NULL, 0, NULL);
+        for (uint32_t k = 0; k < rp->split_n; k++) {
+            rt_prepare_and_bind_megakernel(d, cmd, cs, rp->split[k], pc);
+            d->fpCmdDispatchIndirect(cmd, d->rt_ring_buf, (VkDeviceSize)off + 16u * k);
+        }
+        atomic_fetch_add_explicit(&g_split_select, 1, memory_order_relaxed);
+        return;
+    }
+    /* fallback: every child at the launch size; a child's megakernel runs only its own raygen (its switch has one
+     * case), so exactly one of them does work - correct, only slower. Indirect: the old fallback size. */
+    for (uint32_t k = 0; k < rp->split_n; k++) {
+        rt_prepare_and_bind_megakernel(d, cmd, cs, rp->split[k], pc);
+        if (pc->indirect_mode) d->fpCmdDispatch(cmd, 256, 256, 1);
+        else d->fpCmdDispatch(cmd, (w + 7u) / 8u, (h + 3u) / 4u, dpt);
+    }
+    atomic_fetch_add_explicit(&g_split_fallback, 1, memory_order_relaxed);
+}
+
 static VKAPI_ATTR void VKAPI_CALL
 compat_CmdTraceRaysKHR(
     VkCommandBuffer                             commandBuffer,
@@ -5734,7 +6126,7 @@ compat_CmdTraceRaysKHR(
     struct RtCmdState *cs = rt_get_cmd_state(commandBuffer, false);
     if (!cs || !cs->bound_rt_pipeline) { atomic_fetch_add_explicit(&g_ray_skip_nostate, 1, memory_order_relaxed); return; }
     if (rt_forced_trace_skip()) return;
-    if (!rt_mega_ready(cs->bound_rt_pipeline)) { rt_count_skip(cs->bound_rt_pipeline); return; }
+    if (!rt_pipe_ready(cs->bound_rt_pipeline)) { rt_count_skip(cs->bound_rt_pipeline); return; }
     struct RtPipeline *rp = cs->bound_rt_pipeline;
 
     struct RtDispatchPushConstants pc;
@@ -5825,12 +6217,15 @@ compat_CmdTraceRaysKHR(
                                 0, NULL);
     }
 
-    rt_prepare_and_bind_megakernel(d, commandBuffer, cs, rp, &pc);
-
-    uint32_t gx = (width  + 7u) / 8u;
-    uint32_t gy = (height + 3u) / 4u;
-    uint32_t gz = depth;
-    d->fpCmdDispatch(commandBuffer, gx, gy, gz);
+    if (rp->split_n) {
+        rt_split_dispatch(d, commandBuffer, cs, rp, &pc, width, height, depth);   /* split-1112 */
+    } else {
+        rt_prepare_and_bind_megakernel(d, commandBuffer, cs, rp, &pc);
+        uint32_t gx = (width  + 7u) / 8u;
+        uint32_t gy = (height + 3u) / 4u;
+        uint32_t gz = depth;
+        d->fpCmdDispatch(commandBuffer, gx, gy, gz);
+    }
     {   /* round 4 ray counter: launched megakernel invocations (primary dispatch), not ray-query traversals */
         const uint64_t rays = (uint64_t)width * height * depth;
         const unsigned c = rt_ray_class(rp->stage_count);
@@ -5928,7 +6323,7 @@ static void rt_dispatch_indirect_common(
     struct RtCmdState *cs = rt_get_cmd_state(commandBuffer, false);
     if (!cs || !cs->bound_rt_pipeline) { atomic_fetch_add_explicit(&g_ray_skip_nostate, 1, memory_order_relaxed); return; }
     if (rt_forced_trace_skip()) return;
-    if (!rt_mega_ready(cs->bound_rt_pipeline)) { rt_count_skip(cs->bound_rt_pipeline); return; }
+    if (!rt_pipe_ready(cs->bound_rt_pipeline)) { rt_count_skip(cs->bound_rt_pipeline); return; }
     struct RtPipeline *rp = cs->bound_rt_pipeline;
 
     struct RtDispatchPushConstants pc;
@@ -6021,7 +6416,9 @@ static void rt_dispatch_indirect_common(
                                 0, NULL);
     }
 
-    if (d->rt_ind_pipeline && d->fpCmdDispatchIndirect && dst_bda && d->rt_ring_buf) {
+    if (rp->split_n) {
+        rt_split_dispatch(d, commandBuffer, cs, rp, &pc, 0u, 0u, 0u);   /* split-1112: reads the command on the GPU */
+    } else if (d->rt_ind_pipeline && d->fpCmdDispatchIndirect && dst_bda && d->rt_ring_buf) {
         uint64_t src_bda = indirectDeviceAddress + (indirect_mode == 2 ? 88ULL : 0ULL);
         uint64_t setup_pc[2] = { src_bda, dst_bda };
 
@@ -8325,6 +8722,10 @@ static void rt_report(struct DeviceData *d, bool final) {
         (unsigned long long)atomic_load(&g_rt_skip_nopipe), (unsigned long long)atomic_load(&g_ray_skip_zero),
         (unsigned long long)atomic_load(&g_ray_skip_nostate), (unsigned long long)tr, (unsigned long long)rays,
         (unsigned long long)ind);
+    if (rt_env()->split)
+        LOG("rt_split: t=%lld ms%s split traces total=%llu gpu_select=%llu fallback=%llu (record time)", (long long)now,
+            tag, (unsigned long long)atomic_load(&g_split_traces), (unsigned long long)atomic_load(&g_split_select),
+            (unsigned long long)atomic_load(&g_split_fallback));
     w_ms = now; w_tr = tr; w_rays = rays; w_ind = ind; w_builds = builds; w_inplace = inplace;
     pthread_mutex_unlock(&g_rt_report_lock);
 }

@@ -1523,6 +1523,9 @@ struct DeviceData {
     PFN_vkVoidFunction sal_next[SAL_NEXT_MAX]; // MALI_COMPAT_SSBO_ALIGN_LOG: next entry points (sal_proc), NULL when off
     VkPipelineLayout rt_ind_layout;
     VkPipeline rt_ind_pipeline;
+    VkPipelineLayout rt_split_layout;   /* split-1112: raygen select kernel (MALI_COMPAT_RT_SPLIT=1) */
+    VkPipeline rt_split_pipeline;
+    bool rt_split_failed;
     PFN_vkCmdUpdateBuffer fpCmdUpdateBuffer;  /* rt param upload (GPU-ordered), param-fix 11-08 */
     PFN_vkCmdDispatchIndirect fpCmdDispatchIndirect;
     PFN_vkCmdSetDescriptorBufferOffsetsEXT fpCmdSetDescriptorBufferOffsetsEXT;
@@ -9904,6 +9907,8 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
         }
         if (d->rt_ind_pipeline && d->fpDestroyPipeline) d->fpDestroyPipeline(device, d->rt_ind_pipeline, NULL);
         if (d->rt_ind_layout && d->fpDestroyPipelineLayout) d->fpDestroyPipelineLayout(device, d->rt_ind_layout, NULL);
+        if (d->rt_split_pipeline && d->fpDestroyPipeline) d->fpDestroyPipeline(device, d->rt_split_pipeline, NULL);
+        if (d->rt_split_layout && d->fpDestroyPipelineLayout) d->fpDestroyPipelineLayout(device, d->rt_split_layout, NULL);
         if (d->rt_zero_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_zero_buf, NULL);
         if (d->rt_zero_mem && d->fpFreeMemory) d->fpFreeMemory(device, d->rt_zero_mem, NULL);
         if (d->rt_ring_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_ring_buf, NULL);
