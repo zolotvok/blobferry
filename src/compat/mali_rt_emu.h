@@ -6149,7 +6149,7 @@ static void rt_split_dispatch(struct DeviceData *d, VkCommandBuffer cmd, struct 
         memset(&sp, 0, sizeof sp);
         sp.rgen_base = pc->rgen_base;
         sp.dst_bda   = dst;
-        sp.ind_bda   = pc->indirect_mode ? pc->indirect_bda : 0ULL;
+        sp.ind_bda   = (pc->indirect_mode & 0xffu) ? pc->indirect_bda : 0ULL;
         sp.zero_bda  = zero;
         sp.mode      = pc->indirect_mode & 0xffu;
         sp.count     = rp->split_n;
@@ -6180,12 +6180,13 @@ static void rt_split_dispatch(struct DeviceData *d, VkCommandBuffer cmd, struct 
      * indirect setup kernel (Codex 1111-201541 #2), its old 256x256 fallback only when that kernel is missing too. */
     uint32_t ind_off = 0;
     VkDeviceAddress ind_dst = 0ULL;
-    if (pc->indirect_mode) {
+    const uint32_t ind_mode = pc->indirect_mode & 0xffu;   /* local1d-1112: without the RT_PC_LOCAL1D flag bit */
+    if (ind_mode) {
         rt_ensure_indirect_setup_pipeline(d);
         if (d->rt_ind_pipeline && d->fpCmdDispatchIndirect && d->rt_ring_buf)
             ind_dst = rt_ring_alloc(d, 64, 64, NULL, &ind_off);
         if (ind_dst) {
-            uint64_t setup_pc[2] = { pc->indirect_bda + (pc->indirect_mode == 2 ? 88ULL : 0ULL), ind_dst };
+            uint64_t setup_pc[2] = { pc->indirect_bda + (ind_mode == 2 ? 88ULL : 0ULL), ind_dst };
             d->fpCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->rt_ind_pipeline);
             d->fpCmdPushConstants(cmd, d->rt_ind_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, setup_pc);
             d->fpCmdDispatch(cmd, 1, 1, 1);
@@ -6199,7 +6200,7 @@ static void rt_split_dispatch(struct DeviceData *d, VkCommandBuffer cmd, struct 
     for (uint32_t k = 0; k < rp->split_n; k++) {
         rt_prepare_and_bind_megakernel(d, cmd, cs, rp->split[k], pc);
         if (l1d) d->fpCmdDispatch(cmd, (w + 31u) / 32u, h, dpt);
-        else if (!pc->indirect_mode) d->fpCmdDispatch(cmd, (w + 7u) / 8u, (h + 3u) / 4u, dpt);
+        else if (!ind_mode) d->fpCmdDispatch(cmd, (w + 7u) / 8u, (h + 3u) / 4u, dpt);
         else if (ind_dst) d->fpCmdDispatchIndirect(cmd, d->rt_ring_buf, (VkDeviceSize)ind_off);
         else d->fpCmdDispatch(cmd, 256, 256, 1);
     }
