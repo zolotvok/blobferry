@@ -1344,6 +1344,171 @@ static uint64_t pc2_sum(int k) {
     return t;
 }
 
+// ---- MALI_COMPAT_BCD_RING=1 (diagnostic, default off). DOOM Eternal 2026-11-13 13:11: the menu froze after one vendor
+// GROUP_ERROR_FATAL (MMU translation fault, READ at GPU VA 0x5e080a37c0) while the pc2 counters stayed flat. The BC
+// decode reads the app's source buffer and writes a staging buffer through raw device addresses, so this keeps the last
+// BCR_N decode regions (sequence, command buffer, source buffer, the exact source bytes the shader reads, the staging
+// bytes it writes, format, size, CLOCK_MONOTONIC ms) and the last BCR_FREE_N staging buffers given back to the pool or
+// destroyed. Dumped to stderr by the pc2 log thread when v1 pushes and BC decodes are both flat for 2 ticks (20 s) after
+// having moved (once per stall, at most 3), and once more at the first device destroy / process exit with new entries.
+// Off: g_bcr stays NULL, the decode path pays one branch per region. [game/doom_eternal keeper, Claude Opus 5.5] 2026-11-13
+#define BCR_N 4096
+#define BCR_FREE_N 512
+struct BcrEnt { uint64_t seq, ms, cmd, srcbuf, src, src_end, dst, dst_end; uint32_t fmt, w, h, slices, row_B, slice_B; };
+struct BcrFree { uint64_t seq, ms, lo, hi; bool pooled; };
+struct BcdRing {
+    pthread_mutex_t m;
+    uint64_t n, nf;              // entries ever written (the next sequence numbers)
+    uint64_t dumped_n, dumped_nf; // n / nf at the last dump
+    int dumps, stall_dumps;      // dumps so far (numbering), of them stall dumps (at most 3)
+    bool end_done;
+    struct BcrEnt e[BCR_N];
+    struct BcrFree f[BCR_FREE_N];
+};
+static struct BcdRing *g_bcr; // set once in bcr_init (before the pc2 thread starts); NULL = key off
+static uint64_t bcr_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+static void bcr_add(uint64_t cmd, uint64_t srcbuf, uint64_t src, uint64_t src_B, uint64_t dst, uint64_t dst_B, uint32_t fmt,
+                    uint32_t w, uint32_t h, uint32_t slices, uint32_t row_B, uint32_t slice_B) {
+    struct BcdRing *r = g_bcr;
+    uint64_t ms = bcr_ms();
+    pthread_mutex_lock(&r->m);
+    r->e[r->n % BCR_N] = (struct BcrEnt){r->n, ms, cmd, srcbuf, src, src + src_B, dst, dst + dst_B, fmt, w, h, slices, row_B, slice_B};
+    r->n++;
+    pthread_mutex_unlock(&r->m);
+}
+static void bcr_free(uint64_t lo, uint64_t bytes, bool pooled) {
+    struct BcdRing *r = g_bcr;
+    uint64_t ms = bcr_ms();
+    pthread_mutex_lock(&r->m);
+    r->f[r->nf % BCR_FREE_N] = (struct BcrFree){r->nf, ms, lo, lo + bytes, pooled};
+    r->nf++;
+    pthread_mutex_unlock(&r->m);
+}
+// One dump: a copy taken under the lock, written without it. why = the header's reason, e.g. "stall: ... flat for 20 s".
+// end = the one dump at device destroy / exit (only when there are entries since the last dump).
+static void bcr_dump(const char *why, bool end) {
+    struct BcdRing *r = g_bcr;
+    struct BcrEnt *e = malloc(sizeof r->e);
+    struct BcrFree *f = malloc(sizeof r->f);
+    if (!e || !f) { free(e); free(f); return; }
+    pthread_mutex_lock(&r->m);
+    bool go = end ? !r->end_done && (r->n != r->dumped_n || r->nf != r->dumped_nf) : r->stall_dumps < 3;
+    if (go && end) r->end_done = true;
+    else if (go) r->stall_dumps++;
+    uint64_t n = r->n, nf = r->nf;
+    int k = go ? ++r->dumps : 0;
+    if (go) {
+        memcpy(e, r->e, sizeof r->e);
+        memcpy(f, r->f, sizeof r->f);
+        r->dumped_n = n;
+        r->dumped_nf = nf;
+    }
+    pthread_mutex_unlock(&r->m);
+    if (go) {
+        uint64_t m = n < BCR_N ? n : BCR_N, mf = nf < BCR_FREE_N ? nf : BCR_FREE_N;
+        fprintf(stderr, "mali-compat: bcd-ring dump %d (%s), entries %llu, staging frees %llu, now t %llu ms\n", k, why,
+                (unsigned long long)m, (unsigned long long)mf, (unsigned long long)bcr_ms());
+        for (uint64_t i = n - m; i < n; i++) {
+            const struct BcrEnt *x = &e[i % BCR_N];
+            fprintf(stderr, "mali-compat: bcd-ring #%llu t %llu cmd 0x%llx srcbuf 0x%llx read 0x%llx-0x%llx (row %u slice %u) "
+                    "write 0x%llx-0x%llx fmt %u %ux%ux%u\n", (unsigned long long)x->seq, (unsigned long long)x->ms,
+                    (unsigned long long)x->cmd, (unsigned long long)x->srcbuf, (unsigned long long)x->src,
+                    (unsigned long long)x->src_end, x->row_B, x->slice_B, (unsigned long long)x->dst,
+                    (unsigned long long)x->dst_end, x->fmt, x->w, x->h, x->slices);
+        }
+        for (uint64_t i = nf - mf; i < nf; i++) {
+            const struct BcrFree *x = &f[i % BCR_FREE_N];
+            fprintf(stderr, "mali-compat: bcd-ring free #%llu t %llu staging 0x%llx-0x%llx %s\n", (unsigned long long)x->seq,
+                    (unsigned long long)x->ms, (unsigned long long)x->lo, (unsigned long long)x->hi,
+                    x->pooled ? "pooled" : "destroyed");
+        }
+        fprintf(stderr, "mali-compat: bcd-ring dump %d end\n", k);
+    }
+    free(e);
+    free(f);
+}
+// bcd-mix (MALI_COMPAT_BCD_RING=1) [game/doom_eternal keeper, Claude Opus 5.5] 2026-11-13 14:xx: the BC decode is
+// recorded inline into the app's command buffer and restores only the last PUSH_RECS (8) push records; pushes past
+// 256 bytes and v2 pushes with a null layout are not recorded. Measures whether DOOM mixes decodes with its own pushes /
+// pipeline binds in one command buffer and whether records are lost. Counted only with the key (g_bcr); measurement
+// only, the restore is unchanged. One line from the pc2 thread when a number changed, once more at the first end dump.
+//   decodes           compat_CmdCopyBufferToImage calls on a tracked BC image that record the decode (staging acquired)
+//   cb-with-app-push  of those: the command buffer held >= 1 push record (v1 or v2) at that moment
+//   cb-with-draws     of those: the app had bound a graphics or compute pipeline in that command buffer since begin
+//                     (vkCmdBindPipeline is always hooked; draws/dispatches are not hooked without GPU_TIME)
+//   push-records-max  the most push records held at a decode (<= PUSH_RECS)
+//   push-dropped      records dropped because the 8-slot table was full (every tracked command buffer)
+//   push-unrecorded   pushes never recorded: v1 past 256 bytes (counted here) + v2 null layout / past 256 (PC2_V2_UNREC)
+static _Atomic uint64_t g_bcm_dec, g_bcm_push, g_bcm_draw, g_bcm_drop, g_bcm_v1unrec;
+static _Atomic uint32_t g_bcm_max;
+static void bcm_decode(uint32_t push_count, bool draws) {
+    atomic_fetch_add_explicit(&g_bcm_dec, 1, memory_order_relaxed);
+    if (push_count) atomic_fetch_add_explicit(&g_bcm_push, 1, memory_order_relaxed);
+    if (draws) atomic_fetch_add_explicit(&g_bcm_draw, 1, memory_order_relaxed);
+    uint32_t m = atomic_load_explicit(&g_bcm_max, memory_order_relaxed);
+    while (push_count > m && !atomic_compare_exchange_weak_explicit(&g_bcm_max, &m, push_count, memory_order_relaxed,
+                                                                    memory_order_relaxed)) {}
+}
+// end: the first end dump (device destroy / exit) prints even when nothing changed.
+static void bcm_line(bool end) {
+    static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+    static unsigned long long last[6];
+    static bool end_done;
+    unsigned long long v[6] = {atomic_load_explicit(&g_bcm_dec, memory_order_relaxed),
+                               atomic_load_explicit(&g_bcm_push, memory_order_relaxed),
+                               atomic_load_explicit(&g_bcm_draw, memory_order_relaxed),
+                               atomic_load_explicit(&g_bcm_max, memory_order_relaxed),
+                               atomic_load_explicit(&g_bcm_drop, memory_order_relaxed),
+                               pc2_sum(PC2_V2_UNREC) + atomic_load_explicit(&g_bcm_v1unrec, memory_order_relaxed)};
+    pthread_mutex_lock(&mx);
+    bool go = memcmp(v, last, sizeof v) != 0 || (end && !end_done);
+    if (end) end_done = true;
+    memcpy(last, v, sizeof v);
+    pthread_mutex_unlock(&mx);
+    if (go)
+        fprintf(stderr, "mali-compat: bcd-mix (pid %d): decodes %llu, cb-with-app-push %llu, cb-with-draws %llu, "
+                "push-records-max %u, push-dropped %llu, push-unrecorded %llu\n", (int)getpid(), v[0], v[1], v[2],
+                (unsigned)v[3], v[4], v[5]);
+}
+static void bcr_end_dump(const char *why) {
+    bcm_line(true); // bcd-mix
+    char h[128];
+    snprintf(h, sizeof h, "%s: pushes %llu decodes %llu", why, (unsigned long long)pc2_sum(PC2_V1),
+             (unsigned long long)pc2_sum(PC2_DECODES));
+    bcr_dump(h, true);
+}
+static void bcr_atexit(void) { bcr_end_dump("exit"); }
+static void bcr_init_once(void) {
+    const char *e = getenv("MALI_COMPAT_BCD_RING");
+    if (!e || atoi(e) <= 0) return;
+    struct BcdRing *r = calloc(1, sizeof *r);
+    if (!r) return;
+    pthread_mutex_init(&r->m, NULL);
+    g_bcr = r;
+    atexit(bcr_atexit);
+    fprintf(stderr, "mali-compat: bcd-ring on (MALI_COMPAT_BCD_RING): last %d BC decode regions + %d staging frees, dumped "
+            "when pushes and decodes are flat for 20 s (max 3) and once at device destroy / exit\n", BCR_N, BCR_FREE_N);
+}
+static void bcr_init(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, bcr_init_once);
+}
+// pc2 log thread only, every 10 s: a stall = both counters unchanged for 2 ticks after having moved; one dump per stall.
+static void bcr_tick(unsigned long long v1, unsigned long long dec) {
+    static unsigned long long pv1, pdec;
+    static int flat;
+    if (!g_bcr) return;
+    if (v1 != pv1 || dec != pdec) { pv1 = v1; pdec = dec; flat = 0; return; }
+    if (!(v1 | dec) || ++flat != 2) return;
+    char h[128];
+    snprintf(h, sizeof h, "stall: pushes %llu decodes %llu flat for 20 s", v1, dec);
+    bcr_dump(h, false);
+}
+
 // The app's compute push descriptors (vkd3d-proton pushes its root CBVs this way with MALI_COMPAT_VENDOR_ID=5143),
 // merged per binding since the last layout change, so they can be pushed again after a BC decode like the push
 // constants. Only single-descriptor writes are kept; anything else marks the record unusable. [Claude Opus 5.5] 2026-10-28
@@ -2735,6 +2900,7 @@ static PFN_vkVoidFunction dc_proc(VkDevice device, const char *n) {
 }
 
 static void destroy_staging(struct DeviceData *d, struct StagingResource *r) {
+    if (g_bcr && r->addr) bcr_free(r->addr, r->size, false); // MALI_COMPAT_BCD_RING
     if (r->buffer) d->fpDestroyBuffer(d->device, r->buffer, NULL);
     if (r->memory) {
         d->fpFreeMemory(d->device, r->memory, NULL);
@@ -2754,6 +2920,7 @@ static void release_staging(struct DeviceData *d, struct StagingResource *r) {
     }
     pthread_mutex_unlock(&g_staging_pool_mutex);
     if (!n) destroy_staging(d, r);
+    else if (g_bcr) bcr_free(r->addr, r->size, true); // MALI_COMPAT_BCD_RING
 }
 
 static uint64_t now_ns(void) {
@@ -4495,6 +4662,127 @@ static void fail_spv_dump(const uint32_t *code, size_t bytes, uint32_t hash) {
     if (f) { fwrite(code, 1, bytes, f); fclose(f); }
 }
 
+// ---- MALI_COMPAT_SG_LOG=1 (diagnostic, default off; docs/games/doom_eternal.md 2026-11-13). DOOM Eternal demands subgroup
+// support in the VERTEX stage; this driver has it only in FRAGMENT + COMPUTE (real stages 0x3f30) and FAKE_SUBGROUP reports
+// the vertex bit anyway. This key answers "does any vertex/tess/geometry shader really use subgroup instructions, and which
+// fragment/compute shaders do": every created shader module is scanned (read only, the module is passed on unchanged) for
+// OpGroupNonUniform* (333..366, RotateKHR 4431) and the Subgroup* built-ins. One line per module that has any (first 256),
+// those modules dumped to /root/mali-sg-<hash>.spv (first 24, plus up to 16 more with a faked stage), totals every 10 s on
+// the pc2 log thread. Counters are atomics; nothing else is touched. [game/doom_eternal, Claude Fable 5.2] 2026-11-13
+// =2 (diag-1113): as 1, and EVERY module with subgroup use is dumped, fragment ones included (each distinct hash once,
+// cap SGL_DUMP2_MAX files, one line when the cap is hit); the module lines run up to 4096; the SPV_KHR_shader_ballot /
+// SPV_KHR_subgroup_vote opcodes (4421 4422 4428-4430 4432) and quad-control 5110/5111 are counted too (=1 does not).
+// [game/doom_eternal keeper, Claude Opus 5.5] 2026-11-13
+#define SGL_DUMP2_MAX 128
+#define SGL_MODELS 7 // 0 vertex, 1 tess control, 2 tess eval, 3 geometry, 4 fragment, 5 compute, 6 any other
+static int g_sgl_on;
+static atomic_ullong g_sgl_mod[SGL_MODELS], g_sgl_sg[SGL_MODELS], g_sgl_total, g_sgl_total_sg;
+static void sgl_init(void) {
+    const char *e = getenv("MALI_COMPAT_SG_LOG");
+    g_sgl_on = e && atoi(e) > 0 ? (atoi(e) >= 2 ? 2 : 1) : 0;
+    if (g_sgl_on)
+        fprintf(stderr, "mali-compat: sg-log on (MALI_COMPAT_SG_LOG): shader modules are scanned for subgroup instructions "
+                "(read only); FAKED-STAGE = a vertex/tess/geometry module, where this driver has no subgroup support\n");
+    if (g_sgl_on >= 2)
+        fprintf(stderr, "mali-compat: sg-log level 2: every module with subgroup use is dumped to /root/mali-sg-<hash>.spv "
+                "(each hash once, cap %d files), module lines up to 4096, KHR ballot/vote + quad-control opcodes counted\n",
+                SGL_DUMP2_MAX);
+}
+static int sgl_on(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, sgl_init);
+    return g_sgl_on;
+}
+// MALI_COMPAT_SG_LOG=2: true when this hash is to be written (first time seen, below the cap).
+static bool sgl_dump2(uint32_t hash) {
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    static uint32_t done[SGL_DUMP2_MAX], n;
+    static bool capped;
+    bool fresh = true, cap_line = false;
+    pthread_mutex_lock(&m);
+    for (uint32_t i = 0; i < n && fresh; i++) fresh = done[i] != hash;
+    if (fresh && n == SGL_DUMP2_MAX) { fresh = false; cap_line = !capped; capped = true; }
+    else if (fresh) done[n++] = hash;
+    pthread_mutex_unlock(&m);
+    if (cap_line)
+        fprintf(stderr, "mali-compat: sg-log: dump cap of %d files reached at spv %08x; later modules are not dumped\n",
+                SGL_DUMP2_MAX, hash);
+    return fresh;
+}
+static void sgl_scan(const uint32_t *code, size_t bytes) {
+    size_t n = bytes / 4;
+    if (!code || n < 5 || code[0] != 0x07230203u) return;
+    uint32_t models = 0, ops = 0, builtins = 0, opc[35] = {0}; // opc[0..33] = 333..366, opc[34] = RotateKHR
+    static const uint16_t sgl_x[8] = {4421, 4422, 4428, 4429, 4430, 4432, 5110, 5111}; // =2 only: KHR ballot/vote, quad ctl
+    uint32_t opx[8] = {0};
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = code[i] >> 16, op = code[i] & 0xffffu;
+        if (!wc || wc > n - i) break;
+        if (op == 15 && wc >= 2) models |= 1u << (code[i + 1] <= 5 ? code[i + 1] : 6); // OpEntryPoint
+        else if (op >= 333 && op <= 366) { ops++; opc[op - 333]++; }
+        else if (op == 4431) { ops++; opc[34]++; }
+        else if (g_sgl_on >= 2 && ((op >= 4421 && op <= 4432) || op == 5110 || op == 5111))
+            for (int j = 0; j < 8; j++) { if (sgl_x[j] == op) { ops++; opx[j]++; } }
+        else if ((op == 71 && wc >= 4 && code[i + 2] == 11) || (op == 72 && wc >= 5 && code[i + 3] == 11)) { // (Member)Decorate BuiltIn
+            uint32_t b = code[i + (op == 71 ? 3 : 4)];
+            if (b == 36 || b == 38 || b == 40 || b == 41) builtins |= 1u << (b - 36); // Size, NumSubgroups, Id, LocalInvocationId
+            else if (b >= 4416 && b <= 4420) builtins |= 1u << (8 + b - 4416);      // Eq/Ge/Gt/Le/Lt mask
+        }
+        i += wc;
+    }
+    bool sg = ops || builtins;
+    for (int m = 0; m < SGL_MODELS; m++)
+        if (models & (1u << m)) {
+            atomic_fetch_add_explicit(&g_sgl_mod[m], 1, memory_order_relaxed);
+            if (sg) atomic_fetch_add_explicit(&g_sgl_sg[m], 1, memory_order_relaxed);
+        }
+    atomic_fetch_add_explicit(&g_sgl_total, 1, memory_order_relaxed);
+    if (!sg) return;
+    unsigned long long k = atomic_fetch_add_explicit(&g_sgl_total_sg, 1, memory_order_relaxed);
+    bool faked = (models & 0x0fu) != 0;
+    static atomic_uint lines, dumps, fdumps;
+    uint32_t hash = spv_hash(code, bytes);
+    if (atomic_fetch_add(&lines, 1) < (g_sgl_on >= 2 ? 4096u : 256u)) {
+        char l[512];
+        int w = 0;
+        for (int j = 0; j < 35 && w < (int)sizeof l - 16; j++)
+            if (opc[j]) w += snprintf(l + w, sizeof l - w, " %d:%u", j < 34 ? 333 + j : 4431, opc[j]);
+        for (int j = 0; j < 8 && w < (int)sizeof l - 16; j++)
+            if (opx[j]) w += snprintf(l + w, sizeof l - w, " %d:%u", sgl_x[j], opx[j]);
+        if (!w) l[0] = 0;
+        fprintf(stderr, "mali-compat: sg-log: #%llu spv %08x %zu B models 0x%02x ops %u [%s ] builtins 0x%04x%s\n", k, hash, bytes,
+                models, ops, l, builtins, faked ? " FAKED-STAGE" : "");
+    }
+    bool dump;
+    if (g_sgl_on >= 2) dump = sgl_dump2(hash);
+    else {
+        dump = atomic_fetch_add(&dumps, 1) < 24;
+        if (!dump && faked) dump = atomic_fetch_add(&fdumps, 1) < 16;
+    }
+    if (dump) {
+        char path[64];
+        snprintf(path, sizeof path, "/root/mali-sg-%08x.spv", hash);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(code, 1, bytes, f); fclose(f); }
+    }
+}
+// Called from the pc2 log thread only (every 10 s).
+static void sgl_summary(void) {
+    static unsigned long long last; // that thread only
+    unsigned long long t = atomic_load_explicit(&g_sgl_total, memory_order_relaxed);
+    if (!sgl_on() || t == last) return;
+    last = t;
+    unsigned long long m[SGL_MODELS], g[SGL_MODELS];
+    for (int i = 0; i < SGL_MODELS; i++) {
+        m[i] = atomic_load_explicit(&g_sgl_mod[i], memory_order_relaxed);
+        g[i] = atomic_load_explicit(&g_sgl_sg[i], memory_order_relaxed);
+    }
+    fprintf(stderr, "mali-compat: sg-log (pid %d): modules %llu, with subgroup use %llu | per stage with/all: vertex %llu/%llu "
+            "tessc %llu/%llu tesse %llu/%llu geom %llu/%llu fragment %llu/%llu compute %llu/%llu other %llu/%llu\n", (int)getpid(), t,
+            atomic_load_explicit(&g_sgl_total_sg, memory_order_relaxed), g[0], m[0], g[1], m[1], g[2], m[2], g[3], m[3], g[4],
+            m[4], g[5], m[5], g[6], m[6]);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
     VkDevice device, const VkShaderModuleCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkShaderModule *pShaderModule) {
@@ -4505,6 +4793,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
     }
     struct DeviceData *d = get_device_data(device);
     uint32_t hash = 0, mflags = 0, cnt[4];
+    if (pCreateInfo && sgl_on()) sgl_scan(pCreateInfo->pCode, pCreateInfo->codeSize); // MALI_COMPAT_SG_LOG, read only
     if (g_gpu_time || g_dump_hash_count || g_vs_scan || g_dc_on || g_ct) {
         hash = spv_hash(pCreateInfo->pCode, pCreateInfo->codeSize);
         spv_dump_if_wanted(pCreateInfo->pCode, pCreateInfo->codeSize, hash);
@@ -6620,7 +6909,10 @@ static void push_record(struct CmdBufData *c, VkPipelineLayout layout, VkShaderS
     uint32_t i = 0;
     while (i < c->push_count && !(c->push[i].layout == layout && c->push[i].stages == stages &&
                                   c->push[i].offset == offset && c->push[i].size == size)) i++;
-    if (i == c->push_count && c->push_count == PUSH_RECS) i = 0; // full: drop the oldest
+    if (i == c->push_count && c->push_count == PUSH_RECS) { // full: drop the oldest
+        i = 0;
+        if (g_bcr) atomic_fetch_add_explicit(&g_bcm_drop, 1, memory_order_relaxed); // MALI_COMPAT_BCD_RING bcd-mix
+    }
     if (i < c->push_count) {
         memmove(&c->push[i], &c->push[i + 1], (c->push_count - i - 1) * sizeof c->push[0]);
         c->push_count--;
@@ -6645,6 +6937,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdPushConstants(VkCommandBuffer comman
         return;
     }
     if (offset + size <= 256) push_record(c, layout, stages, offset, size, pValues, false);
+    else if (g_bcr) atomic_fetch_add_explicit(&g_bcm_v1unrec, 1, memory_order_relaxed); // MALI_COMPAT_BCD_RING bcd-mix
     c->dev->fpCmdPushConstants(commandBuffer, layout, stages, offset, size, pValues);
 }
 
@@ -6695,6 +6988,9 @@ static void *pc2_log_thread(void *arg) {
                     atomic_load_explicit(&g_bcd_nobda, memory_order_relaxed),
                     atomic_load_explicit(&g_bcd_done, memory_order_relaxed));
         }
+        sgl_summary(); // MALI_COMPAT_SG_LOG
+        bcr_tick(v1, dec); // MALI_COMPAT_BCD_RING
+        if (g_bcr) bcm_line(false); // MALI_COMPAT_BCD_RING: bcd-mix, when a number changed
     }
     return NULL;
 }
@@ -6775,6 +7071,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
     struct CmdBufData *cstate = cmd_data(commandBuffer);
     static struct CmdBufData no_state;
     if (!cstate) cstate = &no_state;
+    if (g_bcr) bcm_decode(cstate->push_count, cstate->gfx_pipeline || cstate->compute_pipeline); // BCD_RING bcd-mix
     VkPipeline decoder = cstate->descriptor_buffers && d->bc_pipelines_db[shader_idx] ? d->bc_pipelines_db[shader_idx]
                                                                                       : d->bc_pipelines[shader_idx];
     d->fpCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, decoder);
@@ -6803,6 +7100,10 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
         };
         d->fpCmdPushConstants(commandBuffer, d->bc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         d->fpCmdDispatch(commandBuffer, (w + 7) / 8, (h + 7) / 8, slices);
+        if (g_bcr) // MALI_COMPAT_BCD_RING: the bytes the shader reads (last block of the last row of the last slice) / writes
+            bcr_add((uint64_t)(uintptr_t)commandBuffer, (uint64_t)srcBuffer, full_src,
+                    w && h ? (uint64_t)(slices - 1) * src_slice_B + (uint64_t)((h - 1) / 4) * src_row_B + (uint64_t)((w + 3) / 4) * blk_B : 0,
+                    full_dst, (uint64_t)w * h * slices * texel_B, tracked.orig_format, w, h, slices, src_row_B, src_slice_B);
         dec[i] = *reg;
         dec[i].bufferOffset = dst_off[i];
         dec[i].bufferRowLength = 0;
@@ -7680,6 +7981,24 @@ static void gt_init(struct DeviceData *d, PFN_vkGetDeviceProcAddr gdpa) {
         return;
     }
     fprintf(stderr, "mali-compat: GPU timing on, report in %s\n", g->path);
+}
+
+// MALI_COMPAT_GPU_TIME (diag-1113): true for a hooked 1.2/1.3 command (or its KHR name) whose driver pointer is NULL on
+// this device, e.g. vkCmdBeginRenderingKHR on a Vulkan 1.1 device without the extension. The hook would call NULL.
+static bool gt_hook_missing(const struct GpuTime *g, const char *n) {
+    if (strncmp(n, "vkCmd", 5)) return false;
+    n += 5;
+    size_t l = strlen(n);
+    if (l > 3 && !strcmp(n + l - 3, "KHR")) l -= 3;
+    #define GT_MISS(fn) if (l == sizeof #fn - 1 && !strncmp(n, #fn, l)) return !g->fpCmd##fn
+    GT_MISS(BeginRendering);
+    GT_MISS(EndRendering);
+    GT_MISS(BeginRenderPass2);
+    GT_MISS(EndRenderPass2);
+    GT_MISS(DrawIndirectCount);
+    GT_MISS(DrawIndexedIndirectCount);
+    #undef GT_MISS
+    return false;
 }
 
 static void gt_destroy(struct DeviceData *d) {
@@ -9337,6 +9656,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     wls_clamp_init(); // same for MALI_COMPAT_WLS_CLAMP (pthread_once)
     sd_init(); // sync-diag keys (pthread_once)
     sal_init(); // MALI_COMPAT_SSBO_ALIGN_LOG (pthread_once)
+    bcr_init(); // MALI_COMPAT_BCD_RING (pthread_once; before the pc2 log thread is started below)
     {   // once: real vs reported subgroup masks (+ storage alignment), to see what FAKE_SUBGROUP / FAKE_ALIGN change
         static int logged;
         if (!logged && inst && inst->fpGetPhysicalDeviceProperties2) {
@@ -9431,6 +9751,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
                 bda_added |= !strcmp(props[i].extensionName, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
         free(props);
         if (bda_added) ext_names[mod_ci.enabledExtensionCount++] = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
+    }
+    // MALI_COMPAT_GPU_TIME on an app below Vulkan 1.2 (DOOM Eternal: 1.1): hostQueryReset is chained further down, but
+    // the device has vkResetQueryPool(EXT) only with VK_EXT_host_query_reset enabled, so GPU timing was "unavailable".
+    // Added when the app did not enable it, the driver lists it and the app is on >= 1.1 (the extension's dependency,
+    // physical-device-properties2, is core there). One line per such device after gt_init.
+    // [game/doom_eternal keeper, Claude Opus 5.5] 2026-11-13
+    int hqr_state = -1; // -1 no line (key off or app >= 1.2), 0 not added, 1 added, 2 enabled by the app
+    bool hqr_drv = false;
+    if (g_gpu_time && bda_api < VK_API_VERSION_1_2) {
+        bool app = false;
+        for (uint32_t i = 0; i < mod_ci.enabledExtensionCount; i++)
+            app |= !strcmp(ext_names[i], VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+        if (inst && inst->fpEnumerateDeviceExtensionProperties) {
+            uint32_t n = 0;
+            inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &n, NULL);
+            VkExtensionProperties *props = n ? malloc(n * sizeof *props) : NULL;
+            if (props && inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &n, props) >= 0)
+                for (uint32_t i = 0; i < n; i++) hqr_drv |= !strcmp(props[i].extensionName, VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+            free(props);
+        }
+        hqr_state = app ? 2 : hqr_drv && bda_api >= VK_API_VERSION_1_1;
+        if (hqr_state == 1) ext_names[mod_ci.enabledExtensionCount++] = VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME;
     }
     if (g_rt_pipeline) {
         const char *need_rt[3] = {
@@ -9910,6 +10252,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         d->fpCreateComputePipelinesReal = (PFN_vkCreateComputePipelines)fpGetDeviceProcAddr(*pDevice, "vkCreateComputePipelines");
         #undef LOAD_DEV
         if (g_gpu_time || g_async_ms || g_noatt_w || g_no_susres || g_dc_on || g_ct) gt_init(d, fpGetDeviceProcAddr); // without GPU_TIME: pointers only, no pool
+        if (hqr_state >= 0)
+            fprintf(stderr, "mali-compat: gpu-time: VK_EXT_host_query_reset %s for a Vulkan %u.%u app (driver lists it: %d), "
+                    "vkResetQueryPool %s\n", hqr_state == 1 ? "added" : hqr_state == 2 ? "enabled by the app" : "NOT added",
+                    VK_API_VERSION_MAJOR(bda_api), VK_API_VERSION_MINOR(bda_api), hqr_drv,
+                    d->gt && d->gt->fpResetQueryPool ? "yes" : "NO");
         if (g_ct && ct_ext_ok) ct_device_init(d, fpGetDeviceProcAddr);
         if (g_memlog) {
             d->ml_fpQueueSubmit = (PFN_vkQueueSubmit)fpGetDeviceProcAddr(*pDevice, "vkQueueSubmit");
@@ -9986,6 +10333,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
     struct DeviceData *d = get_device_data(device);
     if (g_memlog) ml_flush();
     if (d) {
+        if (g_bcr) bcr_end_dump("device destroy"); // MALI_COMPAT_BCD_RING: once, when there are entries since the last dump
         ct_device_destroy(d);
         sd_device_destroy(d);
         gt_destroy(d);
@@ -10138,6 +10486,10 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         }
     }
     if (g_gpu_time || g_async_ms || g_noatt_w || g_no_susres || g_dc_on || g_ct) { // GPU timing, async compiles, pass clamp, NO_SUSPEND_RESUME, desc-capture-1 and cover-trim share these hooks
+        if (g_gpu_time) { // diag-1113: on a device below 1.2/1.3 the driver's answer, not a hook over its NULL
+            struct DeviceData *nd = get_device_data(device);
+            if (nd && nd->gt && gt_hook_missing(nd->gt, pName)) return nd->get_device_proc_addr(device, pName);
+        }
         MATCH_DEV_KHR(CmdBeginRendering);
         MATCH_DEV_KHR(CmdEndRendering);
         MATCH_DEV(CmdBeginRenderPass);
