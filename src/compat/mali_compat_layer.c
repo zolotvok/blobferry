@@ -1162,10 +1162,11 @@ static void *budget_log_thread(void *arg) {
 #define ML_NONE UINT32_MAX
 #define ML_BUF (256u << 10)
 static int g_memlog; // 0 off, 1 on, 2 on without the capture-address query
+static bool g_addrmap; // MALI_COMPAT_ADDRMAP=1, see "GPU address map" below (addrmap-1113)
 static pthread_mutex_t g_ml_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_ml_fd = -1;
 static char *g_ml_buf;
-static size_t g_ml_len;
+static size_t g_ml_len, g_ml_bufsz = ML_BUF; // ADDRMAP: 4 MiB, so a flush inside an event is rare
 static uint64_t g_ml_bytes, g_ml_cap = 64ULL << 20; // bytes taken so far (written + buffered), cap
 static bool g_ml_stopped;
 static _Atomic uint64_t g_ml_submits;
@@ -1190,8 +1191,8 @@ static void ml_flush_locked(void) {
 
 // Called with g_ml_mutex held.
 static void ml_append_locked(const char *line, size_t n) {
-    if (g_ml_len + n > ML_BUF) ml_flush_locked();
-    if (n > ML_BUF) return;
+    if (g_ml_len + n > g_ml_bufsz) ml_flush_locked();
+    if (n > g_ml_bufsz) return;
     memcpy(g_ml_buf + g_ml_len, line, n);
     g_ml_len += n;
 }
@@ -1216,6 +1217,15 @@ static void ml_write(const char *line, size_t n) {
     pthread_mutex_unlock(&g_ml_mutex);
 }
 
+// ADDRMAP: events written per letter (A..Z), for the end line; the thread id is cached per thread (no syscall per event).
+static _Atomic uint64_t g_am_count[26];
+static __thread long tl_ml_tid;
+static long ml_tid(void) {
+    if (!g_addrmap) return (long)syscall(SYS_gettid); // MEMLOG alone: as before
+    if (!tl_ml_tid) tl_ml_tid = (long)syscall(SYS_gettid);
+    return tl_ml_tid;
+}
+
 // va_kind: 0 = '-', 1 = hex address, 2 = signed decimal (VkResult)
 static void ml_event(char ev, uint64_t mem, uint64_t size, uint32_t type, uint32_t heap, uint64_t va, int va_kind) {
     if (!g_memlog) return;
@@ -1225,8 +1235,9 @@ static void ml_event(char ev, uint64_t mem, uint64_t size, uint32_t type, uint32
     if (va_kind == 1) snprintf(vs, sizeof vs, "0x%llx", (unsigned long long)va);
     else if (va_kind == 2) snprintf(vs, sizeof vs, "%lld", (long long)(int64_t)va);
     int n = snprintf(line, sizeof line, "%llu\t%c\t0x%llx\t%llu\t%s\t%s\t%s\t%ld\t%llu\n", (unsigned long long)ml_now_ms(),
-                     ev, (unsigned long long)mem, (unsigned long long)size, ty, hp, vs, (long)syscall(SYS_gettid),
+                     ev, (unsigned long long)mem, (unsigned long long)size, ty, hp, vs, ml_tid(),
                      (unsigned long long)budget_live_mb());
+    if (g_addrmap && ev >= 'A' && ev <= 'Z') atomic_fetch_add_explicit(&g_am_count[ev - 'A'], 1, memory_order_relaxed);
     if (n > 0) ml_write(line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
 }
 
@@ -1236,27 +1247,34 @@ static void ml_flush(void) {
     pthread_mutex_unlock(&g_ml_mutex);
 }
 
+static void am_tick(void);
 static void *ml_flush_thread(void *arg) {
     (void)arg;
-    for (;;) {
+    for (unsigned tick = 1;; tick++) {
         sleep(1);
         pthread_mutex_lock(&g_ml_mutex);
         bool stop = g_ml_stopped;
         if (!stop) ml_flush_locked();
         pthread_mutex_unlock(&g_ml_mutex);
         if (stop) return NULL;
+        if (g_addrmap && tick % 10 == 0) am_tick(); // clock pair line + bc-misc counters
     }
 }
 
 // Once per process. Leaves g_memlog 0 when the file cannot be opened.
+static void am_clock_line(const char *what);
+static void am_atexit(void);
+static void am_end(const char *why);
 static void ml_open(const char *path, const char *comm) {
-    g_ml_buf = malloc(ML_BUF);
+    if (g_addrmap) g_ml_bufsz = 4u << 20;
+    g_ml_buf = malloc(g_ml_bufsz);
     g_ml_fd = g_ml_buf ? open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644) : -1;
     if (g_ml_fd < 0) {
         fprintf(stderr, "mali-compat: memlog: cannot open %s: %s\n", path, strerror(errno));
         free(g_ml_buf);
         g_ml_buf = NULL;
         g_memlog = 0;
+        g_addrmap = false; // no file: no address map either (set before any device, so no hook is handed out)
         return;
     }
     char h[256];
@@ -1265,14 +1283,105 @@ static void ml_open(const char *path, const char *comm) {
                      (unsigned long long)ml_now_ms(), (unsigned long long)(g_ml_cap >> 20),
                      g_memlog == 2 ? ", no capture address" : "");
     if (n > 0) ml_write(h, (size_t)n < sizeof h ? (size_t)n : sizeof h - 1);
+    if (g_addrmap) {
+        am_clock_line("start");
+        atexit(am_atexit); // registered before ml_flush, so it runs after it (atexit is LIFO): stderr only
+    }
     atexit(ml_flush);
     pthread_t t;
     if (pthread_create(&t, NULL, ml_flush_thread, NULL) == 0) pthread_detach(t);
 }
 
-static void ml_submit_tick(void) {
+static uint64_t ml_submit_tick(void) {
     uint64_t n = atomic_fetch_add(&g_ml_submits, 1) + 1;
-    if (n % 100 == 0) ml_event('S', n, 0, ML_NONE, BUDGET_NO_HEAP, 0, 0);
+    if (n % 100 == 0 && !g_addrmap) ml_event('S', n, 0, ML_NONE, BUDGET_NO_HEAP, 0, 0); // ADDRMAP: every submit, am_submit
+    return n;
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// GPU address map, MALI_COMPAT_ADDRMAP=1 [game/doom_eternal keeper, Claude Opus 5.5] 2026-11-13 (addrmap-1113).
+// Diagnostic for a single vendor GPU MMU fault (DOOM Eternal title freeze): which Vulkan object, if any, lay at the
+// faulting GPU VA. Turns the memlog on (as MALI_COMPAT_MEMLOG=1 unless MEMLOG is set; MEMLOG=2 keeps "no capture
+// address") and adds to the same TSV /root/mali-memlog-<comm>.tsv. The 9 memlog columns stay; ADDRMAP events add a
+// 10th column "detail" with space-separated k=v pairs (A/M/U/F/X keep 9 columns). Default cap 256 MiB under ADDRMAP
+// (MALI_COMPAT_MEMLOG_MB still wins). Events (mem / size / type / heap / va columns, then detail):
+//   B  bind       mem = VkDeviceMemory, size = the object's vkGet*MemoryRequirements size ('-' if not queried), va =
+//                 the memory's capture address + offset ('-' unknown); detail kind=buf|img obj off req_align and the
+//                 object's description (buffers: csize usage flags; images: fmt (driver-side) bcfmt (app's BC format,
+//                 '-' if not a BC shadow) ext mips layers samples tiling usage flags (driver-side) appflags afrc
+//                 (2bpc|3bpc|none: fixed-rate chained by the layer) cc (compression-control flags the driver got, '-'
+//                 none) [plane] [swapchain])
+//   D  destroy    mem = the object handle, size/va = its bind (req size, va) or '-'; detail kind obj mem off|unbound
+//   L  layer alloc / R layer free: memory the layer itself allocates from the driver (not through compat_AllocateMemory):
+//                 mem = VkDeviceMemory, size, type, heap, va = the staging buffer's device address (bc-staging) or the
+//                 capture address; detail purpose=bc-staging|ct-buffer|rt-ring|rt-zero|rt-scratch [buf bucket]
+//   X  (layer)    a failed layer allocation: va = VkResult, detail purpose=...
+//   N  marker     mem = the object handle; detail what=dpool-create|dpool-reset|dpool-destroy|cpool-create|cpool-reset|
+//                 cpool-destroy|cb-alloc|cb-free|qpool-create|qpool-destroy|qpool-layer|swapchain-create|swapchain-destroy
+//   S  submit     every vkQueueSubmit/2 (MEMLOG alone: every 100th): mem = the submit count, size = submitCount;
+//                 detail v=1|2 q cbs (all command buffers in the call) cb=<first up to 4> fence
+//   C  bc-misc    the first 16 copies/blits/resolves touching an emulated-BC image, and image views on one whose
+//                 format differs from the image's BC format; detail call ...
+// '#' lines: "# addrmap clock start|tick realtime_ms R monotonic_ms M pid P" (both clocks read back to back) at the
+// start and every 10 s; the blob's fault print carries CLOCK_MONOTONIC seconds, logcat wall time.
+// stderr: "mali-compat: addrmap on (MALI_COMPAT_ADDRMAP): ..." once, "mali-compat: addrmap: bc-misc ..." when those
+// counters change (10-s tick), "mali-compat: addrmap: end (device destroy|exit): ..." with the event counts.
+// Unset: no hook below is handed out; the always-hooked paths (vkCreateImage/Buffer/ImageView, vkDestroyImage, command
+// pool/buffer calls, BC staging) test one bool.
+// ------------------------------------------------------------------------------------------------------------------
+static _Atomic uint64_t g_am_bcmisc[9], g_am_bcmisc_logged, g_am_c_events;
+static const char *const g_am_bcmisc_name[9] = {"copy-src", "copy-dst", "blit-src", "blit-dst", "copy-to-buf",
+                                                "resolve-src", "resolve-dst", "view-bcfmt", "view-nonbc"};
+static uint64_t am_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+static void am_clock_line(const char *what) {
+    uint64_t rt = ml_now_ms(), mono = am_mono_ms();
+    char l[160];
+    int n = snprintf(l, sizeof l, "# addrmap clock %s realtime_ms %llu monotonic_ms %llu pid %d\n", what,
+                     (unsigned long long)rt, (unsigned long long)mono, (int)getpid());
+    if (n > 0) ml_write(l, (size_t)n < sizeof l ? (size_t)n : sizeof l - 1);
+}
+
+// One ADDRMAP line: the 9 memlog columns, then the detail column (printf format). One snprintf + one vsnprintf into
+// a stack buffer, then the append under g_ml_mutex (ml_write); no other lock is held or taken here.
+#define AM_NA UINT64_MAX // size / va column '-'
+__attribute__((format(printf, 8, 9)))
+static void am_emit(char ev, uint64_t mem, uint64_t size, uint32_t type, uint32_t heap, uint64_t va, int va_kind,
+                    const char *fmt, ...) {
+    if (!g_addrmap || !g_memlog) return;
+    char line[768], ty[16] = "-", hp[16] = "-", vs[32] = "-", sz[24] = "-";
+    if (type != ML_NONE) snprintf(ty, sizeof ty, "%u", type);
+    if (heap < VK_MAX_MEMORY_HEAPS) snprintf(hp, sizeof hp, "%u", heap);
+    if (size != AM_NA) snprintf(sz, sizeof sz, "%llu", (unsigned long long)size);
+    if (va_kind == 1 && va != AM_NA) snprintf(vs, sizeof vs, "0x%llx", (unsigned long long)va);
+    else if (va_kind == 2) snprintf(vs, sizeof vs, "%lld", (long long)(int64_t)va);
+    int n = snprintf(line, sizeof line, "%llu\t%c\t0x%llx\t%s\t%s\t%s\t%s\t%ld\t%llu\t", (unsigned long long)ml_now_ms(), ev,
+                     (unsigned long long)mem, sz, ty, hp, vs, ml_tid(), (unsigned long long)budget_live_mb());
+    if (n <= 0 || (size_t)n >= sizeof line - 2) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(line + n, sizeof line - (size_t)n - 1, fmt, ap);
+    va_end(ap);
+    if (k < 0) k = 0;
+    size_t len = (size_t)n + ((size_t)k < sizeof line - (size_t)n - 1 ? (size_t)k : sizeof line - (size_t)n - 2);
+    line[len++] = '\n';
+    if (ev >= 'A' && ev <= 'Z') atomic_fetch_add_explicit(&g_am_count[ev - 'A'], 1, memory_order_relaxed);
+    ml_write(line, len);
+}
+
+// Layer-internal driver memory: L after a successful allocation (X on failure), R before the free.
+static void am_layer_alloc(const char *purpose, VkResult r, VkDeviceMemory m, uint64_t size, uint32_t type, uint32_t heap,
+                           uint64_t va, uint64_t buf, uint64_t bucket) {
+    if (r != VK_SUCCESS) { am_emit('X', 0, size, type, heap, (uint64_t)(int64_t)r, 2, "purpose=%s layer=1", purpose); return; }
+    if (buf) am_emit('L', (uint64_t)(uintptr_t)m, size, type, heap, va ? va : AM_NA, 1, "purpose=%s buf=0x%llx bucket=%llu",
+                     purpose, (unsigned long long)buf, (unsigned long long)bucket);
+    else am_emit('L', (uint64_t)(uintptr_t)m, size, type, heap, va ? va : AM_NA, 1, "purpose=%s", purpose);
+}
+static void am_layer_free(const char *purpose, VkDeviceMemory m, uint64_t size, uint32_t type, uint32_t heap, uint64_t va) {
+    am_emit('R', (uint64_t)(uintptr_t)m, size, type, heap, va ? va : AM_NA, 1, "purpose=%s", purpose);
 }
 
 struct StagingResource {
@@ -1282,6 +1391,7 @@ struct StagingResource {
     VkDeviceAddress addr;
     VkDeviceSize mem_size;  // counted in g_heap_usage[heap] while memory is set (0 = not counted)
     uint32_t heap;
+    uint32_t type;          // memory type (MALI_COMPAT_ADDRMAP events)
 };
 
 // Decode staging buffers are pooled per device: a command buffer's buffers go back to the pool when it is begun,
@@ -1710,6 +1820,7 @@ struct DeviceData {
     struct DcFns *dcf;  // desc-capture-1 driver entry points, NULL when off
     struct CtDev *ct;   // cover-trim (MALI_COMPAT_COVER_TRIM), NULL when off
     struct SdDev *sd;   // sync-diag next/driver entry points, NULL when off
+    struct AmFns *amf;  // MALI_COMPAT_ADDRMAP driver entry points, NULL when off
 #define SAL_NEXT_MAX 16
     PFN_vkVoidFunction sal_next[SAL_NEXT_MAX]; // MALI_COMPAT_SSBO_ALIGN_LOG: next entry points (sal_proc), NULL when off
     VkPipelineLayout rt_ind_layout;
@@ -2899,10 +3010,32 @@ static PFN_vkVoidFunction dc_proc(VkDevice device, const char *n) {
     return NULL;
 }
 
+// MALI_COMPAT_ADDRMAP: the layer's other driver allocations (cover-trim buffer, RT emulation rings/scratch) go through
+// these two: L with the capture address (when the memlog has the query, i.e. MEMLOG=1), R before the free. Key unset:
+// the same driver call, one bool test.
+static VkResult am_drv_alloc(struct DeviceData *d, const char *purpose, const VkMemoryAllocateInfo *ai, VkDeviceMemory *m) {
+    VkResult r = d->fpAllocateMemory(d->device, ai, NULL, m);
+    if (g_addrmap) {
+        uint32_t heap = ai->memoryTypeIndex < VK_MAX_MEMORY_TYPES ? d->type_heap[ai->memoryTypeIndex] : BUDGET_NO_HEAP;
+        uint64_t va = 0;
+        if (r == VK_SUCCESS && g_memlog == 1 && d->fpGetDeviceMemoryOpaqueCaptureAddress) {
+            VkDeviceMemoryOpaqueCaptureAddressInfo ci = {VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO, NULL, *m};
+            va = d->fpGetDeviceMemoryOpaqueCaptureAddress(d->device, &ci);
+        }
+        am_layer_alloc(purpose, r, r == VK_SUCCESS ? *m : VK_NULL_HANDLE, ai->allocationSize, ai->memoryTypeIndex, heap, va, 0, 0);
+    }
+    return r;
+}
+static void am_drv_free(struct DeviceData *d, const char *purpose, VkDeviceMemory m) {
+    if (g_addrmap && m) am_layer_free(purpose, m, AM_NA, ML_NONE, BUDGET_NO_HEAP, 0);
+    d->fpFreeMemory(d->device, m, NULL);
+}
+
 static void destroy_staging(struct DeviceData *d, struct StagingResource *r) {
     if (g_bcr && r->addr) bcr_free(r->addr, r->size, false); // MALI_COMPAT_BCD_RING
     if (r->buffer) d->fpDestroyBuffer(d->device, r->buffer, NULL);
     if (r->memory) {
+        if (g_addrmap) am_layer_free("bc-staging", r->memory, r->mem_size, r->type, r->heap, r->addr);
         d->fpFreeMemory(d->device, r->memory, NULL);
         if (r->mem_size) budget_sub(r->heap, r->mem_size);
     }
@@ -2962,16 +3095,25 @@ static VkResult acquire_staging(struct DeviceData *d, VkDeviceSize size, struct 
         if (r == VK_SUCCESS) {
             out->mem_size = mem_req.size;
             out->heap = type < VK_MAX_MEMORY_TYPES ? d->type_heap[type] : BUDGET_NO_HEAP;
+            out->type = type;
             budget_add(out->heap, out->mem_size);
+        } else if (g_addrmap) {
+            am_layer_alloc("bc-staging", r, VK_NULL_HANDLE, mem_req.size, type, BUDGET_NO_HEAP, 0, 0, 0);
         }
     }
     if (r == VK_SUCCESS) r = d->fpBindBufferMemory(d->device, out->buffer, out->memory, 0);
     if (r != VK_SUCCESS) {
+        if (g_addrmap && out->memory) // allocated, bind failed: L without an address, then destroy_staging's R
+            am_layer_alloc("bc-staging", VK_SUCCESS, out->memory, out->mem_size, out->type, out->heap, 0,
+                           (uint64_t)(uintptr_t)out->buffer, bucket);
         destroy_staging(d, out);
         return r;
     }
     VkBufferDeviceAddressInfo bda = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, out->buffer};
     out->addr = d->fpGetBufferDeviceAddress(d->device, &bda);
+    if (g_addrmap) // va = the staging buffer's device address (bound at offset 0 = the allocation's base)
+        am_layer_alloc("bc-staging", VK_SUCCESS, out->memory, out->mem_size, out->type, out->heap, out->addr,
+                       (uint64_t)(uintptr_t)out->buffer, bucket);
     if (g_stats) atomic_fetch_add(&g_st_new, 1);
     return VK_SUCCESS;
 }
@@ -3134,6 +3276,7 @@ struct MemInfo {
     size_t map_size;
     uint32_t heap; // counted in g_heap_usage[heap] (BUDGET_NO_HEAP = not counted)
     uint64_t va;   // memlog: last mapped base (pointer - offset), 0 = never mapped
+    uint64_t cva;  // MALI_COMPAT_ADDRMAP: the capture address of the A event, 0 = none
     struct MemInfo *next;
 };
 #define MEM_BUCKETS 4096
@@ -4544,15 +4687,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDescriptorPool(VkDevice devic
         ci.pPoolSizes = sizes;
     }
     VkResult r = d->fpCreateDescriptorPool(device, &ci, pAllocator, pPool);
+    VkResult r_scaled = r;
     static atomic_uint logged;
     if ((k > 1 || g_desc_pool_pad) && atomic_fetch_add(&logged, 1) < 4)
         fprintf(stderr, "mali-compat: desc-pool-scale x%u pad %u: maxSets %u -> %u, %u sizes (+%u missing types), flags 0x%x, result %d\n", k,
                 g_desc_pool_pad, pCreateInfo->maxSets, ci.maxSets, pCreateInfo->poolSizeCount, added, (unsigned)ci.flags, r);
+    bool fell_back = false;
     if (r != VK_SUCCESS && (k > 1 || added)) { // fall back to the app's own sizes rather than fail
         r = d->fpCreateDescriptorPool(device, pCreateInfo, pAllocator, pPool);
+        fell_back = true;
         fprintf(stderr, "mali-compat: desc-pool-scale: scaled pool failed, app sizes -> %d\n", r);
     }
     if (g_fail_lvl) fl_pool_log(pCreateInfo, r);
+    if (g_addrmap) { // N marker: the app's request -> what the driver got (app sizes again after a fallback)
+        const VkDescriptorPoolCreateInfo *got = fell_back ? pCreateInfo : &ci;
+        char sz[400];
+        size_t o = 0;
+        sz[0] = 0;
+        for (uint32_t i = 0; i < got->poolSizeCount && o < sizeof sz - 32; i++) {
+            uint32_t req = i < pCreateInfo->poolSizeCount ? pCreateInfo->pPoolSizes[i].descriptorCount : 0;
+            o += (size_t)snprintf(sz + o, sizeof sz - o, "%s%d:%u->%u", i ? "," : "", got->pPoolSizes[i].type, req,
+                                  got->pPoolSizes[i].descriptorCount);
+        }
+        const VkDescriptorPoolInlineUniformBlockCreateInfo *iub =
+            find_struct(pCreateInfo->pNext, VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_INLINE_UNIFORM_BLOCK_CREATE_INFO);
+        am_emit('N', r == VK_SUCCESS && pPool ? (uint64_t)*pPool : 0, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0,
+                "what=dpool-create maxSets=%u->%u flags=0x%x sizes=%s iub=%d scale=%u result=%d scaled_result=%d", pCreateInfo->maxSets,
+                got->maxSets, (unsigned)got->flags, sz, iub ? (int)iub->maxInlineUniformBlockBindings : -1, k, r, r_scaled);
+    }
     return r;
 }
 
@@ -6189,6 +6351,223 @@ static void fixup_end(struct image_fixup *fx) {
     free(fx->fl_mapped);
 }
 
+// ---- MALI_COMPAT_ADDRMAP: object descriptions (created here, bound in the bind hooks, dropped at destroy) ----------
+struct AmObj {
+    uint64_t h;
+    struct AmObj *next;
+    uint8_t kind;                    // 1 buffer, 2 image
+    bool bound;
+    uint32_t usage, appusage, flags, appflags; // driver-side usage/flags and the app's
+    uint32_t mips, layers, samples, tiling, imgtype, w, hh, dd;
+    int32_t fmt, bcfmt;              // driver-side format; the app's BC format (0 = not an emulated BC shadow)
+    uint32_t afrc;                   // fixed-rate flags the layer chained for a BC shadow (0 = none)
+    int64_t cc;                      // compression-control flags in the driver's chain (-1 = no struct)
+    uint32_t cc_rate;                // its first pFixedRateFlags entry (explicit rate), 0 = none
+    uint64_t csize;                  // buffer create size
+    uint64_t mem, off, req, va;      // the bind (req / va AM_NA when unknown)
+};
+#define AM_BUCKETS 16384
+static struct AmObj *g_am_obj[AM_BUCKETS];
+static pthread_mutex_t g_am_mutex = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_am_obj_live;
+
+static void am_obj_put(const struct AmObj *o) {
+    struct AmObj *e = malloc(sizeof *e);
+    if (!e) return;
+    *e = *o;
+    uint32_t b = handle_bucket(o->h, AM_BUCKETS);
+    struct AmObj *old = NULL;
+    pthread_mutex_lock(&g_am_mutex);
+    for (struct AmObj **pp = &g_am_obj[b]; *pp; pp = &(*pp)->next)
+        if ((*pp)->h == o->h) { old = *pp; *pp = old->next; break; } // a handle reused without a destroy seen here
+    e->next = g_am_obj[b];
+    g_am_obj[b] = e;
+    pthread_mutex_unlock(&g_am_mutex);
+    if (old) free(old);
+    else atomic_fetch_add_explicit(&g_am_obj_live, 1, memory_order_relaxed);
+}
+// Copies the entry out; with bind set, records the bind first. remove: the entry goes (destroy).
+static bool am_obj_get(uint64_t h, struct AmObj *out, const struct AmObj *bind, bool remove) {
+    uint32_t b = handle_bucket(h, AM_BUCKETS);
+    struct AmObj *e = NULL;
+    pthread_mutex_lock(&g_am_mutex);
+    for (struct AmObj **pp = &g_am_obj[b]; *pp; pp = &(*pp)->next) {
+        if ((*pp)->h != h) continue;
+        e = *pp;
+        if (bind) { e->bound = true; e->mem = bind->mem; e->off = bind->off; e->req = bind->req; e->va = bind->va; }
+        *out = *e;
+        if (remove) *pp = e->next;
+        break;
+    }
+    pthread_mutex_unlock(&g_am_mutex);
+    if (e && remove) { free(e); atomic_fetch_sub_explicit(&g_am_obj_live, 1, memory_order_relaxed); }
+    return e != NULL;
+}
+
+static const char *am_rate(uint32_t f) {
+    return !f ? "none" : f == VK_IMAGE_COMPRESSION_FIXED_RATE_2BPC_BIT_EXT ? "2bpc"
+         : f == VK_IMAGE_COMPRESSION_FIXED_RATE_3BPC_BIT_EXT ? "3bpc" : "other";
+}
+static void am_desc(const struct AmObj *o, char *s, size_t n) {
+    if (!o) { snprintf(s, n, "desc=unknown"); return; }
+    if (o->kind == 1) {
+        snprintf(s, n, "csize=%llu usage=0x%x appusage=0x%x flags=0x%x", (unsigned long long)o->csize, o->usage, o->appusage,
+                 o->flags);
+        return;
+    }
+    char bc[16] = "-", cc[48] = "-";
+    if (o->bcfmt) snprintf(bc, sizeof bc, "%d", o->bcfmt);
+    if (o->cc >= 0) snprintf(cc, sizeof cc, "0x%llx/%s", (unsigned long long)o->cc, am_rate(o->cc_rate));
+    snprintf(s, n, "fmt=%d bcfmt=%s ext=%ux%ux%u mips=%u layers=%u samples=%u tiling=%u type=%u usage=0x%x appusage=0x%x "
+             "flags=0x%x appflags=0x%x afrc=%s cc=%s", o->fmt, bc, o->w, o->hh, o->dd, o->mips, o->layers, o->samples,
+             o->tiling, o->imgtype, o->usage, o->appusage, o->flags, o->appflags, am_rate(o->afrc), cc);
+}
+
+// vkCreateImage (always hooked; this runs only with the key): what the driver got, before fixup_end restores the app's
+// own compression-control struct.
+static void am_image_created(VkImage img, const VkImageCreateInfo *app, const struct image_fixup *fx) {
+    const VkImageCreateInfo *u = fx->use;
+    struct AmObj o = {.h = (uint64_t)(uintptr_t)img, .kind = 2, .usage = u->usage, .appusage = app->usage, .flags = u->flags,
+                      .appflags = app->flags, .mips = u->mipLevels, .layers = u->arrayLayers, .samples = u->samples,
+                      .tiling = u->tiling, .imgtype = u->imageType, .w = u->extent.width, .hh = u->extent.height,
+                      .dd = u->extent.depth, .fmt = u->format, .bcfmt = fx->is_bc ? app->format : 0,
+                      .afrc = fx->is_bc ? fx->rate : 0, .cc = -1, .req = AM_NA, .va = AM_NA};
+    const VkImageCompressionControlEXT *cc = find_struct(u->pNext, VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT);
+    if (cc) {
+        o.cc = cc->flags;
+        if (cc->flags == VK_IMAGE_COMPRESSION_FIXED_RATE_EXPLICIT_EXT && cc->compressionControlPlaneCount && cc->pFixedRateFlags)
+            o.cc_rate = cc->pFixedRateFlags[0];
+    }
+    am_obj_put(&o);
+}
+static void am_buffer_created(VkBuffer b, const VkBufferCreateInfo *app, const VkBufferCreateInfo *drv) {
+    struct AmObj o = {.h = (uint64_t)(uintptr_t)b, .kind = 1, .usage = drv->usage, .appusage = app->usage, .flags = drv->flags,
+                      .csize = drv->size, .cc = -1, .req = AM_NA, .va = AM_NA};
+    am_obj_put(&o);
+}
+
+// The memory's base VA: the capture address of its A event ("cap"), else its last mapped base ("map", the M event;
+// SAME_VA: CPU VA = GPU VA), else 0 ("-").
+static uint64_t am_mem_va(VkDeviceMemory m, const char **src) {
+    uint64_t va = 0;
+    *src = "-";
+    if (!m) return 0;
+    pthread_mutex_lock(&g_mem_mutex);
+    struct MemInfo *e = mem_find(m);
+    if (e && e->cva) { va = e->cva; *src = "cap"; }
+    else if (e && e->va) { va = e->va; *src = "map"; }
+    pthread_mutex_unlock(&g_mem_mutex);
+    return va;
+}
+
+struct AmFns { // driver entry points for the ADDRMAP hooks (NULL = the driver lacks it; the hook is then not handed out)
+    PFN_vkBindImageMemory BindImageMemory;
+    PFN_vkBindBufferMemory2 BindBufferMemory2;
+    PFN_vkBindImageMemory2 BindImageMemory2;
+    PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
+    PFN_vkCreateCommandPool CreateCommandPool;
+    PFN_vkResetDescriptorPool ResetDescriptorPool;
+    PFN_vkDestroyDescriptorPool DestroyDescriptorPool;
+    PFN_vkCreateSwapchainKHR CreateSwapchainKHR;
+    PFN_vkDestroySwapchainKHR DestroySwapchainKHR;
+    PFN_vkCmdCopyImage CmdCopyImage;
+    PFN_vkCmdBlitImage CmdBlitImage;
+    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
+    PFN_vkCmdResolveImage CmdResolveImage;
+    PFN_vkCmdCopyImage2 CmdCopyImage2;
+    PFN_vkCmdBlitImage2 CmdBlitImage2;
+    PFN_vkCmdCopyImageToBuffer2 CmdCopyImageToBuffer2;
+    PFN_vkCmdResolveImage2 CmdResolveImage2;
+};
+static void am_device_init(struct DeviceData *d, PFN_vkGetDeviceProcAddr gdpa, VkDevice dev) {
+    struct AmFns *f = calloc(1, sizeof *f);
+    if (!f) return;
+    #define AM_LOAD(fn) if (!(f->fn = (PFN_vk##fn)gdpa(dev, "vk" #fn))) f->fn = (PFN_vk##fn)gdpa(dev, "vk" #fn "KHR")
+    AM_LOAD(BindImageMemory);
+    AM_LOAD(BindBufferMemory2);
+    AM_LOAD(BindImageMemory2);
+    AM_LOAD(GetImageMemoryRequirements);
+    AM_LOAD(CreateCommandPool);
+    AM_LOAD(ResetDescriptorPool);
+    AM_LOAD(DestroyDescriptorPool);
+    AM_LOAD(CmdCopyImage);
+    AM_LOAD(CmdBlitImage);
+    AM_LOAD(CmdCopyImageToBuffer);
+    AM_LOAD(CmdResolveImage);
+    AM_LOAD(CmdCopyImage2);
+    AM_LOAD(CmdBlitImage2);
+    AM_LOAD(CmdCopyImageToBuffer2);
+    AM_LOAD(CmdResolveImage2);
+    #undef AM_LOAD
+    f->CreateSwapchainKHR = (PFN_vkCreateSwapchainKHR)gdpa(dev, "vkCreateSwapchainKHR");
+    f->DestroySwapchainKHR = (PFN_vkDestroySwapchainKHR)gdpa(dev, "vkDestroySwapchainKHR");
+    d->amf = f;
+}
+
+// B event. kind 1 buffer, 2 image; query: one vkGet*MemoryRequirements for the size (not for disjoint planes or
+// swapchain binds); extra: plane / swapchain detail.
+static void am_bind(struct DeviceData *d, VkDevice device, int kind, uint64_t h, VkDeviceMemory m, VkDeviceSize off, bool query,
+                    const char *extra) {
+    struct AmObj o;
+    bool known = am_obj_get(h, &o, NULL, false);
+    VkMemoryRequirements mr = {0};
+    bool have = false;
+    if (query && m) {
+        if (kind == 1 && d->fpGetBufferMemoryRequirements) {
+            d->fpGetBufferMemoryRequirements(device, (VkBuffer)(uintptr_t)h, &mr);
+            have = true;
+        } else if (kind == 2 && d->amf && d->amf->GetImageMemoryRequirements && !(known && (o.flags & VK_IMAGE_CREATE_DISJOINT_BIT))) {
+            d->amf->GetImageMemoryRequirements(device, (VkImage)(uintptr_t)h, &mr);
+            have = true;
+        }
+    }
+    const char *vasrc;
+    uint64_t cva = am_mem_va(m, &vasrc);
+    struct AmObj bind = {.mem = (uint64_t)(uintptr_t)m, .off = off, .req = have ? mr.size : AM_NA, .va = cva ? cva + off : AM_NA};
+    known = am_obj_get(h, &o, &bind, false);
+    char desc[448];
+    am_desc(known ? &o : NULL, desc, sizeof desc);
+    am_emit('B', (uint64_t)(uintptr_t)m, bind.req, ML_NONE, BUDGET_NO_HEAP, bind.va, 1, "kind=%s obj=0x%llx off=0x%llx align=%llu vasrc=%s %s%s",
+            kind == 1 ? "buf" : "img", (unsigned long long)h, (unsigned long long)off, (unsigned long long)mr.alignment, vasrc, desc,
+            extra ? extra : "");
+}
+static void am_destroy(int kind, uint64_t h) {
+    struct AmObj o;
+    bool known = am_obj_get(h, &o, NULL, true);
+    if (known && o.bound)
+        am_emit('D', h, o.req, ML_NONE, BUDGET_NO_HEAP, o.va, 1, "kind=%s obj=0x%llx mem=0x%llx off=0x%llx", kind == 1 ? "buf" : "img",
+                (unsigned long long)h, (unsigned long long)o.mem, (unsigned long long)o.off);
+    else
+        am_emit('D', h, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 1, "kind=%s obj=0x%llx %s", kind == 1 ? "buf" : "img",
+                (unsigned long long)h, known ? "unbound" : "untracked");
+}
+
+// bc-misc: copies/blits/resolves touching an emulated-BC image (idx: counter for a BC source / destination, -1 none).
+static void am_bcmisc(const char *call, VkCommandBuffer cb, uint64_t src, int si, uint64_t dst, int di, uint32_t regions) {
+    struct AmObj s = {0}, t = {0};
+    bool sbc = si >= 0 && am_obj_get(src, &s, NULL, false) && s.bcfmt;
+    bool dbc = di >= 0 && am_obj_get(dst, &t, NULL, false) && t.bcfmt;
+    if (!sbc && !dbc) return;
+    if (sbc) atomic_fetch_add_explicit(&g_am_bcmisc[si], 1, memory_order_relaxed);
+    if (dbc) atomic_fetch_add_explicit(&g_am_bcmisc[di], 1, memory_order_relaxed);
+    if (atomic_fetch_add_explicit(&g_am_c_events, 1, memory_order_relaxed) < 16)
+        am_emit('C', 0, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "call=%s cb=0x%llx src=0x%llx srcfmt=%d srcbc=%d dst=0x%llx dstfmt=%d dstbc=%d "
+                "regions=%u", call, (unsigned long long)(uintptr_t)cb, (unsigned long long)src, s.fmt, s.bcfmt,
+                (unsigned long long)dst, t.fmt, t.bcfmt, regions);
+}
+// vkCreateImageView on an emulated-BC image with a view format other than the image's BC format.
+static void am_view(const VkImageViewCreateInfo *ci, VkResult r, VkImageView v) {
+    struct AmObj o;
+    if (!am_obj_get((uint64_t)(uintptr_t)ci->image, &o, NULL, false) || !o.bcfmt || (int32_t)ci->format == o.bcfmt) return;
+    bool vbc = panvk_format_is_bc(ci->format);
+    atomic_fetch_add_explicit(&g_am_bcmisc[vbc ? 7 : 8], 1, memory_order_relaxed);
+    if (atomic_fetch_add_explicit(&g_am_c_events, 1, memory_order_relaxed) < 16)
+        am_emit('C', 0, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "call=CreateImageView img=0x%llx view=0x%llx bcfmt=%d imgfmt=%d "
+                "viewfmt=%d driverviewfmt=%d result=%d", (unsigned long long)(uintptr_t)ci->image,
+                (unsigned long long)(uintptr_t)v, o.bcfmt, o.fmt, ci->format,
+                vbc ? (int)panvk_bc_decoded_format(ci->format) : (int)ci->format, r);
+}
+
 static VKAPI_ATTR void VKAPI_CALL compat_GetDeviceImageMemoryRequirements(
     VkDevice device, const VkDeviceImageMemoryRequirements *pInfo, VkMemoryRequirements2 *pMemoryRequirements) {
     struct DeviceData *d = get_device_data(device);
@@ -6305,6 +6684,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImage(
         LOG("emulating BC image %p: orig=%d -> decoded=%d (%ux%u)",
             (void *)*pImage, pCreateInfo->format, fx.mod.format, pCreateInfo->extent.width, pCreateInfo->extent.height);
     }
+    if (g_addrmap && res == VK_SUCCESS && pImage && *pImage) am_image_created(*pImage, pCreateInfo, &fx); // before fixup_end
     fixup_end(&fx);
     relink(u_list);
     relink(u_wsi);
@@ -6314,6 +6694,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImage(
 static VKAPI_ATTR void VKAPI_CALL compat_DestroyImage(
     VkDevice device, VkImage image, const VkAllocationCallbacks *pAllocator) {
     struct DeviceData *d = get_device_data(device);
+    if (g_addrmap && image) am_destroy(2, (uint64_t)(uintptr_t)image); // before the driver: the handle may be reused
     unregister_bc_image(image);
     if (g_rt_compress) rt_untrack(image);
     d->fpDestroyImage(device, image, pAllocator);
@@ -6355,6 +6736,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateImageView(
     VkDevice device, const VkImageViewCreateInfo *pCreateInfo,
     const VkAllocationCallbacks *pAllocator, VkImageView *pView) {
     VkResult res = create_image_view(device, pCreateInfo, pAllocator, pView);
+    if (g_addrmap) am_view(pCreateInfo, res, res == VK_SUCCESS && pView ? *pView : VK_NULL_HANDLE);
     if ((g_gpu_time || g_ct) && res == VK_SUCCESS && pView) {
         struct ImgNode img = {0};
         img_get(g_img_info, (uint64_t)pCreateInfo->image, &img);
@@ -6408,13 +6790,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateQueryPool(VkDevice device, co
                                                             const VkAllocationCallbacks *pAllocator, VkQueryPool *pPool) {
     struct DeviceData *d = get_device_data(device);
     VkResult r = d->fpCreateQueryPool(device, pCreateInfo, pAllocator, pPool);
-    if (r == VK_SUCCESS && pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION) occl_pool(*pPool, true, false);
+    if (r == VK_SUCCESS && g_fake_occlusion && pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION) occl_pool(*pPool, true, false);
+    if (g_addrmap) // handed out for ADDRMAP alone too (then the occlusion table above stays untouched)
+        am_emit('N', r == VK_SUCCESS && pPool ? (uint64_t)*pPool : 0, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0,
+                "what=qpool-create type=%d count=%u stats=0x%x result=%d", pCreateInfo->queryType, pCreateInfo->queryCount,
+                pCreateInfo->pipelineStatistics, r);
     return r;
 }
 
 static VKAPI_ATTR void VKAPI_CALL compat_DestroyQueryPool(VkDevice device, VkQueryPool pool, const VkAllocationCallbacks *pAllocator) {
     struct DeviceData *d = get_device_data(device);
-    if (pool) occl_pool(pool, false, true);
+    if (pool && g_fake_occlusion) occl_pool(pool, false, true);
+    if (g_addrmap && pool) am_emit('N', (uint64_t)pool, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "what=qpool-destroy");
     d->fpDestroyQueryPool(device, pool, pAllocator);
 }
 
@@ -6484,6 +6871,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateBuffer(
     }
 
     VkResult r = d->fpCreateBuffer(device, &mod, pAllocator, pBuffer);
+    if (g_addrmap && r == VK_SUCCESS) am_buffer_created(*pBuffer, pCreateInfo, &mod);
     if (g_dc_on && r == VK_SUCCESS) dc_buf_create(d, *pBuffer, &mod);
     if (as_buf && r == VK_SUCCESS) rt_as_buf_add(*pBuffer, mod.size, as_xfer);   /* round 4: + size, all AS buffers */
     return r;
@@ -6787,6 +7175,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateMemory(
                 va = d->fpGetDeviceMemoryOpaqueCaptureAddress(device, &ci);
             }
             ml_event('A', (uint64_t)(uintptr_t)*pMemory, pAllocateInfo->allocationSize, mod.memoryTypeIndex, heap, va, va ? 1 : 0);
+            if (g_addrmap && va) { // for the B events' va
+                pthread_mutex_lock(&g_mem_mutex);
+                struct MemInfo *me = mem_find(*pMemory);
+                if (me) me->cva = va;
+                pthread_mutex_unlock(&g_mem_mutex);
+            }
         }
     } else if (g_memlog) {
         ml_event('X', 0, pAllocateInfo->allocationSize, mod.memoryTypeIndex, heap, (uint64_t)(int64_t)res, 2);
@@ -7212,6 +7606,9 @@ static VKAPI_ATTR void VKAPI_CALL compat_FreeCommandBuffers(
     VkDevice device, VkCommandPool commandPool, uint32_t commandBufferCount,
     const VkCommandBuffer *pCommandBuffers) {
     struct DeviceData *d = get_device_data(device);
+    if (g_addrmap)
+        am_emit('N', (uint64_t)commandPool, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "what=cb-free count=%u first=0x%llx",
+                commandBufferCount, commandBufferCount && pCommandBuffers ? (unsigned long long)(uintptr_t)pCommandBuffers[0] : 0ull);
     if (d) {
         for (uint32_t i = 0; i < commandBufferCount; i++) {
             reset_cmd_data(d, pCommandBuffers[i], true);
@@ -7225,6 +7622,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_AllocateCommandBuffers(
     struct DeviceData *d = get_device_data(device);
     if (!d || !d->fpAllocateCommandBuffers) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult res = d->fpAllocateCommandBuffers(device, pAllocateInfo, pCommandBuffers);
+    if (g_addrmap && pAllocateInfo)
+        am_emit('N', (uint64_t)pAllocateInfo->commandPool, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0,
+                "what=cb-alloc count=%u level=%d first=0x%llx result=%d", pAllocateInfo->commandBufferCount, pAllocateInfo->level,
+                res == VK_SUCCESS && pCommandBuffers && pAllocateInfo->commandBufferCount ? (unsigned long long)(uintptr_t)pCommandBuffers[0] : 0ull,
+                res);
     if (res == VK_SUCCESS && pAllocateInfo && pCommandBuffers) {
         for (uint32_t i = 0; i < pAllocateInfo->commandBufferCount; i++) {
             struct CmdBufData *e = cmd_data(pCommandBuffers[i]);
@@ -7244,6 +7646,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_ResetCommandPool(
     // the g_staged entries are visited, not the whole table. The pool is externally synchronized with its command
     // buffers, so no other thread touches these entries meanwhile.
     struct DeviceData *d = get_device_data(device);
+    if (g_addrmap) am_emit('N', (uint64_t)commandPool, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "what=cpool-reset flags=0x%x", flags);
     if (d) {
         struct CmdBufData *mine = NULL;
         pthread_mutex_lock(&g_cmdbuf_mutex);
@@ -7280,6 +7683,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_ResetCommandPool(
 static VKAPI_ATTR void VKAPI_CALL compat_DestroyCommandPool(
     VkDevice device, VkCommandPool commandPool, const VkAllocationCallbacks *pAllocator) {
     struct DeviceData *d = get_device_data(device);
+    if (g_addrmap && commandPool) am_emit('N', (uint64_t)commandPool, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "what=cpool-destroy");
     if (d) {
         pthread_mutex_lock(&g_cmdbuf_mutex);
         for (int b = 0; b < CMDBUF_BUCKETS; b++) {
@@ -7964,6 +8368,8 @@ static void gt_init(struct DeviceData *d, PFN_vkGetDeviceProcAddr gdpa) {
         fprintf(stderr, "mali-compat: GPU timing unavailable (query pool or hostQueryReset missing)\n");
         return;
     }
+    if (g_addrmap) am_emit('N', (uint64_t)g->pool, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "what=qpool-layer type=%d count=%u",
+                           VK_QUERY_TYPE_TIMESTAMP, 2 * GT_SLOTS);
     g->fpResetQueryPool(d->device, g->pool, 0, 2 * GT_SLOTS);
     char comm[32] = "unknown";
     FILE *f = fopen("/proc/self/comm", "r");
@@ -8007,6 +8413,7 @@ static void gt_destroy(struct DeviceData *d) {
     if (g->pool) {
         atomic_store(&g->stop, true);
         pthread_join(g->thread, NULL);
+        if (g_addrmap) am_emit('N', (uint64_t)g->pool, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "what=qpool-layer-destroy");
         g->fpDestroyQueryPool(d->device, g->pool, NULL);
     }
     d->gt = NULL;
@@ -9124,16 +9531,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_QueueSubmit2(VkQueue queue, uint32_
     return r;
 }
 
-// MALI_COMPAT_MEMLOG: S event every 100th submit, then the GPU-timing hook if that is on, else the driver.
+// MALI_COMPAT_ADDRMAP: S event for every submit (first up to 4 command buffers of the whole call).
+static void am_submit(VkQueue queue, uint64_t k, int v, uint32_t n, const VkSubmitInfo *si, const VkSubmitInfo2 *si2, VkFence fence) {
+    uint64_t first[4] = {0};
+    uint32_t cbs = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t c = si ? si[i].commandBufferCount : si2[i].commandBufferInfoCount;
+        for (uint32_t j = 0; j < c; j++, cbs++)
+            if (cbs < 4) first[cbs] = si ? (uint64_t)(uintptr_t)si[i].pCommandBuffers[j] : (uint64_t)(uintptr_t)si2[i].pCommandBufferInfos[j].commandBuffer;
+    }
+    am_emit('S', k, n, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "v=%d q=0x%llx cbs=%u cb=0x%llx,0x%llx,0x%llx,0x%llx fence=0x%llx", v,
+            (unsigned long long)(uintptr_t)queue, cbs, (unsigned long long)first[0], (unsigned long long)first[1],
+            (unsigned long long)first[2], (unsigned long long)first[3], (unsigned long long)fence);
+}
+
+// MALI_COMPAT_MEMLOG: S event every 100th submit (ADDRMAP: every one), then the GPU-timing hook if that is on, else the driver.
 static VKAPI_ATTR VkResult VKAPI_CALL compat_MlQueueSubmit(VkQueue queue, uint32_t n, const VkSubmitInfo *si, VkFence fence) {
     struct DeviceData *d = get_device_data_by_cmd((VkCommandBuffer)queue);
-    ml_submit_tick();
+    uint64_t k = ml_submit_tick();
+    if (g_addrmap) am_submit(queue, k, 1, n, si, NULL, fence);
     if ((g_gpu_time || g_dc_on) && d->gt && d->gt->fpQueueSubmit) return compat_QueueSubmit(queue, n, si, fence);
     return d->ml_fpQueueSubmit(queue, n, si, fence);
 }
 static VKAPI_ATTR VkResult VKAPI_CALL compat_MlQueueSubmit2(VkQueue queue, uint32_t n, const VkSubmitInfo2 *si, VkFence fence) {
     struct DeviceData *d = get_device_data_by_cmd((VkCommandBuffer)queue);
-    ml_submit_tick();
+    uint64_t k = ml_submit_tick();
+    if (g_addrmap) am_submit(queue, k, 2, n, NULL, si, fence);
     if ((g_gpu_time || g_dc_on) && d->gt && d->gt->fpQueueSubmit2) return compat_QueueSubmit2(queue, n, si, fence);
     return d->ml_fpQueueSubmit2(queue, n, si, fence);
 }
@@ -9486,18 +9909,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
         g_budget_log_s = g_budget_accounted && (g_gpu_time || g_debug) && ls ? (uint32_t)(ls > 3600 ? 3600 : ls) : 0;
         static _Atomic bool ml_started;
         const char *ml = getenv("MALI_COMPAT_MEMLOG");
+        const char *am = getenv("MALI_COMPAT_ADDRMAP"); // addrmap-1113: turns the memlog on (as =1 unless MEMLOG=2)
+        bool am_on = am && *am && strcmp(am, "0");
+        bool ml_on = ml && *ml && strcmp(ml, "0");
         static char ml_path[300];
-        if (ml && *ml && strcmp(ml, "0") && !atomic_exchange(&ml_started, true)) {
+        if ((ml_on || am_on) && !atomic_exchange(&ml_started, true)) {
             const char *mmb = getenv("MALI_COMPAT_MEMLOG_MB");
-            unsigned long long cap = mmb ? strtoull(mmb, NULL, 10) : 64;
-            g_ml_cap = (cap ? cap : 64) << 20;
-            g_memlog = !strcmp(ml, "2") ? 2 : 1;
+            unsigned long long dflt = am_on ? 256 : 64, cap = mmb ? strtoull(mmb, NULL, 10) : dflt;
+            g_ml_cap = (cap ? cap : dflt) << 20;
+            g_memlog = ml_on && !strcmp(ml, "2") ? 2 : 1;
+            g_addrmap = am_on;
             char comm[32] = "unknown";
             FILE *cf = fopen("/proc/self/comm", "r");
             if (cf) { if (fgets(comm, sizeof comm, cf)) comm[strcspn(comm, "\n")] = 0; fclose(cf); }
             for (char *c = comm; *c; c++) if (*c == '/' || *c == ' ' || *c == '\\') *c = '_';
             snprintf(ml_path, sizeof ml_path, "/root/mali-memlog-%s.tsv", comm);
             ml_open(ml_path, comm);
+            if (g_addrmap)
+                fprintf(stderr, "mali-compat: addrmap on (MALI_COMPAT_ADDRMAP): %s, cap %llu MiB, memlog=%d%s, events A M U F X + "
+                        "B D L R N C, S every submit, clock line every 10 s\n", ml_path, (unsigned long long)(g_ml_cap >> 20),
+                        g_memlog, g_memlog == 2 ? " (no capture address: B va from the mapping only)" : "");
+            else if (am_on)
+                fprintf(stderr, "mali-compat: addrmap OFF: the memlog file could not be opened\n");
         }
         static _Atomic bool budget_logged;
         if (!atomic_exchange(&budget_logged, true)) {
@@ -10258,6 +10691,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
                     VK_API_VERSION_MAJOR(bda_api), VK_API_VERSION_MINOR(bda_api), hqr_drv,
                     d->gt && d->gt->fpResetQueryPool ? "yes" : "NO");
         if (g_ct && ct_ext_ok) ct_device_init(d, fpGetDeviceProcAddr);
+        if (g_addrmap) am_device_init(d, fpGetDeviceProcAddr, *pDevice);
         if (g_memlog) {
             d->ml_fpQueueSubmit = (PFN_vkQueueSubmit)fpGetDeviceProcAddr(*pDevice, "vkQueueSubmit");
             d->ml_fpQueueSubmit2 = (PFN_vkQueueSubmit2)fpGetDeviceProcAddr(*pDevice, "vkQueueSubmit2");
@@ -10350,19 +10784,22 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
         if (d->rt_split_pipeline && d->fpDestroyPipeline) d->fpDestroyPipeline(device, d->rt_split_pipeline, NULL);
         if (d->rt_split_layout && d->fpDestroyPipelineLayout) d->fpDestroyPipelineLayout(device, d->rt_split_layout, NULL);
         if (d->rt_zero_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_zero_buf, NULL);
-        if (d->rt_zero_mem && d->fpFreeMemory) d->fpFreeMemory(device, d->rt_zero_mem, NULL);
+        if (d->rt_zero_mem && d->fpFreeMemory) am_drv_free(d, "rt-zero", d->rt_zero_mem);
         if (d->rt_ring_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_ring_buf, NULL);
         if (d->rt_ring_mem && d->fpFreeMemory) {
             if (d->rt_ring_ptr && d->fpUnmapMemory) d->fpUnmapMemory(device, d->rt_ring_mem);
-            d->fpFreeMemory(device, d->rt_ring_mem, NULL);
+            am_drv_free(d, "rt-ring", d->rt_ring_mem);
         }
         if (d->rt_scratch_buf && d->fpDestroyBuffer) d->fpDestroyBuffer(device, d->rt_scratch_buf, NULL);
-        if (d->rt_scratch_mem && d->fpFreeMemory) d->fpFreeMemory(device, d->rt_scratch_mem, NULL);
+        if (d->rt_scratch_mem && d->fpFreeMemory) am_drv_free(d, "rt-scratch", d->rt_scratch_mem);
         if (g_as_hooks) rt_device_gone(d);   /* round 4: the layer's RT allocations leave rt_mem; final lines */
         pthread_mutex_destroy(&d->bc_lock);
         destroy_staging_pool(d);
         if (d->fpDestroyDevice && device)
             d->fpDestroyDevice(device, pAllocator);
+        if (g_addrmap) { ml_flush(); am_end("device destroy"); }
+        free(d->amf);
+        d->amf = NULL;
     }
     if (device) {
         pthread_mutex_lock(&g_table_mutex);
@@ -10380,6 +10817,188 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
         pthread_mutex_unlock(&g_table_mutex);
     }
 }
+
+// -----------------------------------------------------------------------------
+// MALI_COMPAT_ADDRMAP hooks (handed out by vkGetDeviceProcAddr only with the key, and only for names the driver has).
+// Each one calls what the dispatch would have handed out without the key (desc-capture's / the AS hooks' own entry
+// where those are on, else the driver), then writes its event. [game/doom_eternal keeper, Claude Opus 5.5] 2026-11-13
+// -----------------------------------------------------------------------------
+static VKAPI_ATTR VkResult VKAPI_CALL compat_AmBindBufferMemory(VkDevice device, VkBuffer b, VkDeviceMemory m, VkDeviceSize off) {
+    struct DeviceData *d = get_device_data(device);
+    VkResult r = g_dc_on && d->dcf ? compat_DcBindBufferMemory(device, b, m, off) : d->fpBindBufferMemory(device, b, m, off);
+    if (r == VK_SUCCESS) am_bind(d, device, 1, (uint64_t)(uintptr_t)b, m, off, true, NULL);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_AmBindBufferMemory2(VkDevice device, uint32_t n, const VkBindBufferMemoryInfo *bi) {
+    struct DeviceData *d = get_device_data(device);
+    VkResult r = g_dc_on && d->dcf ? compat_DcBindBufferMemory2(device, n, bi) : d->amf->BindBufferMemory2(device, n, bi);
+    for (uint32_t i = 0; r == VK_SUCCESS && i < n; i++) am_bind(d, device, 1, (uint64_t)(uintptr_t)bi[i].buffer, bi[i].memory, bi[i].memoryOffset, true, " v=2");
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_AmBindImageMemory(VkDevice device, VkImage img, VkDeviceMemory m, VkDeviceSize off) {
+    struct DeviceData *d = get_device_data(device);
+    VkResult r = d->amf->BindImageMemory(device, img, m, off);
+    if (r == VK_SUCCESS) am_bind(d, device, 2, (uint64_t)(uintptr_t)img, m, off, true, NULL);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_AmBindImageMemory2(VkDevice device, uint32_t n, const VkBindImageMemoryInfo *bi) {
+    struct DeviceData *d = get_device_data(device);
+    VkResult r = d->amf->BindImageMemory2(device, n, bi);
+    for (uint32_t i = 0; r == VK_SUCCESS && i < n; i++) {
+        const VkBindImagePlaneMemoryInfo *pl = find_struct(bi[i].pNext, VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO);
+        const VkBindImageMemorySwapchainInfoKHR *sw = find_struct(bi[i].pNext, VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
+        char extra[96] = " v=2";
+        if (pl) snprintf(extra, sizeof extra, " v=2 plane=0x%x", pl->planeAspect);
+        if (sw) snprintf(extra + strlen(extra), sizeof extra - strlen(extra), " swapchain=0x%llx index=%u",
+                         (unsigned long long)sw->swapchain, sw->imageIndex);
+        am_bind(d, device, 2, (uint64_t)(uintptr_t)bi[i].image, bi[i].memory, bi[i].memoryOffset, !pl && !sw, extra);
+    }
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmDestroyBuffer(VkDevice device, VkBuffer b, const VkAllocationCallbacks *a) {
+    if (b) am_destroy(1, (uint64_t)(uintptr_t)b); // before the driver: the handle may be reused right after
+    struct DeviceData *d = get_device_data(device);
+    if (g_as_hooks) { compat_RtDestroyBuffer(device, b, a); return; }
+    if (g_dc_on && d->dcf) { compat_DcDestroyBuffer(device, b, a); return; }
+    d->fpDestroyBuffer(device, b, a);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_AmCreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo *ci,
+                                                                 const VkAllocationCallbacks *a, VkCommandPool *p) {
+    VkResult r = get_device_data(device)->amf->CreateCommandPool(device, ci, a, p);
+    am_emit('N', r == VK_SUCCESS && p ? (uint64_t)*p : 0, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0,
+            "what=cpool-create flags=0x%x qfi=%u result=%d", ci->flags, ci->queueFamilyIndex, r);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_AmResetDescriptorPool(VkDevice device, VkDescriptorPool pool, VkDescriptorPoolResetFlags fl) {
+    struct DeviceData *d = get_device_data(device);
+    am_emit('N', (uint64_t)pool, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "what=dpool-reset");
+    return g_dc_on && d->dcf ? compat_DcResetDescriptorPool(device, pool, fl) : d->amf->ResetDescriptorPool(device, pool, fl);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmDestroyDescriptorPool(VkDevice device, VkDescriptorPool pool, const VkAllocationCallbacks *a) {
+    struct DeviceData *d = get_device_data(device);
+    if (pool) am_emit('N', (uint64_t)pool, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "what=dpool-destroy");
+    if (g_dc_on && d->dcf) compat_DcDestroyDescriptorPool(device, pool, a);
+    else d->amf->DestroyDescriptorPool(device, pool, a);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL compat_AmCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
+                                                                  const VkAllocationCallbacks *a, VkSwapchainKHR *sc) {
+    VkResult r = get_device_data(device)->amf->CreateSwapchainKHR(device, ci, a, sc);
+    am_emit('N', r == VK_SUCCESS && sc ? (uint64_t)*sc : 0, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0,
+            "what=swapchain-create fmt=%d ext=%ux%u images=%u layers=%u usage=0x%x present=%d old=0x%llx result=%d", ci->imageFormat,
+            ci->imageExtent.width, ci->imageExtent.height, ci->minImageCount, ci->imageArrayLayers, ci->imageUsage, ci->presentMode,
+            (unsigned long long)ci->oldSwapchain, r);
+    return r;
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmDestroySwapchainKHR(VkDevice device, VkSwapchainKHR sc, const VkAllocationCallbacks *a) {
+    if (sc) am_emit('N', (uint64_t)sc, AM_NA, ML_NONE, BUDGET_NO_HEAP, AM_NA, 0, "what=swapchain-destroy");
+    get_device_data(device)->amf->DestroySwapchainKHR(device, sc, a);
+}
+// bc-misc counters (indices into g_am_bcmisc_name)
+static VKAPI_ATTR void VKAPI_CALL compat_AmCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl,
+                                                        uint32_t n, const VkImageCopy *r) {
+    am_bcmisc("CmdCopyImage", cb, (uint64_t)(uintptr_t)src, 0, (uint64_t)(uintptr_t)dst, 1, n);
+    get_device_data_by_cmd(cb)->amf->CmdCopyImage(cb, src, sl, dst, dl, n, r);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmCmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl,
+                                                        uint32_t n, const VkImageBlit *r, VkFilter f) {
+    am_bcmisc("CmdBlitImage", cb, (uint64_t)(uintptr_t)src, 2, (uint64_t)(uintptr_t)dst, 3, n);
+    get_device_data_by_cmd(cb)->amf->CmdBlitImage(cb, src, sl, dst, dl, n, r, f);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkBuffer dst,
+                                                                uint32_t n, const VkBufferImageCopy *r) {
+    am_bcmisc("CmdCopyImageToBuffer", cb, (uint64_t)(uintptr_t)src, 4, (uint64_t)(uintptr_t)dst, -1, n);
+    get_device_data_by_cmd(cb)->amf->CmdCopyImageToBuffer(cb, src, sl, dst, n, r);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmCmdResolveImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl,
+                                                           uint32_t n, const VkImageResolve *r) {
+    am_bcmisc("CmdResolveImage", cb, (uint64_t)(uintptr_t)src, 5, (uint64_t)(uintptr_t)dst, 6, n);
+    get_device_data_by_cmd(cb)->amf->CmdResolveImage(cb, src, sl, dst, dl, n, r);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmCmdCopyImage2(VkCommandBuffer cb, const VkCopyImageInfo2 *i) {
+    am_bcmisc("CmdCopyImage2", cb, (uint64_t)(uintptr_t)i->srcImage, 0, (uint64_t)(uintptr_t)i->dstImage, 1, i->regionCount);
+    get_device_data_by_cmd(cb)->amf->CmdCopyImage2(cb, i);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmCmdBlitImage2(VkCommandBuffer cb, const VkBlitImageInfo2 *i) {
+    am_bcmisc("CmdBlitImage2", cb, (uint64_t)(uintptr_t)i->srcImage, 2, (uint64_t)(uintptr_t)i->dstImage, 3, i->regionCount);
+    get_device_data_by_cmd(cb)->amf->CmdBlitImage2(cb, i);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmCmdCopyImageToBuffer2(VkCommandBuffer cb, const VkCopyImageToBufferInfo2 *i) {
+    am_bcmisc("CmdCopyImageToBuffer2", cb, (uint64_t)(uintptr_t)i->srcImage, 4, (uint64_t)(uintptr_t)i->dstBuffer, -1, i->regionCount);
+    get_device_data_by_cmd(cb)->amf->CmdCopyImageToBuffer2(cb, i);
+}
+static VKAPI_ATTR void VKAPI_CALL compat_AmCmdResolveImage2(VkCommandBuffer cb, const VkResolveImageInfo2 *i) {
+    am_bcmisc("CmdResolveImage2", cb, (uint64_t)(uintptr_t)i->srcImage, 5, (uint64_t)(uintptr_t)i->dstImage, 6, i->regionCount);
+    get_device_data_by_cmd(cb)->amf->CmdResolveImage2(cb, i);
+}
+// vkGetDeviceProcAddr part (key set only): the hook when the driver answers the name and its pointer was loaded.
+static PFN_vkVoidFunction am_proc(VkDevice device, const char *n) {
+    #define AMF_OFF(fn) offsetof(struct AmFns, fn)
+    static const struct { const char *name; PFN_vkVoidFunction fn; size_t off; } t[] = {
+        {"vkBindBufferMemory", (PFN_vkVoidFunction)compat_AmBindBufferMemory, SIZE_MAX},
+        {"vkBindBufferMemory2", (PFN_vkVoidFunction)compat_AmBindBufferMemory2, AMF_OFF(BindBufferMemory2)},
+        {"vkBindBufferMemory2KHR", (PFN_vkVoidFunction)compat_AmBindBufferMemory2, AMF_OFF(BindBufferMemory2)},
+        {"vkBindImageMemory", (PFN_vkVoidFunction)compat_AmBindImageMemory, AMF_OFF(BindImageMemory)},
+        {"vkBindImageMemory2", (PFN_vkVoidFunction)compat_AmBindImageMemory2, AMF_OFF(BindImageMemory2)},
+        {"vkBindImageMemory2KHR", (PFN_vkVoidFunction)compat_AmBindImageMemory2, AMF_OFF(BindImageMemory2)},
+        {"vkDestroyBuffer", (PFN_vkVoidFunction)compat_AmDestroyBuffer, SIZE_MAX},
+        {"vkCreateCommandPool", (PFN_vkVoidFunction)compat_AmCreateCommandPool, AMF_OFF(CreateCommandPool)},
+        {"vkResetDescriptorPool", (PFN_vkVoidFunction)compat_AmResetDescriptorPool, AMF_OFF(ResetDescriptorPool)},
+        {"vkDestroyDescriptorPool", (PFN_vkVoidFunction)compat_AmDestroyDescriptorPool, AMF_OFF(DestroyDescriptorPool)},
+        {"vkCreateSwapchainKHR", (PFN_vkVoidFunction)compat_AmCreateSwapchainKHR, AMF_OFF(CreateSwapchainKHR)},
+        {"vkDestroySwapchainKHR", (PFN_vkVoidFunction)compat_AmDestroySwapchainKHR, AMF_OFF(DestroySwapchainKHR)},
+        {"vkCmdCopyImage", (PFN_vkVoidFunction)compat_AmCmdCopyImage, AMF_OFF(CmdCopyImage)},
+        {"vkCmdBlitImage", (PFN_vkVoidFunction)compat_AmCmdBlitImage, AMF_OFF(CmdBlitImage)},
+        {"vkCmdCopyImageToBuffer", (PFN_vkVoidFunction)compat_AmCmdCopyImageToBuffer, AMF_OFF(CmdCopyImageToBuffer)},
+        {"vkCmdResolveImage", (PFN_vkVoidFunction)compat_AmCmdResolveImage, AMF_OFF(CmdResolveImage)},
+        {"vkCmdCopyImage2", (PFN_vkVoidFunction)compat_AmCmdCopyImage2, AMF_OFF(CmdCopyImage2)},
+        {"vkCmdCopyImage2KHR", (PFN_vkVoidFunction)compat_AmCmdCopyImage2, AMF_OFF(CmdCopyImage2)},
+        {"vkCmdBlitImage2", (PFN_vkVoidFunction)compat_AmCmdBlitImage2, AMF_OFF(CmdBlitImage2)},
+        {"vkCmdBlitImage2KHR", (PFN_vkVoidFunction)compat_AmCmdBlitImage2, AMF_OFF(CmdBlitImage2)},
+        {"vkCmdCopyImageToBuffer2", (PFN_vkVoidFunction)compat_AmCmdCopyImageToBuffer2, AMF_OFF(CmdCopyImageToBuffer2)},
+        {"vkCmdCopyImageToBuffer2KHR", (PFN_vkVoidFunction)compat_AmCmdCopyImageToBuffer2, AMF_OFF(CmdCopyImageToBuffer2)},
+        {"vkCmdResolveImage2", (PFN_vkVoidFunction)compat_AmCmdResolveImage2, AMF_OFF(CmdResolveImage2)},
+        {"vkCmdResolveImage2KHR", (PFN_vkVoidFunction)compat_AmCmdResolveImage2, AMF_OFF(CmdResolveImage2)},
+    };
+    #undef AMF_OFF
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        if (strcmp(n, t[i].name)) continue;
+        struct DeviceData *dd = get_device_data(device);
+        if (!dd || !dd->amf || !dd->get_device_proc_addr(device, n)) return NULL;
+        if (t[i].off != SIZE_MAX && !*(PFN_vkVoidFunction *)((char *)dd->amf + t[i].off)) return NULL;
+        return t[i].fn;
+    }
+    return NULL;
+}
+
+// 10-s tick (memlog flush thread): the clock pair line, and the bc-misc counters on stderr when they changed.
+static void am_tick(void) {
+    am_clock_line("tick");
+    uint64_t v[9], sum = 0;
+    for (int i = 0; i < 9; i++) sum += v[i] = atomic_load(&g_am_bcmisc[i]);
+    if (sum == atomic_exchange(&g_am_bcmisc_logged, sum)) return; // counters only grow: same sum = unchanged
+    char l[400];
+    size_t o = 0;
+    for (int i = 0; i < 9 && o < sizeof l; i++) o += (size_t)snprintf(l + o, sizeof l - o, " %s %llu", g_am_bcmisc_name[i], (unsigned long long)v[i]);
+    fprintf(stderr, "mali-compat: addrmap: bc-misc%s (C events %llu, first 16 in the TSV)\n", l,
+            (unsigned long long)atomic_load(&g_am_c_events));
+}
+static void am_end(const char *why) {
+    pthread_mutex_lock(&g_ml_mutex);
+    uint64_t bytes = g_ml_bytes;
+    bool trunc = g_ml_stopped;
+    pthread_mutex_unlock(&g_ml_mutex);
+    char l[400];
+    size_t o = 0;
+    for (const char *e = "AMUFXSBDLRNC"; *e && o < sizeof l; e++)
+        o += (size_t)snprintf(l + o, sizeof l - o, " %c %llu", *e, (unsigned long long)atomic_load(&g_am_count[*e - 'A']));
+    char m[300];
+    size_t k = 0;
+    for (int i = 0; i < 9 && k < sizeof m; i++) k += (size_t)snprintf(m + k, sizeof m - k, " %s %llu", g_am_bcmisc_name[i], (unsigned long long)atomic_load(&g_am_bcmisc[i]));
+    fprintf(stderr, "mali-compat: addrmap: end (%s): events%s, objects tracked %llu, file %llu KiB (cap %llu MiB)%s, bc-misc%s\n", why, l,
+            (unsigned long long)atomic_load(&g_am_obj_live), (unsigned long long)(bytes >> 10), (unsigned long long)(g_ml_cap >> 20),
+            trunc ? " TRUNCATED" : "", m);
+}
+static void am_atexit(void) { am_end("exit"); }
 
 // -----------------------------------------------------------------------------
 // Loader Layer Negotiate & ProcAddr Dispatch
@@ -10458,6 +11077,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
     }
     // round 4 (Codex r3 #5): with RT_PIPELINE the AS-buffer map must see every destroy, also in desc-capture mode
     // (compat_RtDestroyBuffer chains to desc-capture's destroy itself), so this comes before dc_proc.
+    if (g_addrmap) { PFN_vkVoidFunction ah = am_proc(device, pName); if (ah) return ah; } // ADDRMAP (chains to the two below)
     if (g_as_hooks && !strcmp(pName, "vkDestroyBuffer")) return (PFN_vkVoidFunction)compat_RtDestroyBuffer;
     if (g_dc_on) { PFN_vkVoidFunction dh = dc_proc(device, pName); if (dh) return dh; } // desc-capture-1
     #define MATCH_DEV(fn) if (!strcmp(pName, "vk" #fn)) return (PFN_vkVoidFunction)compat_##fn
@@ -10577,10 +11197,14 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         MATCH_DEV(CmdCopyQueryPoolResults);
         MATCH_DEV(GetQueryPoolResults);
     }
+    if (g_addrmap) { // N markers; the occlusion table is touched only with FAKE_OCCLUSION
+        MATCH_DEV(CreateQueryPool);
+        MATCH_DEV(DestroyQueryPool);
+    }
     #undef MATCH_DEV_KHR
     MATCH_DEV(DestroyDevice);
     MATCH_DEV(CreateShaderModule);
-    if (g_desc_pool_scale > 1 || g_desc_pool_pad || g_fail_lvl) MATCH_DEV(CreateDescriptorPool);
+    if (g_desc_pool_scale > 1 || g_desc_pool_pad || g_fail_lvl || g_addrmap) MATCH_DEV(CreateDescriptorPool); // unscaled: as given
     if (g_fail_lvl || g_dsl_stage_retry) { // after dc_proc: desc-capture keeps these entries when it is on
         struct DeviceData *fd = get_device_data(device);
         if (fd && fd->fpCreateDescriptorSetLayout && !strcmp(pName, "vkCreateDescriptorSetLayout")) return (PFN_vkVoidFunction)compat_FlCreateDescriptorSetLayout;

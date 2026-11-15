@@ -5833,14 +5833,14 @@ static bool rt_ensure_ring_buffer(struct DeviceData *d) {
         .memoryTypeIndex = mtype,
     };
     VkDeviceMemory mem = VK_NULL_HANDLE;
-    if (d->fpAllocateMemory(d->device, &mai, NULL, &mem) != VK_SUCCESS) {
+    if (am_drv_alloc(d, "rt-ring", &mai, &mem) != VK_SUCCESS) {
         d->fpDestroyBuffer(d->device, buf, NULL);
         pthread_mutex_unlock(&d->bc_lock);
         return false;
     }
 
     if (d->fpBindBufferMemory(d->device, buf, mem, 0) != VK_SUCCESS) {
-        d->fpFreeMemory(d->device, mem, NULL);
+        am_drv_free(d, "rt-ring", mem);
         d->fpDestroyBuffer(d->device, buf, NULL);
         pthread_mutex_unlock(&d->bc_lock);
         return false;
@@ -5848,7 +5848,7 @@ static bool rt_ensure_ring_buffer(struct DeviceData *d) {
 
     void *ptr = NULL;
     if (d->fpMapMemory(d->device, mem, 0, RT_RING_SIZE, 0, &ptr) != VK_SUCCESS || !ptr) {
-        d->fpFreeMemory(d->device, mem, NULL);
+        am_drv_free(d, "rt-ring", mem);
         d->fpDestroyBuffer(d->device, buf, NULL);
         pthread_mutex_unlock(&d->bc_lock);
         return false;
@@ -5862,7 +5862,7 @@ static bool rt_ensure_ring_buffer(struct DeviceData *d) {
     VkDeviceAddress bda = d->fpGetBufferDeviceAddress(d->device, &bdai);
     if (!bda) {
         d->fpUnmapMemory(d->device, mem);
-        d->fpFreeMemory(d->device, mem, NULL);
+        am_drv_free(d, "rt-ring", mem);
         d->fpDestroyBuffer(d->device, buf, NULL);
         pthread_mutex_unlock(&d->bc_lock);
         return false;
@@ -5966,14 +5966,14 @@ static VkDeviceAddress rt_get_zero_bda(struct DeviceData *d) {
         .memoryTypeIndex = mtype,
     };
     VkDeviceMemory mem = VK_NULL_HANDLE;
-    if (d->fpAllocateMemory(d->device, &mai, NULL, &mem) != VK_SUCCESS) {
+    if (am_drv_alloc(d, "rt-zero", &mai, &mem) != VK_SUCCESS) {
         d->fpDestroyBuffer(d->device, buf, NULL);
         pthread_mutex_unlock(&d->bc_lock);
         return 0ULL;
     }
 
     if (d->fpBindBufferMemory(d->device, buf, mem, 0) != VK_SUCCESS) {
-        d->fpFreeMemory(d->device, mem, NULL);
+        am_drv_free(d, "rt-zero", mem);
         d->fpDestroyBuffer(d->device, buf, NULL);
         pthread_mutex_unlock(&d->bc_lock);
         return 0ULL;
@@ -7391,7 +7391,7 @@ static bool rt_ensure_as_scratch_buffer(struct DeviceData *d) {
         .memoryTypeIndex = mtype,
     };
     VkDeviceMemory mem = VK_NULL_HANDLE;
-    if (d->fpAllocateMemory(d->device, &mai, NULL, &mem) != VK_SUCCESS) {
+    if (am_drv_alloc(d, "rt-scratch", &mai, &mem) != VK_SUCCESS) {
         d->fpDestroyBuffer(d->device, buf, NULL);
         pthread_mutex_unlock(&d->bc_lock);
         COMPAT_INFO("rt_ensure_as_scratch_buffer: vkAllocateMemory failed for 64MB scratch");
@@ -7399,7 +7399,7 @@ static bool rt_ensure_as_scratch_buffer(struct DeviceData *d) {
     }
 
     if (d->fpBindBufferMemory(d->device, buf, mem, 0) != VK_SUCCESS) {
-        d->fpFreeMemory(d->device, mem, NULL);
+        am_drv_free(d, "rt-scratch", mem);
         d->fpDestroyBuffer(d->device, buf, NULL);
         pthread_mutex_unlock(&d->bc_lock);
         COMPAT_INFO("rt_ensure_as_scratch_buffer: vkBindBufferMemory failed");
@@ -7412,7 +7412,7 @@ static bool rt_ensure_as_scratch_buffer(struct DeviceData *d) {
     };
     VkDeviceAddress bda = d->fpGetBufferDeviceAddress(d->device, &bdai);
     if (!bda) {
-        d->fpFreeMemory(d->device, mem, NULL);
+        am_drv_free(d, "rt-scratch", mem);
         d->fpDestroyBuffer(d->device, buf, NULL);
         pthread_mutex_unlock(&d->bc_lock);
         COMPAT_INFO("rt_ensure_as_scratch_buffer: fpGetBufferDeviceAddress returned 0");

@@ -160,11 +160,11 @@ static void ct_device_destroy(struct DeviceData *d) {
     for (int i = 0; i < 4; i++) if (ps[i]) d->fpDestroyPipeline(d->device, ps[i], NULL);
     if (t->layout) d->fpDestroyPipelineLayout(d->device, t->layout, NULL);
     if (t->buf) d->fpDestroyBuffer(d->device, t->buf, NULL);
-    if (t->mem) d->fpFreeMemory(d->device, t->mem, NULL);
+    if (t->mem) am_drv_free(d, "ct-buffer", t->mem);
     for (struct CtOld *o = t->old, *n; o; o = n) {
         n = o->next;
         d->fpDestroyBuffer(d->device, o->buf, NULL);
-        d->fpFreeMemory(d->device, o->mem, NULL);
+        am_drv_free(d, "ct-buffer", o->mem);
         free(o);
     }
     pthread_mutex_destroy(&t->m);
@@ -232,10 +232,10 @@ static bool ct_buffer(struct DeviceData *d, struct CtDev *t, uint32_t w, uint32_
     VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fi, mr.size, type};
     VkDeviceMemory mem;
-    if (d->fpAllocateMemory(d->device, &ai, NULL, &mem) != VK_SUCCESS) { d->fpDestroyBuffer(d->device, buf, NULL); return false; }
+    if (am_drv_alloc(d, "ct-buffer", &ai, &mem) != VK_SUCCESS) { d->fpDestroyBuffer(d->device, buf, NULL); return false; }
     if (d->fpBindBufferMemory(d->device, buf, mem, 0) != VK_SUCCESS) {
         d->fpDestroyBuffer(d->device, buf, NULL);
-        d->fpFreeMemory(d->device, mem, NULL);
+        am_drv_free(d, "ct-buffer", mem);
         return false;
     }
     void *map = NULL;
