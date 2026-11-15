@@ -476,7 +476,18 @@ static uint32_t *wls_clamp_module(const uint32_t *orig, size_t orig_bytes, const
 // the Unroll bit of every OpLoopMerge cleared (the reduce loop becomes N-1 iterations). Anything the rewrite cannot
 // prove safe leaves the module as it is (one log line with the reason). Unset / empty / 0 = off; a comma list of hex
 // hashes (the WLS_CLAMP / GPU_TIME FNV-1a of the app's SPIR-V); no "all".
+// wls-fix-2 [game/doom_eternal keeper, Claude Opus 5.5] 2026-11-14: MALI_COMPAT_WLS_FIX_MODE=sgid (or 2) selects a cheaper
+// rewrite of the same listed modules that keeps the real subgroup reduce (wls-fix-1 made invocation 0 walk 1023 slots
+// serially: 2.234 ms/frame on the phone against 0.32 ms unfixed). Mode sgid: every ShuffleXor v, mask ->
+// Select(SubgroupSize > mask, ShuffleXor, v) (an out-of-range mask gives the lane's own value); the slot division
+// localIndex / SubgroupSize -> OpLoad BuiltIn SubgroupId, the count division N / SubgroupSize -> OpLoad BuiltIn
+// NumSubgroups (two new Input variables on the entry point; no lane-packing assumption); the reduce loop counter starts
+// at 0 instead of 1 (invocation 0 need not be in subgroup 0); Workgroup arrays shorter than N / 4 grown to N / 4 (one
+// slot per subgroup down to 4 lanes) and clamped; Unroll hints off; Broadcast and the other SubgroupSize uses untouched.
+// The mode refuses (module left as it is) unless it finds exactly that pattern (wlsf_sgid_plan). Unset / 1 / lane1 =
+// the wls-fix-1 rewrite above; the mode key alone does nothing.
 static int g_wls_fix;                    // 0 off, 1 hash list
+static int g_wlsf_mode = 1;              // 1 = virtual 1-lane subgroup (wls-fix-1), 2 = sgid (wls-fix-2)
 static uint32_t g_wlsf_hashes[16], g_wlsf_count;
 static _Atomic uint32_t g_wlsf_logged, g_wlsf_left_logged;
 static _Atomic uint64_t g_wlsf_rewritten, g_wlsf_left;
@@ -505,7 +516,12 @@ static void wls_fix_init_impl(void) {
     }
     g_wlsf_count = n;
     g_wls_fix = 1;
-    fprintf(stderr, "mali-compat: wls-fix on (MALI_COMPAT_WLS_FIX=%s)\n", v);
+    const char *m = getenv("MALI_COMPAT_WLS_FIX_MODE");
+    if (m && *m && (!strcmp(m, "2") || !strcmp(m, "sgid"))) g_wlsf_mode = 2;
+    else if (m && *m && strcmp(m, "1") && strcmp(m, "lane1"))
+        fprintf(stderr, "mali-compat: MALI_COMPAT_WLS_FIX_MODE=%s ignored (1 / lane1 or 2 / sgid), mode lane1\n", m);
+    if (g_wlsf_mode == 2) fprintf(stderr, "mali-compat: wls-fix on (MALI_COMPAT_WLS_FIX=%s, MALI_COMPAT_WLS_FIX_MODE=sgid)\n", v);
+    else fprintf(stderr, "mali-compat: wls-fix on (MALI_COMPAT_WLS_FIX=%s)\n", v);
 }
 // once per process, from vkCreateInstance and vkCreateDevice (as wls_clamp_init)
 static void wls_fix_init(void) { pthread_once(&g_wlsf_once, wls_fix_init_impl); }
@@ -523,6 +539,7 @@ static bool wls_fix_wanted(uint32_t hash) {
 
 struct WlsfStat {
     uint32_t n, loads, shx, bcast, grown, clamped, loops;
+    uint32_t mode, new_len, init_from;                   // wls-fix-2: mode, grown length, loop start before (0 / 1)
     uint32_t old_len[WLSF_MAX_VARS];
     size_t in_bytes, out_bytes;
 };
@@ -613,11 +630,281 @@ static bool wlsf_is_id(const uint32_t *w, uint32_t k) {
     }
 }
 
+// ---- wls-fix-2 (MALI_COMPAT_WLS_FIX_MODE=sgid): the pattern check. All helpers run after pass 1 of spv_wls_fix
+// (every instruction length checked, def[] / type[] filled).
+struct WlsfSgid {
+    size_t slot_off, count_off, init_off, ep_off, dec_off, sgvar_off; // word offsets of the instructions rewritten / followed
+    uint32_t sgvar, sgptype, sgtype, booltype;                         // SubgroupSize variable, its Input pointer / uint type
+    uint32_t zero, zero_type, init_val;                                // loop start: constant 0 of the counter's type
+    uint32_t sgid, nsg;                                                // new ids: SubgroupId / NumSubgroups variables
+    bool zero_new;
+};
+
+static const uint32_t *wlsf_dd(const uint32_t *in, const uint32_t *def, uint32_t bound, uint32_t id) {
+    return id && id < bound && def[id] ? in + def[id] : NULL;
+}
+
+// up to max uses of id as an id operand (word offset of the user, operand index); the defining occurrence is not a use.
+// Returns the number of uses (> max = too many, only max recorded).
+static uint32_t wlsf_uses(const uint32_t *in, size_t n, uint32_t id, size_t *off, uint32_t *kk, uint32_t max) {
+    uint32_t c = 0;
+    for (size_t o = 5; o < n; o += in[o] >> 16) {
+        const uint32_t *w = in + o;
+        uint32_t op = w[0] & 0xffff, len = w[0] >> 16;
+        for (uint32_t k = 1; k < len; k++) {
+            if (w[k] != id || !wlsf_is_id(w, k)) continue;
+            if ((spv_op_typed(op) && k == 2) || (op >= 19 && op <= 38 && k == 1)) continue;
+            if (c < max) { off[c] = o; kk[c] = k; }
+            c++;
+        }
+    }
+    return c;
+}
+
+// id = component c of LocalInvocationId: OpLoad(AccessChain(lid, const c)) or CompositeExtract(OpLoad(lid), c)
+static bool wlsf_lid_comp(const uint32_t *in, const uint32_t *def, uint32_t bound, uint32_t lid, uint32_t id, uint32_t c) {
+    const uint32_t *d = wlsf_dd(in, def, bound, id);
+    uint64_t x;
+    if (!d || !lid) return false;
+    if ((d[0] & 0xffff) == 61 && (d[0] >> 16) >= 4) {
+        const uint32_t *ch = wlsf_dd(in, def, bound, d[3]);
+        return ch && ((ch[0] & 0xffff) == 65 || (ch[0] & 0xffff) == 66) && (ch[0] >> 16) == 5 && ch[3] == lid &&
+               wlsf_const(in, def, bound, ch[4], &x) && x == c;
+    }
+    if ((d[0] & 0xffff) == 81 && (d[0] >> 16) == 5) {
+        const uint32_t *l = wlsf_dd(in, def, bound, d[3]);
+        return l && (l[0] & 0xffff) == 61 && (l[0] >> 16) >= 4 && l[3] == lid && d[4] == c;
+    }
+    return false;
+}
+
+// id = the local invocation index: OpLoad LocalInvocationIndex, or (lz == 1) x + y * lx of LocalInvocationId (any order)
+static bool wlsf_local_index(const uint32_t *in, const uint32_t *def, uint32_t bound, uint32_t lid, uint32_t lidx,
+                             uint32_t lx, uint32_t lz, uint32_t id) {
+    const uint32_t *d = wlsf_dd(in, def, bound, id);
+    if (!d) return false;
+    uint32_t op = d[0] & 0xffff, len = d[0] >> 16;
+    if (op == 61 && len >= 4 && lidx && d[3] == lidx) return true;
+    if (op != 128 || len != 5 || lz != 1) return false;
+    for (int s = 0; s < 2; s++) {
+        const uint32_t *m = wlsf_dd(in, def, bound, d[4 - s]);
+        if (!wlsf_lid_comp(in, def, bound, lid, d[3 + s], 0) || !m || (m[0] & 0xffff) != 132 || (m[0] >> 16) != 5) continue;
+        for (int t = 0; t < 2; t++) {
+            uint64_t x;
+            if (wlsf_lid_comp(in, def, bound, lid, m[3 + t], 1) && wlsf_const(in, def, bound, m[4 - t], &x) && x == lx) return true;
+        }
+    }
+    return false;
+}
+
+static bool wlsf_is_wg_array(const struct WlsfVar *v, uint32_t nv, uint32_t id) {
+    for (uint32_t i = 0; i < nv; i++)
+        if (v[i].atype && v[i].var == id) return true;
+    return false;
+}
+
+// Every use of value id is the single index of an access chain into a Workgroup array (their results -> ch[]);
+// a store of it into a Function variable is followed once (*fvar = that variable, stored exactly once, every load
+// of it used the same way) when allow_fvar. False = another use.
+static bool wlsf_index_only(const uint32_t *in, size_t n, const uint32_t *def, uint32_t bound, const struct WlsfVar *v,
+                            uint32_t nv, uint32_t id, bool allow_fvar, uint32_t *ch, uint32_t *nch) {
+    size_t uo[16];
+    uint32_t uk[16], nu = wlsf_uses(in, n, id, uo, uk, 16);
+    if (nu > 16) return false;
+    for (uint32_t i = 0; i < nu; i++) {
+        const uint32_t *w = in + uo[i];
+        uint32_t op = w[0] & 0xffff, len = w[0] >> 16;
+        if ((op == 65 || op == 66) && len == 5 && uk[i] == 4 && wlsf_is_wg_array(v, nv, w[3])) {
+            if (*nch >= 16) return false;
+            ch[(*nch)++] = w[2];
+            continue;
+        }
+        if (op != 62 || len != 3 || uk[i] != 2 || !allow_fvar) return false;
+        const uint32_t *f = wlsf_dd(in, def, bound, w[1]);
+        if (!f || (f[0] & 0xffff) != 59 || f[3] != 7) return false; // a Function variable
+        size_t fo[16];
+        uint32_t fk[16], nf = wlsf_uses(in, n, w[1], fo, fk, 16);
+        if (nf > 16) return false;
+        for (uint32_t j = 0; j < nf; j++) {
+            const uint32_t *u = in + fo[j];
+            uint32_t uop = u[0] & 0xffff;
+            if (fo[j] == uo[i]) continue;                                       // the store of id itself
+            if (uop != 61 || fk[j] != 3 || (u[0] >> 16) < 4) return false;      // another store or use
+            if (!wlsf_index_only(in, n, def, bound, v, nv, u[2], false, ch, nch)) return false;
+        }
+    }
+    return *nch > 0;
+}
+
+// Every use of value id is the right operand of a less-than comparison (direct, or through one Function variable
+// stored once); the left operands -> lhs[].
+static bool wlsf_bound_only(const uint32_t *in, size_t n, const uint32_t *def, uint32_t bound, uint32_t id, bool allow_fvar,
+                            uint32_t *lhs, uint32_t *nl) {
+    size_t uo[16];
+    uint32_t uk[16], nu = wlsf_uses(in, n, id, uo, uk, 16);
+    if (nu > 16) return false;
+    for (uint32_t i = 0; i < nu; i++) {
+        const uint32_t *w = in + uo[i];
+        uint32_t op = w[0] & 0xffff, len = w[0] >> 16;
+        if ((op == 176 || op == 177) && len == 5 && uk[i] == 4) { // OpULessThan / OpSLessThan i, count
+            if (*nl >= 16) return false;
+            lhs[(*nl)++] = w[3];
+            continue;
+        }
+        if (op != 62 || len != 3 || uk[i] != 2 || !allow_fvar) return false;
+        const uint32_t *f = wlsf_dd(in, def, bound, w[1]);
+        if (!f || (f[0] & 0xffff) != 59 || f[3] != 7) return false;
+        size_t fo[16];
+        uint32_t fk[16], nf = wlsf_uses(in, n, w[1], fo, fk, 16);
+        if (nf > 16) return false;
+        for (uint32_t j = 0; j < nf; j++) {
+            const uint32_t *u = in + fo[j];
+            if (fo[j] == uo[i]) continue;
+            if ((u[0] & 0xffff) != 61 || fk[j] != 3 || (u[0] >> 16) < 4) return false;
+            if (!wlsf_bound_only(in, n, def, bound, u[2], false, lhs, nl)) return false;
+        }
+    }
+    return *nl > 0;
+}
+
+// The Function variable C whose load (directly or through OpBitcast) is id; 0 if none.
+static uint32_t wlsf_counter_of(const uint32_t *in, const uint32_t *def, uint32_t bound, uint32_t id) {
+    const uint32_t *d = wlsf_dd(in, def, bound, id);
+    if (d && (d[0] & 0xffff) == 124 && (d[0] >> 16) == 4) d = wlsf_dd(in, def, bound, d[3]);
+    if (!d || (d[0] & 0xffff) != 61 || (d[0] >> 16) < 4) return 0;
+    const uint32_t *f = wlsf_dd(in, def, bound, d[3]);
+    return f && (f[0] & 0xffff) == 59 && f[3] == 7 ? d[3] : 0;
+}
+
+// Checks the wls-fix-2 pattern and fills p; NULL = rewrite, else the reason to leave the module as it is.
+static const char *wlsf_sgid_plan(const uint32_t *in, size_t n, const uint32_t *def, const uint32_t *type, uint32_t bound,
+                                  const struct WlsfVar *v, uint32_t nv, uint32_t sgvar, uint32_t lid, uint32_t lidx,
+                                  uint32_t lx, uint32_t lz, uint32_t N, size_t fn_off, struct WlsfSgid *p, char *why_buf,
+                                  size_t why_n) {
+    memset(p, 0, sizeof *p);
+    p->sgvar = sgvar;
+    p->sgvar_off = def[sgvar];
+    p->sgptype = in[def[sgvar] + 1];
+    p->sgtype = in[def[p->sgptype] + 3];
+    if (in[1] < 0x00010300) return "mode sgid: SPIR-V older than 1.3 (no SubgroupId / NumSubgroups)";
+    bool cap = false;
+    uint32_t ch[16], nch = 0, lhs[16], nl = 0;
+    for (size_t o = 5; o < n; o += in[o] >> 16) {
+        const uint32_t *w = in + o;
+        uint32_t op = w[0] & 0xffff, len = w[0] >> 16;
+        if (op == 17 && len >= 2 && w[1] >= 61 && w[1] <= 68) cap = true; // GroupNonUniform or one that declares it
+        if (op == 15) p->ep_off = o;
+        if (op == 20 && len >= 2 && !p->booltype) p->booltype = w[1];
+        if (op == 71 && len >= 4 && w[1] == sgvar && w[2] == 11 && w[3] == 36) p->dec_off = o;
+        if (op == 346) { // ShuffleXor: scalar result (vector needs SPIR-V 1.4 for OpSelect), 32-bit integer mask
+            const uint32_t *rt = wlsf_dd(in, def, bound, w[1]), *mt = wlsf_dd(in, def, bound, type[w[5] < bound ? w[5] : 0]);
+            uint32_t rop = rt ? rt[0] & 0xffff : 0;
+            if (!(rop >= 20 && rop <= 22) && !(rop == 23 && in[1] >= 0x00010400))
+                return "mode sgid: ShuffleXor result is not a scalar (vector select needs SPIR-V 1.4)";
+            if (!mt || (mt[0] & 0xffff) != 21 || mt[2] != 32) return "mode sgid: ShuffleXor mask is not a 32-bit integer";
+        }
+        for (uint32_t k = 1; k < len; k++) { // uses of a SubgroupSize value: divisions are rewritten, comparisons kept
+            if (!wlsf_is_id(w, k) || (spv_op_typed(op) && k == 2)) continue;
+            const uint32_t *d = wlsf_dd(in, def, bound, w[k]);
+            if (!d || (d[0] & 0xffff) != 61 || (d[0] >> 16) < 4 || d[3] != sgvar) continue;
+            if (op == 134 && len == 5 && k == 4) { // OpUDiv x, SubgroupSize
+                uint64_t x;
+                if (wlsf_const(in, def, bound, w[3], &x)) {
+                    if (x != N || p->count_off) return "mode sgid: a division of a constant other than one N / SubgroupSize";
+                    p->count_off = o;
+                } else {
+                    if (p->slot_off) return "mode sgid: more than one division of a non-constant by SubgroupSize";
+                    p->slot_off = o;
+                }
+            } else if (!(op >= 170 && op <= 179)) {
+                snprintf(why_buf, why_n, "mode sgid: SubgroupSize value used by opcode %u (only divisions / comparisons)", op);
+                return why_buf;
+            }
+        }
+    }
+    if (!cap) return "mode sgid: no GroupNonUniform capability";
+    if (!p->ep_off || !p->dec_off || !p->booltype) return "mode sgid: entry point, SubgroupSize decoration or bool type missing";
+    if (!p->slot_off || !p->count_off) return "mode sgid: no slot (localIndex / SubgroupSize) and count (N / SubgroupSize) divisions";
+    if (in[p->slot_off + 1] != p->sgtype || in[p->count_off + 1] != p->sgtype) return "mode sgid: division type is not the SubgroupSize type";
+    if (!wlsf_local_index(in, def, bound, lid, lidx, lx, lz, in[p->slot_off + 3]))
+        return "mode sgid: slot division of something other than the local invocation index";
+    // the slot only indexes Workgroup arrays (directly or through one Function variable), those chains are only stored to
+    if (!wlsf_index_only(in, n, def, bound, v, nv, in[p->slot_off + 2], true, ch, &nch))
+        return "mode sgid: slot used other than as the index of a Workgroup array access chain";
+    // the count only bounds a less-than comparison; its left operand is the loop counter C
+    if (!wlsf_bound_only(in, n, def, bound, in[p->count_off + 2], true, lhs, &nl))
+        return "mode sgid: count used other than as the bound of a less-than comparison";
+    uint32_t c = wlsf_counter_of(in, def, bound, lhs[0]);
+    for (uint32_t i = 1; i < nl; i++)
+        if (wlsf_counter_of(in, def, bound, lhs[i]) != c) c = 0;
+    if (!c) return "mode sgid: the count is not compared with one Function-variable loop counter";
+    size_t uo[16];
+    uint32_t uk[16], nu = wlsf_uses(in, n, c, uo, uk, 16);
+    if (nu > 16) return "mode sgid: loop counter used too often";
+    for (uint32_t i = 0; i < nu; i++) { // loads; one store of a constant 0 / 1; the rest stores of load(C) + 1
+        const uint32_t *w = in + uo[i];
+        uint32_t op = w[0] & 0xffff, len = w[0] >> 16;
+        if (op == 61 && uk[i] == 3) continue;
+        if (op != 62 || len != 3 || uk[i] != 1) return "mode sgid: loop counter used other than by loads and stores";
+        uint64_t x;
+        if (wlsf_const(in, def, bound, w[2], &x)) {
+            if (p->init_off || x > 1) return "mode sgid: loop counter does not start at one constant 0 or 1";
+            p->init_off = uo[i];
+            p->init_val = (uint32_t)x;
+            p->zero_type = type[w[2]];
+            continue;
+        }
+        const uint32_t *a = wlsf_dd(in, def, bound, w[2]);
+        bool step = false;
+        for (int s = 0; a && (a[0] & 0xffff) == 128 && (a[0] >> 16) == 5 && s < 2; s++) {
+            const uint32_t *l = wlsf_dd(in, def, bound, a[3 + s]);
+            step |= l && (l[0] & 0xffff) == 61 && (l[0] >> 16) >= 4 && l[3] == c && wlsf_const(in, def, bound, a[4 - s], &x) && x == 1;
+        }
+        if (!step) return "mode sgid: loop counter stored with something other than counter + 1";
+    }
+    if (!p->init_off) return "mode sgid: loop counter has no constant start";
+    // every other Workgroup array chain: indexed by a load of C, only loaded from
+    uint32_t nread = 0;
+    for (size_t o = 5; o < n; o += in[o] >> 16) {
+        const uint32_t *w = in + o;
+        uint32_t op = w[0] & 0xffff, len = w[0] >> 16;
+        if ((op != 65 && op != 66) || len < 4 || !wlsf_is_wg_array(v, nv, w[3])) continue;
+        bool slot = false;
+        for (uint32_t i = 0; i < nch; i++) slot |= ch[i] == w[2];
+        size_t co[16];
+        uint32_t ck[16], ncu = wlsf_uses(in, n, w[2], co, ck, 16);
+        if (ncu > 16) return "mode sgid: Workgroup chain used too often";
+        for (uint32_t i = 0; i < ncu; i++) {
+            uint32_t uop = in[co[i]] & 0xffff;
+            if (slot ? !(uop == 62 && ck[i] == 1) : !(uop == 61 && ck[i] == 3))
+                return "mode sgid: a slot chain not only stored to, or a reduce chain not only loaded from";
+        }
+        if (slot) continue;
+        const uint32_t *ix = len == 5 ? wlsf_dd(in, def, bound, w[4]) : NULL;
+        if (!ix || (ix[0] & 0xffff) != 61 || (ix[0] >> 16) < 4 || ix[3] != c)
+            return "mode sgid: a Workgroup array chain indexed by neither the slot nor the loop counter";
+        nread++;
+    }
+    if (!nread) return "mode sgid: no reduce loop reads the Workgroup array";
+    // the constant 0 of the counter's type (32-bit integer) for the new loop start
+    const uint32_t *zt = wlsf_dd(in, def, bound, p->zero_type);
+    if (!zt || (zt[0] & 0xffff) != 21 || zt[2] != 32) return "mode sgid: loop counter is not a 32-bit integer";
+    for (uint32_t k = 1; k < bound && !p->zero; k++) {
+        uint64_t x;
+        if (type[k] == p->zero_type && def[k] < fn_off && wlsf_const(in, def, bound, k, &x) && x == 0) p->zero = k;
+    }
+    p->zero_new = !p->zero && p->init_val == 1;
+    return NULL;
+}
+
 // Returns the rewritten module (size in *out_bytes) or NULL; *why = the reason it was left as it is.
-static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes, struct WlsfStat *st, const char **why) {
+// mode 1 = wls-fix-1 (virtual 1-lane subgroup), 2 = wls-fix-2 (sgid: guarded shuffles, SubgroupId slots).
+static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes, struct WlsfStat *st, const char **why,
+                             int mode) {
     static _Thread_local char why_buf[160]; // per thread: modules are created on many threads at once
     memset(st, 0, sizeof *st);
     st->in_bytes = bytes;
+    st->mode = mode == 2 ? 2 : 1;
     *why = "not SPIR-V or malformed";
     if (!in || bytes < 20 || bytes % 4 || in[0] != 0x07230203) return NULL;
     size_t n = bytes / 4;
@@ -625,9 +912,11 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
     if (!bound || bound > (1u << 22)) return NULL;
     uint32_t *def = calloc(bound, 4), *type = calloc(bound, 4), *out = NULL;
     struct WlsfVar v[WLSF_MAX_VARS];
-    uint32_t nv = 0, sg[4], nsg = 0, entries = 0, model = 0, lx = 0, ly = 0, lz = 0, wgs = 0;
+    uint32_t nv = 0, sg[4], nsg = 0, entries = 0, model = 0, lx = 0, ly = 0, lz = 0, wgs = 0, lid = 0, lidx = 0;
     size_t mm_off = 0, fn_off = 0;
     bool size_id = false;
+    struct WlsfSgid sp;
+    memset(&sp, 0, sizeof sp);
     if (!def || !type) { *why = "out of memory"; goto done; }
     // pass 1: definitions, structure, refusals by opcode / decoration
     for (size_t o = 5; o < n;) {
@@ -653,6 +942,8 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
                 goto done;
             }
             if (b == 25) wgs = w[1];
+            if (b == 27) lid = lid ? ~0u : w[1];   // LocalInvocationId (twice: ~0 = no match, wls-fix-2 refuses)
+            if (b == 29) lidx = lidx ? ~0u : w[1]; // LocalInvocationIndex
         }
         if (op == 72 && len >= 5 && w[3] == 11 && ((w[4] >= 36 && w[4] <= 41) || (w[4] >= 4416 && w[4] <= 4420))) {
             *why = "subgroup built-in as a struct member";
@@ -697,6 +988,9 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
     }
     if (!lx || !ly || !lz || (uint64_t)lx * ly * lz > 4096) { *why = "no constant LocalSize (or invocation count > 4096)"; goto done; }
     st->n = lx * ly * lz;
+    // grown length: mode 1 one slot per invocation, mode 2 one slot per subgroup down to 4 lanes
+    uint32_t tl = mode == 2 ? (st->n / 4 ? st->n / 4 : 1) : st->n;
+    st->new_len = tl;
     for (uint32_t i = 0; i < nsg; i++) { // the SubgroupSize variable: an Input uint
         const uint32_t *d = sg[i] < bound && def[sg[i]] ? in + def[sg[i]] : NULL;
         const uint32_t *pt = d && (d[0] & 0xffff) == 59 && d[1] < bound && def[d[1]] ? in + def[d[1]] : NULL;
@@ -733,8 +1027,8 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
         v[i].lenc = d[3];
         v[i].len = (uint32_t)len;
         v[i].esize = (s + a - 1) / a * a;
-        v[i].grow = len < st->n;
-        shared += ((v[i].grow ? st->n : len) * v[i].esize + 15) / 16 * 16;
+        v[i].grow = len < tl;
+        shared += ((v[i].grow ? tl : len) * v[i].esize + 15) / 16 * 16;
     }
     if (shared > WLSF_SHARED_LIMIT) {
         snprintf(why_buf, sizeof why_buf, "shared memory after growth %llu B > %u B", (unsigned long long)shared, WLSF_SHARED_LIMIT);
@@ -780,10 +1074,17 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
     // lane layout (e.g. quad neighbours), where identity would change the result.
     if (!st->loads) { *why = st->shx || st->bcast ? "ShuffleXor/Broadcast without any SubgroupSize load (lane layout hard-wired)"
                                                   : "no SubgroupSize load (nothing to rewrite)"; goto done; }
+    if (mode == 2) { // wls-fix-2: exactly the slot / count / reduce-loop pattern, else left as it is
+        if (nsg != 1) { *why = "mode sgid: not exactly one SubgroupSize variable"; goto done; }
+        const char *r = wlsf_sgid_plan(in, n, def, type, bound, v, nv, sg[0], lid == ~0u ? 0 : lid, lidx == ~0u ? 0 : lidx,
+                                       lx, lz, st->n, fn_off, &sp, why_buf, sizeof why_buf);
+        if (r) { *why = r; goto done; }
+        st->init_from = sp.init_val;
+    }
     // ids: the constant 1 per SubgroupSize load type (uint), per grown array a length constant, array and pointer type
     uint32_t next = bound, one = 0, one_type = 0;
     bool one_new = false;
-    if (st->loads) {
+    if (st->loads && mode != 2) {
         const uint32_t *d = in + def[sg[0]];
         one_type = in[def[d[1]] + 3];
         for (uint32_t k = 1; k < bound && !one; k++) {
@@ -798,7 +1099,7 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
         if (!lt || lt >= bound || !def[lt] || (in[def[lt]] & 0xffff) != 21) { *why = "array length constant is not an integer"; goto done; }
         for (uint32_t k = 1; k < bound && !v[i].new_len_c; k++) {
             uint64_t x;
-            if (type[k] == lt && def[k] < v[i].var_off && wlsf_const(in, def, bound, k, &x) && x == st->n) v[i].new_len_c = k;
+            if (type[k] == lt && def[k] < v[i].var_off && wlsf_const(in, def, bound, k, &x) && x == tl) v[i].new_len_c = k;
         }
         for (uint32_t j = 0; j < i && !v[i].new_len_c; j++) // a constant made for an earlier array of the same length type
             if (v[j].grow && v[j].len_c_new && type[v[j].lenc] == lt) v[i].new_len_c = v[j].new_len_c;
@@ -807,8 +1108,15 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
         v[i].new_ptype = next++;
         st->old_len[st->grown++] = v[i].len;
     }
+    if (mode == 2) {
+        sp.sgid = next++;
+        sp.nsg = next++;
+        if (sp.zero_new) sp.zero = next++;
+    }
     // pass 3: write the rewritten module
-    out = malloc((n + 8 + 17 * (size_t)nv) * 4); // per grown array: constant 5, array 4, pointer 4, ArrayStride 4
+    // per grown array: constant 5, array 4, pointer 4, ArrayStride 4; mode 2: entry point 2, decorations 8, variables 8,
+    // constant 0 4, per ShuffleXor 15 (load 4, compare 5, select 6)
+    out = malloc((n + 8 + 17 * (size_t)nv + (mode == 2 ? 22 + 15 * (size_t)st->shx : 0)) * 4);
     if (!out) { *why = "out of memory"; goto done; }
     memcpy(out, in, 5 * 4);
     size_t w = 5;
@@ -817,6 +1125,7 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
         const uint32_t *x = in + o;
         uint32_t op = x[0] & 0xffff, len = x[0] >> 16;
         if (o == fn_off && one_new) { out[w++] = (4u << 16) | 43u; out[w++] = one_type; out[w++] = one; out[w++] = 1; }
+        if (o == fn_off && sp.zero_new) { out[w++] = (4u << 16) | 43u; out[w++] = sp.zero_type; out[w++] = sp.zero; out[w++] = 0; }
         for (uint32_t i = 0; i < nv; i++) {
             if (!v[i].grow || o != v[i].var_off) continue;
             if (v[i].len_c_new && !emitted_c[i]) {
@@ -828,7 +1137,7 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
                     out[w++] = ((wide ? 5u : 4u) << 16) | 43u;
                     out[w++] = type[v[i].lenc];
                     out[w++] = v[i].new_len_c;
-                    out[w++] = st->n;
+                    out[w++] = tl;
                     if (wide) out[w++] = 0;
                 }
                 emitted_c[i] = true;
@@ -838,9 +1147,24 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
         }
         bool sgload = false;
         for (uint32_t i = 0; op == 61 && len >= 4 && i < nsg; i++) sgload |= x[3] == sg[i];
-        if (sgload) { // OpLoad %uint %SubgroupSize -> OpCopyObject %uint %uint_1
+        if (mode == 2 && op == 346) { // r = ShuffleXor v, m -> t = ShuffleXor v, m; s = SubgroupSize; r = Select(s > m, t, v)
+            uint32_t t = next++, sz = next++, c = next++;
+            out[w++] = (6u << 16) | 346u; out[w++] = x[1]; out[w++] = t; out[w++] = x[3]; out[w++] = x[4]; out[w++] = x[5];
+            out[w++] = (4u << 16) | 61u; out[w++] = sp.sgtype; out[w++] = sz; out[w++] = sp.sgvar;
+            out[w++] = (5u << 16) | 172u; out[w++] = sp.booltype; out[w++] = c; out[w++] = sz; out[w++] = x[5];
+            out[w++] = (6u << 16) | 169u; out[w++] = x[1]; out[w++] = x[2]; out[w++] = c; out[w++] = t; out[w++] = x[4];
+        } else if (mode == 2 && o == sp.ep_off) { // the entry point gets the two new Input variables
+            out[w++] = ((len + 2) << 16) | 15u;
+            memcpy(out + w, x + 1, (len - 1) * 4);
+            w += len - 1;
+            out[w++] = sp.sgid; out[w++] = sp.nsg;
+        } else if (mode == 2 && (o == sp.slot_off || o == sp.count_off)) { // UDiv -> OpLoad SubgroupId / NumSubgroups
+            out[w++] = (4u << 16) | 61u; out[w++] = x[1]; out[w++] = x[2]; out[w++] = o == sp.slot_off ? sp.sgid : sp.nsg;
+        } else if (mode == 2 && o == sp.init_off && sp.init_val == 1) { // reduce loop start 1 -> 0
+            out[w++] = x[0]; out[w++] = x[1]; out[w++] = sp.zero;
+        } else if (sgload && mode != 2) { // OpLoad %uint %SubgroupSize -> OpCopyObject %uint %uint_1
             out[w++] = (4u << 16) | 83u; out[w++] = x[1]; out[w++] = x[2]; out[w++] = one;
-        } else if (op == 337 || op == 346) { // Broadcast / ShuffleXor -> OpCopyObject <type> <value>
+        } else if ((op == 337 || op == 346) && mode != 2) { // Broadcast / ShuffleXor -> OpCopyObject <type> <value>
             out[w++] = (4u << 16) | 83u; out[w++] = x[1]; out[w++] = x[2]; out[w++] = x[4];
         } else {
             memcpy(out + w, x, len * 4);
@@ -852,6 +1176,14 @@ static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes
                 if (v[i].grow && v[i].stride_off == o) {
                     out[w++] = (4u << 16) | 71u; out[w++] = v[i].new_atype; out[w++] = 6u; out[w++] = v[i].stride;
                 }
+            if (mode == 2 && o == sp.dec_off) { // BuiltIn SubgroupId (40), NumSubgroups (38)
+                out[w++] = (4u << 16) | 71u; out[w++] = sp.sgid; out[w++] = 11u; out[w++] = 40u;
+                out[w++] = (4u << 16) | 71u; out[w++] = sp.nsg; out[w++] = 11u; out[w++] = 38u;
+            }
+            if (mode == 2 && o == sp.sgvar_off) { // two Input uint variables of the SubgroupSize pointer type
+                out[w++] = (4u << 16) | 59u; out[w++] = sp.sgptype; out[w++] = sp.sgid; out[w++] = 1u;
+                out[w++] = (4u << 16) | 59u; out[w++] = sp.sgptype; out[w++] = sp.nsg; out[w++] = 1u;
+            }
         }
         o += len;
     }
@@ -884,7 +1216,7 @@ static uint32_t *wls_fix_module(const uint32_t *orig, size_t orig_bytes, const u
     if (!wls_fix_wanted(h)) return NULL;
     struct WlsfStat st;
     const char *why = NULL;
-    uint32_t *out = spv_wls_fix(cur, cur_bytes, out_bytes, &st, &why);
+    uint32_t *out = spv_wls_fix(cur, cur_bytes, out_bytes, &st, &why, g_wlsf_mode);
     if (!out) {
         atomic_fetch_add(&g_wlsf_left, 1);
         if (atomic_fetch_add(&g_wlsf_left_logged, 1) < 64)
@@ -895,15 +1227,21 @@ static uint32_t *wls_fix_module(const uint32_t *orig, size_t orig_bytes, const u
     if (atomic_fetch_add(&g_wlsf_logged, 1) < 64) {
         char gl[160] = "";
         for (uint32_t i = 0; i < st.grown; i++)
-            snprintf(gl + strlen(gl), sizeof gl - strlen(gl), "%s%u -> %u", i ? ", " : " (", st.old_len[i], st.n);
+            snprintf(gl + strlen(gl), sizeof gl - strlen(gl), "%s%u -> %u", i ? ", " : " (", st.old_len[i], st.new_len);
         if (st.grown) snprintf(gl + strlen(gl), sizeof gl - strlen(gl), ")");
-        fprintf(stderr, "mali-compat: wls-fix: spv %08x rewritten: local size %u, SubgroupSize loads %u, ShuffleXor %u, "
-                "Broadcast %u, arrays grown %u%s, clamped chains %u, loops un-unrolled %u, %zu -> %zu B\n", h, st.n,
-                st.loads, st.shx, st.bcast, st.grown, gl, st.clamped, st.loops, st.in_bytes, st.out_bytes);
+        if (st.mode == 2)
+            fprintf(stderr, "mali-compat: wls-fix: spv %08x rewritten (mode sgid): local size %u, ShuffleXor guarded %u, "
+                    "Broadcast kept %u, slot -> SubgroupId, count -> NumSubgroups, loop start %u -> 0, arrays grown %u%s, "
+                    "clamped chains %u, loops un-unrolled %u, %zu -> %zu B\n", h, st.n, st.shx, st.bcast, st.init_from,
+                    st.grown, gl, st.clamped, st.loops, st.in_bytes, st.out_bytes);
+        else
+            fprintf(stderr, "mali-compat: wls-fix: spv %08x rewritten: local size %u, SubgroupSize loads %u, ShuffleXor %u, "
+                    "Broadcast %u, arrays grown %u%s, clamped chains %u, loops un-unrolled %u, %zu -> %zu B\n", h, st.n,
+                    st.loads, st.shx, st.bcast, st.grown, gl, st.clamped, st.loops, st.in_bytes, st.out_bytes);
     }
     return out;
 }
-// END wls-fix-1
+// END wls-fix-1 (+ wls-fix-2 mode sgid)
 
 static uint32_t *compat_patch_spirv(const uint32_t *inWords, size_t inBytes, size_t *pOutBytes) {
     uint32_t *out = compat_patch_spirv_impl(inWords, inBytes, pOutBytes);
