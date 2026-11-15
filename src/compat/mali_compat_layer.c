@@ -10472,7 +10472,6 @@ struct DpdPool {
     uint32_t flags, maxsets;         // the app's create info
     _Atomic uint32_t since;          // sets allocated since the last reset
     _Atomic uint64_t pend;           // (seq << 8) | queue slot of the newest submit that bound the current generation
-    _Atomic uint64_t pend_cb;        // its command buffer
     _Atomic uint32_t s_resets, s_empty, s_maxsince, s_sets, s_frees, s_fail, s_rwp, s_rwpfree, s_stale, s_stalesub, s_unk;
     _Atomic int32_t s_lastfail;
 };
@@ -10695,9 +10694,10 @@ static uint32_t dpd_qslot(VkQueue queue, struct DeviceData *d, bool add) { // g_
     return g_dpd_nq++;
 }
 // Poll one record's own signal: 0 finished, 1 not yet, -1 none / unusable. g_dpd_m held (serialises with destroy).
-static int dpd_poll(struct DpdSub *r, uint64_t now) {
+// fresh: never answer from the 200-us NOT_READY cache (the app may have seen the fence signal since; review N1).
+static int dpd_poll(struct DpdSub *r, uint64_t now, bool fresh) {
     if (!r->d) return -1;
-    if (r->poll_res == 1 && now - r->poll_ns < 200000u) return 1;
+    if (!fresh && r->poll_res == 1 && now - r->poll_ns < 200000u) return 1;
     VkResult res;
     if (r->fence && r->d->dpd_fence_status) {
         res = r->d->dpd_fence_status(r->d->device, (VkFence)(uintptr_t)r->fence);
@@ -10731,14 +10731,14 @@ static int dpd_state_locked(uint64_t seq, uint32_t q, struct DpdHit *h) {
     h->cb = r->cb;
     h->q = q;
     h->sig = r->fence ? "fence" : r->sem ? "timeline" : "none";
-    int own = dpd_poll(r, now);
+    int own = dpd_poll(r, now, true); // a pending verdict always rests on a fresh poll of the submit's own signal
     if (own == 0) { dpd_wm_max(q, seq); return 0; }
     if (own == 1) return 1;
     if (q >= DPD_QMAX) return 2;
     for (uint64_t s = seq + 1; s <= g_dpd_seq; s++) {
         struct DpdSub *x = &g_dpd_ring[s % DPD_RING];
         if (x->seq != s || x->q != q || x->done) continue;
-        int p = dpd_poll(x, now);
+        int p = dpd_poll(x, now, false);
         if (p == 0) { dpd_wm_max(q, s); return 0; }
         if (p == 1) { h->sig = "later-pending"; return 2; }
     }
@@ -10767,7 +10767,7 @@ static void dpd_check(struct DpdPool *P, uint64_t pend, int kind, uint32_t since
     dpd_imm(err, P->name, "what=dpool-rwp kind=%s pool=0x%llx since=%u set=0x%llx cb=0x%llx seq=%llu lastseq=%llu behind=%llu "
             "age_us=%llu sig=%s q=%u flags=0x%x maxsets=%u", kind == 0 ? "reset" : kind == 1 ? "free" : "destroy",
             (unsigned long long)P->name, since, (unsigned long long)set,
-            (unsigned long long)atomic_load_explicit(&P->pend_cb, memory_order_relaxed), (unsigned long long)h.seq,
+            (unsigned long long)h.cb, (unsigned long long)h.seq,
             (unsigned long long)h.last, (unsigned long long)(h.last - h.seq), (unsigned long long)(h.age_ns / 1000u), h.sig,
             h.q, P->flags, P->maxsets);
 }
@@ -10845,7 +10845,6 @@ static void dpd_mark_cb(VkCommandBuffer cb, uint64_t seq, uint32_t q) {
         }
         uint64_t o = atomic_load_explicit(&P->pend, memory_order_relaxed);
         while ((o >> 8) < seq && !atomic_compare_exchange_weak_explicit(&P->pend, &o, pend, memory_order_release, memory_order_relaxed)) {}
-        atomic_store_explicit(&P->pend_cb, (uint64_t)(uintptr_t)cb, memory_order_relaxed);
     }
     for (uint32_t i = 0; i < m->nfs; i++) dpd_pset_put(m->fs[i], pend);
     dpd_cnt(DS_CBS, 1);
@@ -12633,6 +12632,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
 
 static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
     VkDevice device, const VkAllocationCallbacks *pAllocator) {
+    // rc-1115: read the dispatch key before the driver frees the dispatchable object (ASan heap-use-after-free)
+    void *key = device ? *(void **)device : NULL;
     // 11-10 keeper: a megakernel compile still running on a worker (DestroyPipeline does not wait for it) must
     // finish its driver calls before the device goes away (Codex 1110-194217 "detached compile outlives its device").
     if (device) rt_drain_device_jobs(device);
@@ -12683,7 +12684,6 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
     }
     if (device) {
         pthread_mutex_lock(&g_table_mutex);
-        void *key = *(void **)device;
         for (uint32_t i = 0; i < g_device_count; i++) {
             if (g_devices[i].device == device || (key && g_devices[i].dispatch_key == key)) {
                 for (uint32_t j = i; j + 1 < g_device_count; j++) {
