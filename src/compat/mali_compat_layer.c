@@ -2489,6 +2489,8 @@ struct CmdBufData {
     bool st_on;
     uint8_t sd_pass;                // sync-diag: inside a render pass instance (MALI_COMPAT_FULL_BARRIERS/SYNC_CTL)
     bool sd_susp;                   // sync-diag: the open pass is a SUSPENDING part
+    VkPipeline db_pipe;             // disp-barrier: compute pipeline whose hash is in db_hash (reset at begin)
+    uint32_t db_hash;               // disp-barrier: its app-SPIR-V hash (GPU_TIME "cs:"), 0 = unknown
 };
 
 #define CMDBUF_BUCKETS 1024
@@ -4907,6 +4909,9 @@ static void spv_dump_if_wanted(const uint32_t *code, size_t bytes, uint32_t hash
 struct HashNode { uint64_t handle; uint32_t hash[3]; uint32_t stages[3]; uint32_t flags; struct HashNode *next; }; // flags: PF_*
 #define HASH_BUCKETS 4096
 static struct HashNode *g_module_hash[HASH_BUCKETS], *g_pipeline_hash[HASH_BUCKETS];
+// disp-barrier (MALI_COMPAT_DISP_BARRIER / sync-diag ctl db=): fill the module and compute-pipeline hash tables. Set
+// once in sd_init_once (vkCreateDevice), before any module or pipeline of that device exists.
+static bool g_db_hash;
 static pthread_mutex_t g_hash_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void hash_put(struct HashNode **table, uint64_t handle, const uint32_t *hash, const uint32_t *stages, uint32_t n,
@@ -5748,6 +5753,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
     if (g_gpu_time || g_dump_hash_count || g_vs_scan || g_dc_on || g_ct) {
         hash = spv_hash(pCreateInfo->pCode, pCreateInfo->codeSize);
         spv_dump_if_wanted(pCreateInfo->pCode, pCreateInfo->codeSize, hash);
+    } else if (g_db_hash) {
+        hash = spv_hash(pCreateInfo->pCode, pCreateInfo->codeSize); // disp-barrier: the app's code, before any patch
     }
     if (g_vs_scan && spv_vs_stores(pCreateInfo->pCode, pCreateInfo->codeSize, cnt)) { // KZ2, before any patch
         mflags = PF_VSW;
@@ -5774,7 +5781,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateShaderModule(
                 pCreateInfo->codeSize, patched_bytes != 0);
         fail_spv_dump(pCreateInfo->pCode, pCreateInfo->codeSize, fh);
     }
-    if (r == VK_SUCCESS && (g_gpu_time || g_dc_on || g_ct) && pShaderModule) hash_put(g_module_hash, (uint64_t)*pShaderModule, &hash, NULL, 1, mflags);
+    if (r == VK_SUCCESS && (g_gpu_time || g_dc_on || g_ct || g_db_hash) && pShaderModule) hash_put(g_module_hash, (uint64_t)*pShaderModule, &hash, NULL, 1, mflags);
     if (r == VK_SUCCESS && g_fragdepth_fix && pShaderModule && spv_writes_fragdepth(pCreateInfo->pCode, pCreateInfo->codeSize))
         fragdepth_module_put(*pShaderModule, pCreateInfo->pCode, pCreateInfo->codeSize);
     return r;
@@ -6774,7 +6781,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
                                                    ct_ci ? ct_ci : pCreateInfos, pAllocator, pPipelines);
     for (uint32_t i = 0; i < 8; i++) if (ct_f2[i]) ct_f2[i]->flags = ct_f2_saved[i];
     free(ct_ci);
-    if (res != VK_SUCCESS) { // [game/doom_eternal, Claude Opus 5.5] 2026-11-06: compute failures were silent
+    // The failure log only where c002fb05 had this hook (not for the disp-barrier hash fill alone: SYNC_CTL / DISP_BARRIER
+    // must not add FAILED lines / .spv dumps, e.g. on VK_PIPELINE_COMPILE_REQUIRED). [game/re_village keeper] 2026-11-14
+    bool fail_log = g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_wls_fix ||
+                    g_ct || g_fail_log;
+    if (res != VK_SUCCESS && fail_log) { // [game/doom_eternal, Claude Opus 5.5] 2026-11-06: compute failures were silent
         for (uint32_t i = 0; i < createInfoCount; i++) {
             const VkShaderModuleCreateInfo *sm = find_struct(pCreateInfos[i].stage.pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
             uint32_t fh[1], fst[1];
@@ -6795,7 +6806,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
     for (uint32_t i = 0; i < createInfoCount; i++) {
         uint32_t hash[1], stage[1];
         uint32_t n = stage_hashes(&pCreateInfos[i].stage, 1, hash, stage);
-        if ((g_gpu_time || g_ct) && res == VK_SUCCESS && pPipelines && pPipelines[i])
+        // Every pipeline that exists gets its entry, whatever res says (a partial multi-create failure or
+        // VK_PIPELINE_COMPILE_REQUIRED still returns valid handles, and a reused handle must not keep an older hash).
+        if ((g_gpu_time || g_ct || g_db_hash) && pPipelines && pPipelines[i])
             hash_put(g_pipeline_hash, (uint64_t)pPipelines[i], hash, stage, n, 0);
         if (g_dc_on && res == VK_SUCCESS && pPipelines && pPipelines[i])
             dc_pipe_create(pPipelines[i], n ? hash[0] : 0, pCreateInfos[i].layout);
@@ -9248,6 +9261,19 @@ static void gt_destroy(struct DeviceData *d) {
 //   0x010 before a pass, 0x020 after a pass, 0x040 after a dispatch, 0x080 after a copy/blit/resolve/fill/update,
 //   0x100 after a clear-image, 0x200 after a query-pool copy. Armed in any mode: a histogram of the app's barriers
 //   outside passes by stage (dst tess = TESS/GEOMETRY/PRE_RASTERIZATION, ...) in the 10-s line.
+//   disp-barrier (RE Village blinking light, docs/games/resident_evil_village.md 11-14 18:33; fbm 0x040 cures it at -3 fps)
+//   [game/re_village keeper, Claude Opus 5.5] 2026-11-14: MALI_COMPAT_DISP_BARRIER=<list> / ctl "db=<list>" (replaces the
+//   list; "db=0" and "off" clear it). <list> = 1..16 entries "<hash8>[:a|:b|:ab]" separated by commas (blanks and ';'
+//   too); hash8 = exactly 8 hex digits, the FNV-1a hash of the compute shader's app SPIR-V = the GPU_TIME "cs:" hash
+//   (00000000 is refused: it stands for "unknown"); a = after (default), b = before, ab = both; each hash once. A
+//   malformed list is refused as a whole and logged (ctl: the old list stays; env: no list). For vkCmdDispatch /
+//   DispatchIndirect / DispatchBase outside a render pass whose bound compute pipeline has a listed hash: one global
+//   memory barrier exactly as fbm 0x040 records it (sd_full) before and/or after the dispatch. Counted in "added" like
+//   every sd_full, and per entry (hits = matching dispatches) at the end of the 10-s line and of the mode line, only
+//   while a list is set (without one both lines are byte-identical to the layer before). With fbm 0x040 as well, the
+//   'a' barrier comes on top of the 0x040 one. The key (a valid list) or MALI_COMPAT_SYNC_CTL arms the hooks and fills
+//   the module / compute-pipeline hash tables (g_db_hash). Replaced lists are never freed (a recording thread may still
+//   read one; ~200 bytes per ctl change); hits a thread adds to a list after it was replaced are not reported.
 // -----------------------------------------------------------------------------
 enum { SD_PB, SD_PB2, SD_WE, SD_WE2, SD_BCB, SD_BR, SD_ER, SD_BRP, SD_BRP2, SD_ERP, SD_ERP2, SD_D, SD_DI, SD_DB,
        SD_CB, SD_CB2, SD_CI, SD_CI2, SD_CBI, SD_CBI2, SD_CIB, SD_CIB2, SD_BL, SD_BL2, SD_RS, SD_RS2, SD_FILL, SD_UPD,
@@ -9292,7 +9318,7 @@ static uint32_t sd_si_parse(const char *v) {
 }
 
 static void sd_line(const char *fmt, ...) { // stderr (the Proton log) and the status file
-    char buf[640];
+    char buf[1280]; // the 10-s line + 16 disp-barrier entries
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
@@ -9311,25 +9337,139 @@ static void sd_stamp(char *out, size_t len) { // "HH:MM:SS epoch E.EEE" (the scr
              ts.tv_nsec / 1000000);
 }
 
+// disp-barrier list (see the header). Immutable once published in g_sd_db, except the hit counters.
+#define SD_DB_MAX 16
+enum { SD_DB_A = 1, SD_DB_B = 2 };
+struct SdDb { uint32_t n; uint32_t hash[SD_DB_MAX]; uint8_t mode[SD_DB_MAX]; _Atomic uint64_t hits[SD_DB_MAX]; };
+static _Atomic(struct SdDb *) g_sd_db; // NULL = no list
+#define SD_DB_SEP " \t\r\n,;"
+
+static int sd_hexval(char ch) {
+    return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+}
+// 1 = a list in *out, 0 = "0" (clear), -1 = refused (*why says why). s is only read.
+static int sd_db_parse(const char *s, struct SdDb *out, const char **why) {
+    memset(out, 0, sizeof *out);
+    *why = "empty list (db=0 clears)";
+    if (!s) return -1;
+    size_t i = 0;
+    int toks = 0, zero = 0;
+    for (;;) {
+        while (s[i] && strchr(SD_DB_SEP, s[i])) i++;
+        if (!s[i]) break;
+        const char *t = s + i;
+        size_t tl = 0;
+        while (s[i] && !strchr(SD_DB_SEP, s[i])) { i++; tl++; }
+        toks++;
+        if (tl == 1 && t[0] == '0') { zero = 1; continue; }
+        *why = "entry is not <8 hex digits>[:a|:b|:ab]";
+        if (tl != 8 && tl != 10 && tl != 11) return -1;
+        uint32_t h = 0;
+        for (int k = 0; k < 8; k++) {
+            int v = sd_hexval(t[k]);
+            if (v < 0) return -1;
+            h = h << 4 | (uint32_t)v;
+        }
+        uint8_t m;
+        if (tl == 8) m = SD_DB_A;
+        else if (tl == 10 && t[8] == ':' && t[9] == 'a') m = SD_DB_A;
+        else if (tl == 10 && t[8] == ':' && t[9] == 'b') m = SD_DB_B;
+        else if (tl == 11 && t[8] == ':' && t[9] == 'a' && t[10] == 'b') m = SD_DB_A | SD_DB_B;
+        else return -1;
+        if (!h) { *why = "hash 00000000 (= unknown pipeline)"; return -1; }
+        for (uint32_t k = 0; k < out->n; k++)
+            if (out->hash[k] == h) { *why = "hash listed twice"; return -1; }
+        if (out->n == SD_DB_MAX) { *why = "more than 16 entries"; return -1; }
+        out->hash[out->n] = h;
+        out->mode[out->n++] = m;
+    }
+    if (zero) {
+        if (toks == 1) return 0;
+        *why = "0 together with entries";
+        return -1;
+    }
+    *why = "empty list (db=0 clears)";
+    return out->n ? 1 : -1;
+}
+static const char *sd_db_mode(uint8_t m) { return m == (SD_DB_A | SD_DB_B) ? "ab" : m == SD_DB_B ? "b" : "a"; }
+// "h:m,h:m" (cnt NULL) or "h:m N, h:m N" with the hits since prev[] (prev updated; NULL prev = since the list was set).
+static void sd_db_text(struct SdDb *L, uint64_t *prev, bool cnt, char *out, size_t len) {
+    size_t n = 0;
+    out[0] = 0;
+    for (uint32_t i = 0; L && i < L->n && n < len; i++) {
+        uint64_t h = atomic_load_explicit(&L->hits[i], memory_order_relaxed), dl = h - (prev ? prev[i] : 0);
+        if (prev) prev[i] = h;
+        int w = cnt ? snprintf(out + n, len - n, "%s%08x:%s %llu", i ? ", " : "", L->hash[i], sd_db_mode(L->mode[i]),
+                               (unsigned long long)dl)
+                    : snprintf(out + n, len - n, "%s%08x:%s", i ? "," : "", L->hash[i], sd_db_mode(L->mode[i]));
+        if (w < 0) break;
+        n += (size_t)w;
+    }
+}
+// Parse and publish (ctl thread / init). Returns false when refused (logged; the old list stays).
+static bool sd_db_set(const char *v, const char *src) {
+    struct SdDb tmp;
+    const char *why;
+    int r = sd_db_parse(v, &tmp, &why);
+    if (r < 0) { sd_line("sync-diag db=%.300s refused (%s), %s", v ? v : "", why, src); return false; }
+    struct SdDb *L = NULL;
+    if (r > 0) {
+        if (!(L = malloc(sizeof *L))) { sd_line("sync-diag db=%.300s refused (out of memory), %s", v, src); return false; }
+        memcpy(L, &tmp, sizeof *L);
+    }
+    atomic_store_explicit(&g_sd_db, L, memory_order_release); // the old list is never freed (see the header)
+    return true;
+}
+
 static void sd_mode_line(const char *why) {
     char st[48];
     sd_stamp(st, sizeof st);
     uint32_t m = atomic_load(&g_sd_fbm);
-    sd_line("sync-diag mode fb %d si %u ms k4 %d at %s (%s) fbm 0x%03x", sd_fb_level(m), atomic_load(&g_sd_si_ms),
-            (int)atomic_load(&g_sd_k4), st, why, m); // fbm last: the tests-lane parsers match up to "(why)"
+    struct SdDb *L = atomic_load(&g_sd_db);
+    char dbt[SD_DB_MAX * 12 + 4];
+    sd_db_text(L, NULL, false, dbt, sizeof dbt);
+    sd_line("sync-diag mode fb %d si %u ms k4 %d at %s (%s) fbm 0x%03x%s%s", sd_fb_level(m), atomic_load(&g_sd_si_ms),
+            (int)atomic_load(&g_sd_k4), st, why, m, L ? " db " : "", dbt); // fbm, db last: the parsers match up to "(why)"
 }
 
 // "fb=2 si=1 k4=0", also FULL_BARRIERS= / SUBMIT_IDLE= / GT_SPLIT_SKIP=, separated by blanks, commas or newlines.
+// "db=<list>" / DISP_BARRIER=: the tokens without '=' right after it (other than "off") continue its list, so
+// "db=f1dca4ed:b,71bc7191:b" survives the comma split. "off" clears the list too.
 static void sd_apply(char *s) {
-    for (char *t = strtok(s, " \t\r\n,;"); t; t = strtok(NULL, " \t\r\n,;")) {
+    char db[600];
+    int in_db = 0, db_long = 0;
+    for (char *t = strtok(s, SD_DB_SEP); t; t = strtok(NULL, SD_DB_SEP)) {
         char *eq = strchr(t, '=');
-        if (!strcmp(t, "off")) { atomic_store(&g_sd_fbm, 0); atomic_store(&g_sd_si_ms, 0); atomic_store(&g_sd_k4, false); }
+        if (in_db) {
+            if (!eq && strcmp(t, "off")) {
+                size_t n = strlen(db);
+                if (n + 1 + strlen(t) >= sizeof db) db_long = 1;
+                else { db[n] = ','; strcpy(db + n + 1, t); }
+                continue;
+            }
+            if (db_long) sd_line("sync-diag db= list refused (too long), ctl file");
+            else sd_db_set(db, "ctl file");
+            in_db = 0;
+        }
+        if (!strcmp(t, "off")) {
+            atomic_store(&g_sd_fbm, 0); atomic_store(&g_sd_si_ms, 0); atomic_store(&g_sd_k4, false);
+            if (atomic_load(&g_sd_db)) atomic_store(&g_sd_db, NULL);
+        }
         if (!eq) continue;
         *eq++ = 0;
         if (!strcmp(t, "fb") || !strcmp(t, "FULL_BARRIERS")) atomic_store(&g_sd_fbm, sd_fb_mask(atoi(eq)));
         else if (!strcmp(t, "fbm") || !strcmp(t, "FB_MASK")) atomic_store(&g_sd_fbm, (uint32_t)strtoul(eq, NULL, 0) & FBM_ALL);
         else if (!strcmp(t, "si") || !strcmp(t, "SUBMIT_IDLE")) atomic_store(&g_sd_si_ms, sd_si_parse(eq));
         else if (!strcmp(t, "k4") || !strcmp(t, "GT_SPLIT_SKIP")) atomic_store(&g_sd_k4, atoi(eq) != 0);
+        else if (!strcmp(t, "db") || !strcmp(t, "DISP_BARRIER")) {
+            db_long = strlen(eq) >= sizeof db;
+            snprintf(db, sizeof db, "%s", db_long ? "" : eq);
+            in_db = 1;
+        }
+    }
+    if (in_db) {
+        if (db_long) sd_line("sync-diag db= list refused (too long), ctl file");
+        else sd_db_set(db, "ctl file");
     }
 }
 
@@ -9338,6 +9478,9 @@ static void *sd_thread(void *arg) {
     struct timespec last_m = {0};
     off_t last_size = -1;
     uint64_t prev[SDC_N] = {0}, t_last = now_ns();
+    struct SdDb *rep_l = NULL; // the disp-barrier list the last 10-s line reported, and its hit counts then
+    uint64_t rep_prev[SD_DB_MAX] = {0};
+    char dbh[SD_DB_MAX * 36 + 8]; // "h:ab <20 digits>, " per entry
     for (;;) {
         struct timespec q = {0, 250000000};
         nanosleep(&q, NULL);
@@ -9346,15 +9489,23 @@ static void *sd_thread(void *arg) {
             (sb.st_mtim.tv_sec != last_m.tv_sec || sb.st_mtim.tv_nsec != last_m.tv_nsec || sb.st_size != last_size)) {
             last_m = sb.st_mtim;
             last_size = sb.st_size;
-            char buf[256] = {0};
+            char buf[512] = {0};
             FILE *f = fopen(g_sd_ctl, "r");
             if (f) {
                 size_t n = fread(buf, 1, sizeof buf - 1, f);
                 buf[n] = 0;
                 fclose(f);
                 uint32_t fb = atomic_load(&g_sd_fbm); uint32_t si = atomic_load(&g_sd_si_ms); bool k4 = atomic_load(&g_sd_k4);
+                struct SdDb *dbl = atomic_load(&g_sd_db);
                 sd_apply(buf);
-                if (fb != atomic_load(&g_sd_fbm) || si != atomic_load(&g_sd_si_ms) || k4 != atomic_load(&g_sd_k4))
+                if (dbl && dbl != atomic_load(&g_sd_db)) { // the replaced list's hits since the last 10-s line
+                    uint64_t zero[SD_DB_MAX] = {0};
+                    sd_db_text(dbl, dbl == rep_l ? rep_prev : zero, true, dbh, sizeof dbh);
+                    sd_line("sync-diag db list replaced, its hits since the last line: %s", dbh);
+                    if (dbl == rep_l) rep_l = NULL;
+                }
+                if (fb != atomic_load(&g_sd_fbm) || si != atomic_load(&g_sd_si_ms) || k4 != atomic_load(&g_sd_k4) ||
+                    dbl != atomic_load(&g_sd_db))
                     sd_mode_line("ctl file");
             }
         }
@@ -9364,11 +9515,14 @@ static void *sd_thread(void *arg) {
         for (int i = 0; i < SDC_N; i++) { c[i] = atomic_load(&g_sd_c[i]); dl[i] = c[i] - prev[i]; prev[i] = c[i]; }
         char st[48];
         sd_stamp(st, sizeof st);
+        struct SdDb *dl_l = atomic_load(&g_sd_db);
+        if (dl_l != rep_l) { rep_l = dl_l; memset(rep_prev, 0, sizeof rep_prev); }
+        sd_db_text(dl_l, rep_prev, true, dbh, sizeof dbh);
         sd_line("sync-diag %.1fs %s: fb %d si %u k4 %d | barriers widened %llu, in-pass kept %llu, added %llu, "
                 "split-part skips %llu | submits %llu, idled %llu, timeouts %llu, idle avg %.2f ms max %.2f ms, fails %llu"
                 " | k4 untimed parts %llu | fbm 0x%03x | app barriers %llu: dst tess %llu, dst indirect %llu, dst vtx %llu,"
                 " dst frag %llu, dst compute %llu, dst transfer %llu, dst all %llu, src compute %llu, src transfer %llu,"
-                " src frag %llu",
+                " src frag %llu%s%s",
                 (now - t_last) / 1e9, st, sd_fb_level(atomic_load(&g_sd_fbm)), atomic_load(&g_sd_si_ms), (int)atomic_load(&g_sd_k4),
                 (unsigned long long)dl[SDC_WIDEN], (unsigned long long)dl[SDC_INPASS], (unsigned long long)dl[SDC_EXTRA],
                 (unsigned long long)dl[SDC_SPLIT], (unsigned long long)dl[SDC_SUBMITS], (unsigned long long)dl[SDC_IDLED],
@@ -9378,7 +9532,7 @@ static void *sd_thread(void *arg) {
                 (unsigned long long)dl[SDC_H_DTESS], (unsigned long long)dl[SDC_H_DIND], (unsigned long long)dl[SDC_H_DVTX],
                 (unsigned long long)dl[SDC_H_DFRAG], (unsigned long long)dl[SDC_H_DCS], (unsigned long long)dl[SDC_H_DXFER],
                 (unsigned long long)dl[SDC_H_DALL], (unsigned long long)dl[SDC_H_SCS], (unsigned long long)dl[SDC_H_SXFER],
-                (unsigned long long)dl[SDC_H_SFRAG]);
+                (unsigned long long)dl[SDC_H_SFRAG], dl_l ? " | db hits " : "", dbh);
         t_last = now;
     }
     return NULL;
@@ -9392,9 +9546,18 @@ static void sd_init_once(void) {
     if (getenv("MALI_COMPAT_FB_MASK")) atomic_store(&g_sd_fbm, (uint32_t)strtoul(getenv("MALI_COMPAT_FB_MASK"), NULL, 0) & FBM_ALL);
     atomic_store(&g_sd_si_ms, sd_si_parse(si));
     atomic_store(&g_sd_k4, k4 && strcmp(k4, "0") != 0);
+    // disp-barrier: unset, empty or "0" = no list (as if unset); a malformed list is refused (no list).
+    const char *dbv = getenv("MALI_COMPAT_DISP_BARRIER");
+    struct SdDb db_env;
+    const char *db_why = NULL;
+    int db_r = dbv && *dbv ? sd_db_parse(dbv, &db_env, &db_why) : 0;
+    g_db_hash = ctl || db_r > 0;
     // The hooks are needed when a barrier or submit mode is asked for, or may be switched on later (ctl file);
     // GT_SPLIT_SKIP alone is a flag in the GPU timing code and needs none of them.
-    g_sd_armed = ctl || atomic_load(&g_sd_fbm) || atomic_load(&g_sd_si_ms) || g_rt_pipeline;
+    g_sd_armed = ctl || atomic_load(&g_sd_fbm) || atomic_load(&g_sd_si_ms) || g_rt_pipeline || db_r > 0;
+    if (db_r < 0 && !g_sd_armed)
+        fprintf(stderr, "mali-compat: sync-diag db=%.300s refused (%s), env MALI_COMPAT_DISP_BARRIER; no per-hash barrier\n",
+                dbv, db_why);
     if (!g_sd_armed && !atomic_load(&g_sd_k4)) return;
     g_sd_ctl = ctl;
     if (getenv("MALI_COMPAT_SYNC_REPORT_S") && atoi(getenv("MALI_COMPAT_SYNC_REPORT_S")) > 0)
@@ -9409,6 +9572,8 @@ static void sd_init_once(void) {
         snprintf(g_sd_log, sizeof g_sd_log, "/root/mali-sync-diag-%s.txt", comm);
     }
     sd_line("sync-diag armed: hooks %s, ctl %s, log %s", g_sd_armed ? "on" : "off (k4 only)", ctl ? ctl : "none", g_sd_log);
+    if (db_r > 0) sd_db_set(dbv, "env MALI_COMPAT_DISP_BARRIER");
+    else if (db_r < 0) sd_line("sync-diag db=%.300s refused (%s), env MALI_COMPAT_DISP_BARRIER", dbv, db_why);
     sd_mode_line("env");
     pthread_t t;
     if (pthread_create(&t, NULL, sd_thread, NULL) == 0) pthread_detach(t);
@@ -9698,6 +9863,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL sd_BeginCommandBuffer(VkCommandBuffer cmd,
         // buffer can start with a RESUMING part of a pass suspended in the previous one.
         c->sd_pass = bi && (bi->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);
         c->sd_susp = false;
+        c->db_pipe = VK_NULL_HANDLE; // disp-barrier: look the hash up again in this recording
+        c->db_hash = 0;
     }
     return r;
 }
@@ -9768,10 +9935,44 @@ static VKAPI_ATTR void VKAPI_CALL sd_CmdEndRenderPass2(VkCommandBuffer cmd, cons
         SD_NEXT(d, k, PFN_vk##fn) ARGS; \
         sd_post(d, cmd, sd_kbit(k)); \
     }
-SD_POST(CmdDispatch, SD_D, (VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z), (cmd, x, y, z))
-SD_POST(CmdDispatchIndirect, SD_DI, (VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o), (cmd, b, o))
-SD_POST(CmdDispatchBase, SD_DB, (VkCommandBuffer cmd, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y, uint32_t z),
+// Dispatches: the disp-barrier entry of the bound compute pipeline's hash (before / after), and fbm 0x040 after.
+// Index into *lp of the matching entry, or -1 (no list, no tracking, inside a pass, no or unknown pipeline, not listed).
+static int sd_db_match(VkCommandBuffer cmd, struct SdDb **lp) {
+    struct SdDb *L = atomic_load_explicit(&g_sd_db, memory_order_acquire);
+    if (!L) return -1;
+    struct CmdBufData *c = cmd_data(cmd);
+    if (!c || c->sd_pass || !c->compute_pipeline) return -1;
+    if (c->db_pipe != c->compute_pipeline) { // once per pipeline bind change: the hash table takes a mutex
+        struct HashNode h;
+        c->db_pipe = c->compute_pipeline;
+        c->db_hash = 0;
+        if (hash_get(g_pipeline_hash, (uint64_t)c->compute_pipeline, &h))
+            for (int s = 0; s < 3; s++)
+                if (h.stages[s] == VK_SHADER_STAGE_COMPUTE_BIT) { c->db_hash = h.hash[s]; break; }
+    }
+    if (!c->db_hash) return -1;
+    for (uint32_t i = 0; i < L->n; i++)
+        if (L->hash[i] == c->db_hash) { *lp = L; return (int)i; }
+    return -1;
+}
+#define SD_DISP(fn, k, PARAMS, ARGS) \
+    static VKAPI_ATTR void VKAPI_CALL sd_##fn PARAMS { \
+        struct DeviceData *d = get_device_data_by_cmd(cmd); \
+        struct SdDb *L = NULL; \
+        int m = sd_db_match(cmd, &L); \
+        if (m >= 0 && (L->mode[m] & SD_DB_B)) sd_full(d, cmd); \
+        SD_NEXT(d, k, PFN_vk##fn) ARGS; \
+        sd_post(d, cmd, sd_kbit(k)); \
+        if (m >= 0) { \
+            if (L->mode[m] & SD_DB_A) sd_full(d, cmd); \
+            atomic_fetch_add_explicit(&L->hits[m], 1, memory_order_relaxed); \
+        } \
+    }
+SD_DISP(CmdDispatch, SD_D, (VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z), (cmd, x, y, z))
+SD_DISP(CmdDispatchIndirect, SD_DI, (VkCommandBuffer cmd, VkBuffer b, VkDeviceSize o), (cmd, b, o))
+SD_DISP(CmdDispatchBase, SD_DB, (VkCommandBuffer cmd, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y, uint32_t z),
         (cmd, bx, by, bz, x, y, z))
+#undef SD_DISP
 SD_POST(CmdCopyBuffer, SD_CB, (VkCommandBuffer cmd, VkBuffer s, VkBuffer t, uint32_t n, const VkBufferCopy *r), (cmd, s, t, n, r))
 SD_POST(CmdCopyBuffer2, SD_CB2, (VkCommandBuffer cmd, const VkCopyBufferInfo2 *i), (cmd, i))
 SD_POST(CmdCopyImage, SD_CI, (VkCommandBuffer cmd, VkImage s, VkImageLayout sl, VkImage t, VkImageLayout tl, uint32_t n,
@@ -11995,7 +12196,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         if (!strcmp(pName, "vkGetAccelerationStructureDeviceAddressKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureDeviceAddressKHR;
         if (!strcmp(pName, "vkGetAccelerationStructureBuildSizesKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureBuildSizesKHR;
     }
-    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_wls_fix || g_ct || g_fail_log) MATCH_DEV(CreateComputePipelines);
+    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_wls_fix || g_ct || g_fail_log || g_db_hash) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
         MATCH_DEV(CreateQueryPool);
         MATCH_DEV(DestroyQueryPool);
