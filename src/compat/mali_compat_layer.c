@@ -131,6 +131,25 @@ static bool g_rt_pipeline;
 static bool g_as_hooks;
 static bool rt_pipeline_emulation_available(void) { return true; }
 static bool g_bc_afrc = true; // MALI_COMPAT_BC_AFRC=0 turns the fixed-rate BC shadows off
+// MALI_COMPAT_BDA_EXT=1: vkCreateDevice also enables VK_KHR_buffer_device_address when the app did not and the driver
+// has it. The BC decode reads the app's upload buffer and writes its staging buffer through device addresses, so it
+// needs vkGetBufferDeviceAddress. An app on Vulkan 1.0/1.1 that does not enable the extension (DOOM Eternal: instance
+// apiVersion 1.1.0) gets a device whose vkGetDeviceProcAddr has neither vkGetBufferDeviceAddress nor ...KHR: the
+// decode then called a null pointer on every BC upload. Under Wine the fault is swallowed inside the unix call (the
+// call just returns), so nothing was logged and every BC texture stayed undecoded ("BC decodes 0" with 74 514
+// uploads, 2026-11-06). Without the key such an upload is now skipped and counted (bc-dec nobda), not called.
+// The key and the switch of the bc-dec counts line (the key or MALI_COMPAT_FAIL_LOG) are read once (pthread_once):
+// device creation and the log thread read them from other threads.
+// [game/doom_eternal, Claude Fable 5.2] 2026-11-12
+static bool g_bda_ext_val, g_bcd_log_val;
+static pthread_once_t g_bda_once = PTHREAD_ONCE_INIT;
+static void bda_ext_init(void) {
+    g_bda_ext_val = getenv("MALI_COMPAT_BDA_EXT") && atoi(getenv("MALI_COMPAT_BDA_EXT")) > 0;
+    g_bcd_log_val = g_bda_ext_val || (getenv("MALI_COMPAT_FAIL_LOG") && atoi(getenv("MALI_COMPAT_FAIL_LOG")) > 0);
+}
+static bool bda_ext_on(void) { pthread_once(&g_bda_once, bda_ext_init); return g_bda_ext_val; }
+static bool bcd_log_on(void) { pthread_once(&g_bda_once, bda_ext_init); return g_bcd_log_val; }
+static _Atomic unsigned long long g_bcd_enter, g_bcd_nobda, g_bcd_done; // BC uploads: seen / skipped (no BDA) / decoded
 static void dump_spirv(const uint32_t *orig, size_t orig_bytes, const uint32_t *patched, size_t patched_bytes) {
     static _Atomic int n;
     if (!g_dump_spirv) return;
@@ -994,6 +1013,7 @@ done:
 // Layer Data Structures & Dispatch Tables
 // -----------------------------------------------------------------------------
 struct InstanceData {
+    uint32_t app_api; // VkApplicationInfo::apiVersion of this instance (0 = none given = Vulkan 1.0); MALI_COMPAT_BDA_EXT
     VkInstance instance;
     void *dispatch_key;
     PFN_vkGetInstanceProcAddr get_instance_proc_addr;
@@ -1609,6 +1629,23 @@ static struct InstanceData *get_instance_by_phys_dev(VkPhysicalDevice phys_dev) 
     struct InstanceData *fallback = g_instance_count > 0 ? &g_instances[g_instance_count - 1] : NULL;
     pthread_mutex_unlock(&g_table_mutex);
     return fallback;
+}
+
+// VkApplicationInfo::apiVersion of the instance phys_dev belongs to (the search of get_instance_by_phys_dev), read
+// under g_table_mutex: vkDestroyInstance compacts g_instances, so a pointer handed out earlier may name another
+// instance by the time it is read. No instance known: 0 (= Vulkan 1.0, MALI_COMPAT_BDA_EXT then adds nothing).
+static uint32_t app_api_by_phys_dev(VkPhysicalDevice phys_dev) {
+    uint32_t api = 0;
+    pthread_mutex_lock(&g_table_mutex);
+    void *key = phys_dev ? *(void **)phys_dev : NULL;
+    int32_t hit = -1;
+    if (key)
+        for (int32_t i = (int32_t)g_instance_count - 1; i >= 0 && hit < 0; i--)
+            if (g_instances[i].dispatch_key == key) hit = i;
+    if (hit < 0 && g_instance_count > 0) hit = (int32_t)g_instance_count - 1;
+    if (hit >= 0) api = g_instances[hit].app_api;
+    pthread_mutex_unlock(&g_table_mutex);
+    return api;
 }
 
 // F2 (our-cpu-paths-1105.md) [keeper, Claude Opus 5.5] 2026-11-05: the device lookups ran under g_table_mutex on
@@ -6650,6 +6687,14 @@ static void *pc2_log_thread(void *arg) {
         if (v1 | v2 | un | dec | dv2)
             fprintf(stderr, "mali-compat: pc2: v1 pushes %llu, v2 pushes %llu, v2 unrecorded %llu, BC decodes %llu, "
                     "decodes replaying v2 %llu\n", v1, v2, un, dec, dv2);
+        static unsigned long long last_enter; // this thread only
+        unsigned long long be = atomic_load_explicit(&g_bcd_enter, memory_order_relaxed);
+        if (bcd_log_on() && be != last_enter) {
+            last_enter = be;
+            fprintf(stderr, "mali-compat: bc-dec (pid %d): enter %llu nobda %llu done %llu\n", (int)getpid(), be,
+                    atomic_load_explicit(&g_bcd_nobda, memory_order_relaxed),
+                    atomic_load_explicit(&g_bcd_done, memory_order_relaxed));
+        }
     }
     return NULL;
 }
@@ -6673,6 +6718,14 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
 
     if (!d || !find_bc_image(dstImage, &tracked)) {
         d->fpCmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, pRegions);
+        return;
+    }
+    atomic_fetch_add_explicit(&g_bcd_enter, 1, memory_order_relaxed);
+    if (!d->fpGetBufferDeviceAddress) { // see bda_ext_on: this was a call through a null pointer
+        if (atomic_fetch_add_explicit(&g_bcd_nobda, 1, memory_order_relaxed) == 0)
+            fprintf(stderr, "mali-compat: BC decode: this device has no vkGetBufferDeviceAddress (app on Vulkan < 1.2 "
+                    "without VK_KHR_buffer_device_address); BC uploads are skipped, textures stay undecoded. "
+                    "MALI_COMPAT_BDA_EXT=1 enables the extension\n");
         return;
     }
     if (init_bc_compute(d) != VK_SUCCESS || !regionCount) return;
@@ -6778,6 +6831,7 @@ static VKAPI_ATTR void VKAPI_CALL compat_CmdCopyBufferToImage(
         }
     }
     pc2_count(PC2_DECODES);
+    atomic_fetch_add_explicit(&g_bcd_done, 1, memory_order_relaxed);
     if (replayed_v2) pc2_count(PC2_DECODES_V2);
     // Only with MALI_COMPAT_VENDOR_ID: the recorded writes can name image/buffer views the app has destroyed since,
     // and pushing them again crashed Horizon Zero Dawn's benchmark load (C0000005, 2026-10-28 22:49).
@@ -9210,6 +9264,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
         struct InstanceData *inst = &g_instances[g_instance_count++];
         memset(inst, 0, sizeof(*inst));
         inst->instance = *pInstance;
+        inst->app_api = pCreateInfo->pApplicationInfo ? pCreateInfo->pApplicationInfo->apiVersion : 0;
         inst->dispatch_key = *pInstance ? *(void **)*pInstance : NULL;
         inst->get_instance_proc_addr = fpGetInstanceProcAddr;
         #define LOAD_INST(fn) inst->fp##fn = (PFN_vk##fn)fpGetInstanceProcAddr(*pInstance, "vk" #fn)
@@ -9357,6 +9412,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         if (strcmp(e, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME)) ext_names[mod_ci.enabledExtensionCount++] = e;
     }
     if (div_ext && !div_khr) ext_names[mod_ci.enabledExtensionCount++] = "VK_KHR_vertex_attribute_divisor";
+    // MALI_COMPAT_BDA_EXT=1 (see bda_ext_on): enable VK_KHR_buffer_device_address for an app that did not. Not next to
+    // an app-enabled VK_EXT_buffer_device_address (the two must not be enabled together). Only for an app on Vulkan
+    // >= 1.1: there the extension's own dependency (physical-device-properties2) is core.
+    bool bda_app = false, bda_app_ext = false, bda_added = false;
+    uint32_t bda_api = app_api_by_phys_dev(physicalDevice);
+    for (uint32_t i = 0; i < mod_ci.enabledExtensionCount; i++) {
+        bda_app |= !strcmp(ext_names[i], VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+        bda_app_ext |= !strcmp(ext_names[i], "VK_EXT_buffer_device_address");
+    }
+    if (bda_ext_on() && !bda_app && !bda_app_ext && bda_api >= VK_API_VERSION_1_1 && inst &&
+        inst->fpEnumerateDeviceExtensionProperties) {
+        uint32_t n = 0;
+        inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &n, NULL);
+        VkExtensionProperties *props = n ? malloc(n * sizeof *props) : NULL;
+        if (props && inst->fpEnumerateDeviceExtensionProperties(physicalDevice, NULL, &n, props) >= 0)
+            for (uint32_t i = 0; i < n; i++)
+                bda_added |= !strcmp(props[i].extensionName, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+        free(props);
+        if (bda_added) ext_names[mod_ci.enabledExtensionCount++] = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
+    }
     if (g_rt_pipeline) {
         const char *need_rt[3] = {
             drv_has_dho ? "VK_KHR_deferred_host_operations" : NULL,
@@ -9766,6 +9841,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
         LOAD_DEV(GetBufferDeviceAddress);
         if (!d->fpGetBufferDeviceAddress)
             d->fpGetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress)fpGetDeviceProcAddr(*pDevice, "vkGetBufferDeviceAddressKHR");
+        if (bda_ext_on() || !d->fpGetBufferDeviceAddress)
+            fprintf(stderr, "mali-compat: bda: VkDevice %p, app apiVersion %u.%u, VK_KHR_buffer_device_address app %d "
+                    "(EXT %d) layer-added %d (MALI_COMPAT_BDA_EXT=%d), vkGetBufferDeviceAddress %s%s\n", (void *)*pDevice,
+                    VK_API_VERSION_MAJOR(bda_api), VK_API_VERSION_MINOR(bda_api), bda_app, bda_app_ext, bda_added,
+                    bda_ext_on(), d->fpGetBufferDeviceAddress ? "yes" : "NO",
+                    d->fpGetBufferDeviceAddress ? "" : ": BC uploads will be skipped (textures undecoded)");
         LOAD_DEV(CmdBindPipeline);
         LOAD_DEV(CmdPushConstants);
         LOAD_DEV(CmdPushConstants2);
