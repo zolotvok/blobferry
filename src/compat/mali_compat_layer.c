@@ -463,6 +463,448 @@ static uint32_t *wls_clamp_module(const uint32_t *orig, size_t orig_bytes, const
 }
 // END wls-clamp-1
 
+// BEGIN wls-fix-1
+// MALI_COMPAT_WLS_FIX (DOOM Eternal cs:371a5d57) [game/doom_eternal keeper, Claude Opus 5.5] 2026-11-13: a listed compute
+// module is rewritten to a VIRTUAL 1-LANE SUBGROUP with ONE WORKGROUP SLOT PER INVOCATION, so its result no longer
+// depends on the driver's subgroup width. DOOM's cs:371a5d57 (32x32) reduces per subgroup with ShuffleXor 1..16 (+
+// Broadcast 32 under SubgroupSize > 32), stores arr[(x + 32y) / SubgroupSize] into a shared vec3[32] and lets
+// invocation 0 loop over 1024 / SubgroupSize entries: written for 32/64 lanes. With the blob's 16 lanes the index runs
+// to 63 (512 B past the array in Mali's plain-VA WLS) and mask 16 is out of range (undefined). Rewrite: every load of
+// SubgroupSize -> constant 1, every ShuffleXor / Broadcast -> its value operand (the only lane is the invocation
+// itself; the spec leaves other lanes undefined, identity is what a max/min reduction needs), every Workgroup array
+// shorter than the invocation count N grown to N, then the wls-clamp-1 clamp with the new lengths (safety net), and
+// the Unroll bit of every OpLoopMerge cleared (the reduce loop becomes N-1 iterations). Anything the rewrite cannot
+// prove safe leaves the module as it is (one log line with the reason). Unset / empty / 0 = off; a comma list of hex
+// hashes (the WLS_CLAMP / GPU_TIME FNV-1a of the app's SPIR-V); no "all".
+static int g_wls_fix;                    // 0 off, 1 hash list
+static uint32_t g_wlsf_hashes[16], g_wlsf_count;
+static _Atomic uint32_t g_wlsf_logged, g_wlsf_left_logged;
+static _Atomic uint64_t g_wlsf_rewritten, g_wlsf_left;
+
+static pthread_once_t g_wlsf_once = PTHREAD_ONCE_INIT;
+static void wls_fix_init_impl(void) {
+    const char *v = getenv("MALI_COMPAT_WLS_FIX");
+    if (!v || !*v || !strcmp(v, "0")) return;
+    uint32_t n = 0;
+    bool bad = false;
+    for (const char *h = v;;) { // strict: 1-8 hex digits per item, ',' between items
+        const char *e = h;
+        uint32_t x = 0;
+        while ((*e >= '0' && *e <= '9') || (*e >= 'a' && *e <= 'f') || (*e >= 'A' && *e <= 'F')) {
+            x = x << 4 | (uint32_t)(*e <= '9' ? *e - '0' : (*e | 0x20) - 'a' + 10);
+            e++;
+        }
+        if (e == h || e - h > 8 || (*e && *e != ',') || n >= 16) { bad = true; break; }
+        g_wlsf_hashes[n++] = x;
+        if (!*e) break;
+        h = e + 1;
+    }
+    if (bad) {
+        fprintf(stderr, "mali-compat: MALI_COMPAT_WLS_FIX=%s ignored (comma list of up to 16 hex shader hashes)\n", v);
+        return;
+    }
+    g_wlsf_count = n;
+    g_wls_fix = 1;
+    fprintf(stderr, "mali-compat: wls-fix on (MALI_COMPAT_WLS_FIX=%s)\n", v);
+}
+// once per process, from vkCreateInstance and vkCreateDevice (as wls_clamp_init)
+static void wls_fix_init(void) { pthread_once(&g_wlsf_once, wls_fix_init_impl); }
+
+static bool wls_fix_wanted(uint32_t hash) {
+    for (uint32_t i = 0; g_wls_fix && i < g_wlsf_count; i++)
+        if (g_wlsf_hashes[i] == hash) return true;
+    return false;
+}
+
+// Mali's maxComputeSharedMemorySize (Dimensity 9500 blob, 32 KiB). The patch path runs without a device at hand
+// (vkCreateShaderModule has no physical device in reach cheaply), so the limit is this constant.
+#define WLSF_SHARED_LIMIT 32768u
+#define WLSF_MAX_VARS 16
+
+struct WlsfStat {
+    uint32_t n, loads, shx, bcast, grown, clamped, loops;
+    uint32_t old_len[WLSF_MAX_VARS];
+    size_t in_bytes, out_bytes;
+};
+
+struct WlsfVar {
+    uint32_t var, ptype, atype, elem, lenc, len, stride; // atype 0 = scalar/vector variable
+    uint32_t var_off, stride_off;                        // word offsets of the OpVariable and of OpDecorate ArrayStride
+    uint32_t new_len_c, new_atype, new_ptype;            // grown: the new length constant / array type / pointer type
+    bool len_c_new, grow;
+    uint64_t esize;                                      // array element stride (std430-like) or the whole size
+};
+
+// value of an integer OpConstant (not spec, not null); false otherwise
+static bool wlsf_const(const uint32_t *in, const uint32_t *def, uint32_t bound, uint32_t id, uint64_t *v) {
+    if (!id || id >= bound || !def[id]) return false;
+    const uint32_t *d = in + def[id];
+    if ((d[0] & 0xffff) != 43 || (d[0] >> 16) < 4) return false;
+    *v = (d[0] >> 16) >= 5 ? ((uint64_t)d[4] << 32 | d[3]) : d[3];
+    return true;
+}
+
+// std430-like size and alignment of a type (vec3 = 16 B); 0 = unknown / not allowed in workgroup storage here
+static uint64_t wlsf_size(const uint32_t *in, const uint32_t *def, uint32_t bound, uint32_t t, uint64_t *align, int depth) {
+    *align = 4;
+    if (depth > 8 || !t || t >= bound || !def[t]) return 0;
+    const uint32_t *d = in + def[t];
+    uint32_t op = d[0] & 0xffff, len = d[0] >> 16;
+    uint64_t a, s, v;
+    switch (op) {
+    case 20: return 4;                                            // bool
+    case 21: case 22:                                             // int, float
+        if (len < 3 || d[2] < 8 || d[2] > 64) return 0;
+        *align = d[2] / 8;
+        return d[2] / 8;
+    case 23:                                                      // vector
+        if (len < 4 || !(s = wlsf_size(in, def, bound, d[2], &a, depth + 1))) return 0;
+        *align = s * (d[3] == 3 ? 4 : d[3]);
+        return *align;
+    case 24:                                                      // matrix: columns of padded vectors
+        if (len < 4 || !(s = wlsf_size(in, def, bound, d[2], &a, depth + 1))) return 0;
+        *align = a;
+        return s * d[3];
+    case 28:                                                      // array with a constant length
+        if (len < 4 || !wlsf_const(in, def, bound, d[3], &v) || !v || v > (1u << 20)) return 0;
+        if (!(s = wlsf_size(in, def, bound, d[2], &a, depth + 1))) return 0;
+        *align = a;
+        s = v * ((s + a - 1) / a * a);
+        return s > (1ull << 32) ? 0 : s;
+    case 30: {                                                    // struct
+        uint64_t off = 0, ma = 4;
+        for (uint32_t k = 2; k < len; k++) {
+            if (!(s = wlsf_size(in, def, bound, d[k], &a, depth + 1))) return 0;
+            off = (off + a - 1) / a * a + s;
+            if (a > ma) ma = a;
+        }
+        *align = ma;
+        return off ? (off + ma - 1) / ma * ma : 0;
+    }
+    default: return 0;
+    }
+}
+
+// Is word k (1..len-1) of instruction w an id operand? Literal-only and string instructions answer false; unknown
+// instructions answer true (an id compared against a literal can only cause a refusal, never a wrong rewrite).
+static bool wlsf_is_id(const uint32_t *w, uint32_t k) {
+    uint32_t op = w[0] & 0xffff;
+    switch (op) {
+    case 0: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 10: case 11: case 14: case 15: case 16:
+    case 17: case 71: case 72: case 73: case 74: case 75: case 317: case 330: case 331: case 332: case 5632: case 5633:
+    case 19: case 20: case 21: case 22: case 26: case 31:
+        return false; // debug, annotations, mode setting, scalar types (OpEntryPoint interface: allowed anyway)
+    case 43: case 50: return k <= 2;                 // OpConstant, OpSpecConstant: literal values
+    case 52: return k != 3;                          // OpSpecConstantOp: literal opcode
+    case 23: case 24: return k == 1 || k == 2;       // vector / matrix: literal count
+    case 25: return k == 1 || k == 2;                // OpTypeImage
+    case 32: return k != 2;                          // OpTypePointer: storage class
+    case 39: return k == 1;                          // OpTypeForwardPointer
+    case 59: return k != 3;                          // OpVariable: storage class
+    case 54: return k != 3;                          // OpFunction: function control
+    case 12: return k != 4;                          // OpExtInst: instruction number
+    case 79: return k <= 4;                          // OpVectorShuffle: components
+    case 81: return k <= 3;                          // OpCompositeExtract: indices
+    case 82: return k <= 4;                          // OpCompositeInsert: indices
+    case 68: return k <= 3;                          // OpArrayLength: member
+    case 246: return k <= 2;                         // OpLoopMerge: control (+ parameters)
+    case 247: return k == 1;                         // OpSelectionMerge
+    default: return true;
+    }
+}
+
+// Returns the rewritten module (size in *out_bytes) or NULL; *why = the reason it was left as it is.
+static uint32_t *spv_wls_fix(const uint32_t *in, size_t bytes, size_t *out_bytes, struct WlsfStat *st, const char **why) {
+    static _Thread_local char why_buf[160]; // per thread: modules are created on many threads at once
+    memset(st, 0, sizeof *st);
+    st->in_bytes = bytes;
+    *why = "not SPIR-V or malformed";
+    if (!in || bytes < 20 || bytes % 4 || in[0] != 0x07230203) return NULL;
+    size_t n = bytes / 4;
+    uint32_t bound = in[3];
+    if (!bound || bound > (1u << 22)) return NULL;
+    uint32_t *def = calloc(bound, 4), *type = calloc(bound, 4), *out = NULL;
+    struct WlsfVar v[WLSF_MAX_VARS];
+    uint32_t nv = 0, sg[4], nsg = 0, entries = 0, model = 0, lx = 0, ly = 0, lz = 0, wgs = 0;
+    size_t mm_off = 0, fn_off = 0;
+    bool size_id = false;
+    if (!def || !type) { *why = "out of memory"; goto done; }
+    // pass 1: definitions, structure, refusals by opcode / decoration
+    for (size_t o = 5; o < n;) {
+        uint32_t op = in[o] & 0xffff, len = in[o] >> 16;
+        if (!len || o + len > n) goto done;
+        const uint32_t *w = in + o;
+        if (spv_op_typed(op) && len >= 3 && w[2] < bound && w[1] < bound) { def[w[2]] = (uint32_t)o; type[w[2]] = w[1]; }
+        else if (op >= 19 && op <= 38 && len >= 2 && w[1] < bound) def[w[1]] = (uint32_t)o;
+        if (op == 15 && len >= 3) { entries++; model = w[1]; }
+        if (op == 16 && len >= 3 && w[2] == 17 && len >= 6) { lx = w[3]; ly = w[4]; lz = w[5]; }
+        if ((op == 16 || op == 331) && len >= 3 && w[2] == 38) size_id = true;
+        if (op == 14 && !mm_off) {
+            mm_off = o;
+            if (len < 3 || w[1] != 0 || w[2] != 1) { *why = "memory model is not Logical GLSL450"; goto done; }
+        }
+        if (op == 54 && !fn_off) fn_off = o;
+        if (op == 71 && len >= 4 && w[2] == 11) { // OpDecorate BuiltIn
+            uint32_t b = w[3];
+            if (b == 36) { if (nsg >= 4) { *why = "too many SubgroupSize variables"; goto done; } sg[nsg++] = w[1]; }
+            if ((b >= 37 && b <= 41) || (b >= 4416 && b <= 4420)) {
+                snprintf(why_buf, sizeof why_buf, "subgroup built-in %u (only SubgroupSize is rewritten)", b);
+                *why = why_buf;
+                goto done;
+            }
+            if (b == 25) wgs = w[1];
+        }
+        if (op == 72 && len >= 5 && w[3] == 11 && ((w[4] >= 36 && w[4] <= 41) || (w[4] >= 4416 && w[4] <= 4420))) {
+            *why = "subgroup built-in as a struct member";
+            goto done;
+        }
+        bool grp = (op >= 259 && op <= 271) || (op >= 333 && op <= 366 && op != 337 && op != 346) ||
+                   (op >= 4421 && op <= 4432) || (op >= 5000 && op <= 5007) || op == 5110 || op == 5111 || op == 5296 ||
+                   (op >= 5571 && op <= 5581) || op == 6221 || op == 6237 || (op >= 6401 && op <= 6408);
+        if (grp) {
+            snprintf(why_buf, sizeof why_buf, "group/subgroup opcode %u (only ShuffleXor 346 and Broadcast 337 are rewritten)", op);
+            *why = why_buf;
+            goto done;
+        }
+        if (op == 337 || op == 346) {
+            uint64_t sc;
+            if (len != 6 || !wlsf_const(in, def, bound, w[3], &sc) || sc != 3) { *why = "ShuffleXor/Broadcast with a scope other than a constant Subgroup"; goto done; }
+            if (op == 346) st->shx++; else st->bcast++;
+        }
+        if (op == 59 && len >= 4 && w[3] == 4) { // OpVariable Workgroup
+            if (nv >= WLSF_MAX_VARS) { *why = "more than 16 Workgroup variables"; goto done; }
+            memset(&v[nv], 0, sizeof v[nv]);
+            v[nv].var = w[2];
+            v[nv].ptype = w[1];
+            v[nv].var_off = (uint32_t)o;
+            nv++;
+        }
+        o += len;
+    }
+    if (!mm_off || !fn_off) goto done;
+    if (entries != 1) { *why = "not exactly one entry point"; goto done; }
+    if (model != 5) { *why = "not a GLCompute entry point"; goto done; }
+    if (size_id) { *why = "LocalSizeId (workgroup size from spec constants)"; goto done; }
+    if (wgs) { // a WorkgroupSize built-in constant overrides LocalSize: plain constants only
+        const uint32_t *d = wgs < bound && def[wgs] ? in + def[wgs] : NULL;
+        uint64_t a, b, c;
+        if (!d || (d[0] & 0xffff) != 44 || (d[0] >> 16) != 6 || !wlsf_const(in, def, bound, d[3], &a) ||
+            !wlsf_const(in, def, bound, d[4], &b) || !wlsf_const(in, def, bound, d[5], &c)) {
+            *why = "WorkgroupSize built-in is not a plain constant (spec-constant workgroup size)";
+            goto done;
+        }
+        lx = (uint32_t)a; ly = (uint32_t)b; lz = (uint32_t)c;
+    }
+    if (!lx || !ly || !lz || (uint64_t)lx * ly * lz > 4096) { *why = "no constant LocalSize (or invocation count > 4096)"; goto done; }
+    st->n = lx * ly * lz;
+    for (uint32_t i = 0; i < nsg; i++) { // the SubgroupSize variable: an Input uint
+        const uint32_t *d = sg[i] < bound && def[sg[i]] ? in + def[sg[i]] : NULL;
+        const uint32_t *pt = d && (d[0] & 0xffff) == 59 && d[1] < bound && def[d[1]] ? in + def[d[1]] : NULL;
+        const uint32_t *it = pt && (pt[0] & 0xffff) == 32 && pt[3] < bound && def[pt[3]] ? in + def[pt[3]] : NULL;
+        if (!it || (it[0] & 0xffff) != 21 || it[2] != 32) { *why = "SubgroupSize is not an Input uint variable"; goto done; }
+    }
+    // Workgroup variables: scalar / vector, or an array with a constant length; estimate the memory after growth
+    uint64_t shared = 0;
+    for (uint32_t i = 0; i < nv; i++) {
+        const uint32_t *pt = v[i].ptype < bound && def[v[i].ptype] ? in + def[v[i].ptype] : NULL;
+        if (!pt || (pt[0] & 0xffff) != 32 || (pt[0] >> 16) < 4) goto done;
+        const uint32_t *d = pt[3] < bound && def[pt[3]] ? in + def[pt[3]] : NULL;
+        uint32_t top = d ? d[0] & 0xffff : 0;
+        uint64_t a, s;
+        if (top >= 20 && top <= 23) { // bool, int, float, vector
+            if (!(s = wlsf_size(in, def, bound, pt[3], &a, 0))) { *why = "Workgroup variable of unknown size"; goto done; }
+            shared += (s + 15) / 16 * 16;
+            continue;
+        }
+        uint64_t len;
+        if (top != 28 || (d[0] >> 16) < 4) {
+            snprintf(why_buf, sizeof why_buf, "Workgroup variable %%%u is not a scalar, vector or array (opcode %u)", v[i].var, top);
+            *why = why_buf;
+            goto done;
+        }
+        if (!wlsf_const(in, def, bound, d[3], &len) || !len || len > (1u << 20)) {
+            snprintf(why_buf, sizeof why_buf, "Workgroup array %%%u has a spec-constant or invalid length", v[i].var);
+            *why = why_buf;
+            goto done;
+        }
+        if (!(s = wlsf_size(in, def, bound, d[2], &a, 0))) { *why = "Workgroup array element of unknown size"; goto done; }
+        v[i].atype = pt[3];
+        v[i].elem = d[2];
+        v[i].lenc = d[3];
+        v[i].len = (uint32_t)len;
+        v[i].esize = (s + a - 1) / a * a;
+        v[i].grow = len < st->n;
+        shared += ((v[i].grow ? st->n : len) * v[i].esize + 15) / 16 * 16;
+    }
+    if (shared > WLSF_SHARED_LIMIT) {
+        snprintf(why_buf, sizeof why_buf, "shared memory after growth %llu B > %u B", (unsigned long long)shared, WLSF_SHARED_LIMIT);
+        *why = why_buf;
+        goto done;
+    }
+    // pass 2: every id operand that names a SubgroupSize variable, a Workgroup array variable, its pointer type or its
+    // array type must be one of the allowed uses; also count the loads, record ArrayStride decorations and loops
+    for (size_t o = 5; o < n; o += in[o] >> 16) {
+        const uint32_t *w = in + o;
+        uint32_t op = w[0] & 0xffff, len = w[0] >> 16;
+        if (op == 71 && len >= 4 && w[2] == 6)
+            for (uint32_t i = 0; i < nv; i++)
+                if (v[i].atype && w[1] == v[i].atype) { v[i].stride = w[3]; v[i].stride_off = (uint32_t)o; }
+        if (op == 246 && len >= 4 && (w[3] & 1)) st->loops++;
+        for (uint32_t k = 1; k < len; k++) {
+            uint32_t id = w[k];
+            if (!wlsf_is_id(w, k)) continue;
+            for (uint32_t i = 0; i < nsg; i++) {
+                if (id != sg[i]) continue;
+                if (op == 61 && k == 3) { st->loads++; continue; }
+                if (op == 59 && k == 2) continue;
+                snprintf(why_buf, sizeof why_buf, "SubgroupSize variable used by opcode %u (only OpLoad is rewritten)", op);
+                *why = why_buf;
+                goto done;
+            }
+            for (uint32_t i = 0; i < nv; i++) {
+                if (!v[i].atype) continue;
+                bool ok = true;
+                if (id == v[i].var) ok = (op == 59 && k == 2) || ((op == 65 || op == 66) && k == 3 && len >= 5);
+                else if (id == v[i].ptype) ok = (op == 32 && k == 1) || (op == 59 && k == 1 && o == v[i].var_off);
+                else if (id == v[i].atype) ok = (op == 28 && k == 1) || (op == 32 && k == 3 && w[1] == v[i].ptype);
+                else continue;
+                if (!ok) {
+                    snprintf(why_buf, sizeof why_buf, "Workgroup array %%%u (or its type) used by opcode %u (only access chains are allowed)", v[i].var, op);
+                    *why = why_buf;
+                    goto done;
+                }
+            }
+        }
+    }
+    // Only a shader that reads SubgroupSize can follow a 1-lane subgroup; ShuffleXor / Broadcast without it hard-wire a
+    // lane layout (e.g. quad neighbours), where identity would change the result.
+    if (!st->loads) { *why = st->shx || st->bcast ? "ShuffleXor/Broadcast without any SubgroupSize load (lane layout hard-wired)"
+                                                  : "no SubgroupSize load (nothing to rewrite)"; goto done; }
+    // ids: the constant 1 per SubgroupSize load type (uint), per grown array a length constant, array and pointer type
+    uint32_t next = bound, one = 0, one_type = 0;
+    bool one_new = false;
+    if (st->loads) {
+        const uint32_t *d = in + def[sg[0]];
+        one_type = in[def[d[1]] + 3];
+        for (uint32_t k = 1; k < bound && !one; k++) {
+            uint64_t x;
+            if (type[k] == one_type && def[k] < fn_off && wlsf_const(in, def, bound, k, &x) && x == 1) one = k;
+        }
+        if (!one) { one = next++; one_new = true; }
+    }
+    for (uint32_t i = 0; i < nv; i++) {
+        if (!v[i].grow) continue;
+        uint32_t lt = type[v[i].lenc];
+        if (!lt || lt >= bound || !def[lt] || (in[def[lt]] & 0xffff) != 21) { *why = "array length constant is not an integer"; goto done; }
+        for (uint32_t k = 1; k < bound && !v[i].new_len_c; k++) {
+            uint64_t x;
+            if (type[k] == lt && def[k] < v[i].var_off && wlsf_const(in, def, bound, k, &x) && x == st->n) v[i].new_len_c = k;
+        }
+        for (uint32_t j = 0; j < i && !v[i].new_len_c; j++) // a constant made for an earlier array of the same length type
+            if (v[j].grow && v[j].len_c_new && type[v[j].lenc] == lt) v[i].new_len_c = v[j].new_len_c;
+        if (!v[i].new_len_c) { v[i].new_len_c = next++; v[i].len_c_new = true; }
+        v[i].new_atype = next++;
+        v[i].new_ptype = next++;
+        st->old_len[st->grown++] = v[i].len;
+    }
+    // pass 3: write the rewritten module
+    out = malloc((n + 8 + 17 * (size_t)nv) * 4); // per grown array: constant 5, array 4, pointer 4, ArrayStride 4
+    if (!out) { *why = "out of memory"; goto done; }
+    memcpy(out, in, 5 * 4);
+    size_t w = 5;
+    bool emitted_c[WLSF_MAX_VARS] = {0};
+    for (size_t o = 5; o < n;) {
+        const uint32_t *x = in + o;
+        uint32_t op = x[0] & 0xffff, len = x[0] >> 16;
+        if (o == fn_off && one_new) { out[w++] = (4u << 16) | 43u; out[w++] = one_type; out[w++] = one; out[w++] = 1; }
+        for (uint32_t i = 0; i < nv; i++) {
+            if (!v[i].grow || o != v[i].var_off) continue;
+            if (v[i].len_c_new && !emitted_c[i]) {
+                bool done_before = false; // shared with an earlier array: emitted there already
+                for (uint32_t j = 0; j < i; j++) if (v[j].grow && v[j].new_len_c == v[i].new_len_c && emitted_c[j]) done_before = true;
+                if (!done_before) {
+                    const uint32_t *lt = in + def[type[v[i].lenc]];
+                    bool wide = lt[2] == 64;
+                    out[w++] = ((wide ? 5u : 4u) << 16) | 43u;
+                    out[w++] = type[v[i].lenc];
+                    out[w++] = v[i].new_len_c;
+                    out[w++] = st->n;
+                    if (wide) out[w++] = 0;
+                }
+                emitted_c[i] = true;
+            }
+            out[w++] = (4u << 16) | 28u; out[w++] = v[i].new_atype; out[w++] = v[i].elem; out[w++] = v[i].new_len_c;
+            out[w++] = (4u << 16) | 32u; out[w++] = v[i].new_ptype; out[w++] = 4u; out[w++] = v[i].new_atype;
+        }
+        bool sgload = false;
+        for (uint32_t i = 0; op == 61 && len >= 4 && i < nsg; i++) sgload |= x[3] == sg[i];
+        if (sgload) { // OpLoad %uint %SubgroupSize -> OpCopyObject %uint %uint_1
+            out[w++] = (4u << 16) | 83u; out[w++] = x[1]; out[w++] = x[2]; out[w++] = one;
+        } else if (op == 337 || op == 346) { // Broadcast / ShuffleXor -> OpCopyObject <type> <value>
+            out[w++] = (4u << 16) | 83u; out[w++] = x[1]; out[w++] = x[2]; out[w++] = x[4];
+        } else {
+            memcpy(out + w, x, len * 4);
+            if (op == 246 && len >= 4) out[w + 3] &= ~1u;           // OpLoopMerge: Unroll off
+            for (uint32_t i = 0; op == 59 && i < nv; i++)           // the grown variable gets its new pointer type
+                if (v[i].grow && o == v[i].var_off) out[w + 1] = v[i].new_ptype;
+            w += len;
+            for (uint32_t i = 0; op == 71 && i < nv; i++)           // ArrayStride copied to the new array type
+                if (v[i].grow && v[i].stride_off == o) {
+                    out[w++] = (4u << 16) | 71u; out[w++] = v[i].new_atype; out[w++] = 6u; out[w++] = v[i].stride;
+                }
+        }
+        o += len;
+    }
+    out[3] = next;
+    // the wls-clamp-1 clamp on the rewritten module: every dynamic index into a Workgroup array <= the NEW length - 1
+    uint32_t cst[4];
+    size_t cb = 0;
+    uint32_t *clamped = spv_wls_clamp(out, w * 4, &cb, cst);
+    if (clamped) {
+        free(out);
+        out = clamped;
+        w = cb / 4;
+        st->clamped = cst[0];
+    }
+    *out_bytes = w * 4;
+    st->out_bytes = w * 4;
+    *why = NULL;
+done:
+    free(def);
+    free(type);
+    if (*why) { free(out); out = NULL; }
+    return out;
+}
+
+// One module through the fix (from compat_patch_spirv / the inline compute path): orig = the app's code (hash
+// filter), cur = the code so far. NULL = not listed or left as it is (logged).
+static uint32_t *wls_fix_module(const uint32_t *orig, size_t orig_bytes, const uint32_t *cur, size_t cur_bytes,
+                                size_t *out_bytes) {
+    uint32_t h = spv_hash(orig, orig_bytes);
+    if (!wls_fix_wanted(h)) return NULL;
+    struct WlsfStat st;
+    const char *why = NULL;
+    uint32_t *out = spv_wls_fix(cur, cur_bytes, out_bytes, &st, &why);
+    if (!out) {
+        atomic_fetch_add(&g_wlsf_left, 1);
+        if (atomic_fetch_add(&g_wlsf_left_logged, 1) < 64)
+            fprintf(stderr, "mali-compat: wls-fix: spv %08x left as it is: %s\n", h, why ? why : "?");
+        return NULL;
+    }
+    atomic_fetch_add(&g_wlsf_rewritten, 1);
+    if (atomic_fetch_add(&g_wlsf_logged, 1) < 64) {
+        char gl[160] = "";
+        for (uint32_t i = 0; i < st.grown; i++)
+            snprintf(gl + strlen(gl), sizeof gl - strlen(gl), "%s%u -> %u", i ? ", " : " (", st.old_len[i], st.n);
+        if (st.grown) snprintf(gl + strlen(gl), sizeof gl - strlen(gl), ")");
+        fprintf(stderr, "mali-compat: wls-fix: spv %08x rewritten: local size %u, SubgroupSize loads %u, ShuffleXor %u, "
+                "Broadcast %u, arrays grown %u%s, clamped chains %u, loops un-unrolled %u, %zu -> %zu B\n", h, st.n,
+                st.loads, st.shx, st.bcast, st.grown, gl, st.clamped, st.loops, st.in_bytes, st.out_bytes);
+    }
+    return out;
+}
+// END wls-fix-1
+
 static uint32_t *compat_patch_spirv(const uint32_t *inWords, size_t inBytes, size_t *pOutBytes) {
     uint32_t *out = compat_patch_spirv_impl(inWords, inBytes, pOutBytes);
     uint32_t *fixed = g_spv_fix ? spv_fix_u64_to_float(out ? out : inWords, out ? *pOutBytes : inBytes) : NULL;
@@ -482,6 +924,15 @@ static uint32_t *compat_patch_spirv(const uint32_t *inWords, size_t inBytes, siz
         if (!out) *pOutBytes = inBytes;
         free(out);
         out = fixed;
+    }
+    if (g_wls_fix) { // wls-fix-1: before the clamp, on the code so far; the hash filter uses the app's code
+        size_t fb = 0;
+        fixed = wls_fix_module(inWords, inBytes, out ? out : inWords, out ? *pOutBytes : inBytes, &fb);
+        if (fixed) {
+            *pOutBytes = fb;
+            free(out);
+            out = fixed;
+        }
     }
     if (g_wls_clamp) { // wls-clamp-1: last, on the code so far; the hash filter uses the app's code
         size_t wb = 0;
@@ -5942,10 +6393,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateComputePipelines(
     const uint32_t *wls_code[8];
     size_t wls_size[8];
     uint32_t *wls_new[8] = {0};
-    for (uint32_t i = 0; g_wls_clamp && i < createInfoCount && i < 8; i++) {
+    for (uint32_t i = 0; (g_wls_clamp || g_wls_fix) && i < createInfoCount && i < 8; i++) {
         VkShaderModuleCreateInfo *sm = (VkShaderModuleCreateInfo *)find_struct(pCreateInfos[i].stage.pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
-        size_t ob = 0;
-        if (sm && sm->pCode && (wls_new[i] = wls_clamp_module(sm->pCode, sm->codeSize, sm->pCode, sm->codeSize, &ob))) {
+        size_t ob = 0, fb = 0;
+        // wls-fix-1 first (hash of the app's code), then the clamp on its result (hash of the app's code as well)
+        uint32_t *wf = g_wls_fix && sm && sm->pCode ? wls_fix_module(sm->pCode, sm->codeSize, sm->pCode, sm->codeSize, &fb) : NULL;
+        if (wf && g_wls_clamp) {
+            uint32_t *wc = wls_clamp_module(sm->pCode, sm->codeSize, wf, fb, &ob);
+            if (wc) { free(wf); wf = wc; fb = ob; }
+        }
+        if (wf) ob = fb;
+        if (sm && sm->pCode && (wls_new[i] = wf ? wf : g_wls_clamp ? wls_clamp_module(sm->pCode, sm->codeSize, sm->pCode, sm->codeSize, &ob) : NULL)) {
             wls_sm[i] = sm;
             wls_code[i] = sm->pCode;
             wls_size[i] = sm->codeSize;
@@ -9970,6 +10428,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateInstance(
         g_async_threads = (uint32_t)atoi(getenv("MALI_COMPAT_ASYNC_THREADS"));
     g_spv_dontunroll = getenv("MALI_COMPAT_SPV_DONTUNROLL") && strcmp(getenv("MALI_COMPAT_SPV_DONTUNROLL"), "0") != 0;
     wls_clamp_init(); // MALI_COMPAT_WLS_CLAMP (wls-clamp-1)
+    wls_fix_init(); // MALI_COMPAT_WLS_FIX (wls-fix-1)
     g_xfb_vs = getenv("MALI_COMPAT_XFB_VS") && strcmp(getenv("MALI_COMPAT_XFB_VS"), "0") != 0;
     const char *deq = getenv("MALI_COMPAT_DEPTH_EQUAL");
     g_depth_equal_on = deq && (!strcmp(deq, "always") || !strcmp(deq, "lequal") || !strcmp(deq, "gequal"));
@@ -10087,6 +10546,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compat_CreateDevice(
     struct InstanceData *inst = get_instance_by_phys_dev(physicalDevice);
     dc_init(); // also here: a device created without this layer's vkCreateInstance (checks) still parses the key
     wls_clamp_init(); // same for MALI_COMPAT_WLS_CLAMP (pthread_once)
+    wls_fix_init(); // and MALI_COMPAT_WLS_FIX (wls-fix-1)
     sd_init(); // sync-diag keys (pthread_once)
     sal_init(); // MALI_COMPAT_SSBO_ALIGN_LOG (pthread_once)
     bcr_init(); // MALI_COMPAT_BCD_RING (pthread_once; before the pc2 log thread is started below)
@@ -10798,6 +11258,13 @@ static VKAPI_ATTR void VKAPI_CALL compat_DestroyDevice(
         if (d->fpDestroyDevice && device)
             d->fpDestroyDevice(device, pAllocator);
         if (g_addrmap) { ml_flush(); am_end("device destroy"); }
+        if (g_wls_fix) { // wls-fix-1 summary
+            char hl[16 * 9 + 1] = "";
+            for (uint32_t i = 0; i < g_wlsf_count; i++)
+                snprintf(hl + strlen(hl), sizeof hl - strlen(hl), "%s%08x", i ? "," : "", g_wlsf_hashes[i]);
+            fprintf(stderr, "mali-compat: wls-fix: VkDevice %p destroyed, modules %s, so far %llu rewritten / %llu left as they are\n",
+                    (void *)device, hl, (unsigned long long)atomic_load(&g_wlsf_rewritten), (unsigned long long)atomic_load(&g_wlsf_left));
+        }
         free(d->amf);
         d->amf = NULL;
     }
@@ -11190,7 +11657,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         if (!strcmp(pName, "vkGetAccelerationStructureDeviceAddressKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureDeviceAddressKHR;
         if (!strcmp(pName, "vkGetAccelerationStructureBuildSizesKHR")) return (PFN_vkVoidFunction)compat_GetAccelerationStructureBuildSizesKHR;
     }
-    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_ct || g_fail_log) MATCH_DEV(CreateComputePipelines);
+    if (g_gpu_time || g_dump_hash_count || g_pcache_on || g_dump_inflight || g_dc_on || g_wls_clamp || g_wls_fix || g_ct || g_fail_log) MATCH_DEV(CreateComputePipelines);
     if (g_fake_occlusion) {
         MATCH_DEV(CreateQueryPool);
         MATCH_DEV(DestroyQueryPool);
