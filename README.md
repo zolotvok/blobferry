@@ -284,8 +284,9 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 ## How it was made
 
 Most of the code, the tests and the debugging were done by AI coding agents, directed and tested on the phone by
-zolotvok: Claude Opus 5.5, Fable 5.1 and Claude Sonnet 5.5 (Anthropic), Gemini 3.8 Flash and Gemini 4 Argon (Google,
-the latter for reviews). Code comments carry a `[model]` tag where an agent wrote or changed something.
+zolotvok: Claude Opus 5.5, Claude Fable 5.1 / 5.2 and Claude Sonnet 5.5 (Anthropic), Gemini 3.8 Flash and Gemini 4
+Argon (Google; Argon wrote the DX12 ray tracing emulation, `src/compat/mali_rt_emu.h`, and did reviews) and GPT-6.1
+Codex (independent code reviews). Code comments carry a `[model]` tag where an agent wrote or changed something.
 
 ## License
 
