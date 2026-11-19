@@ -4,7 +4,7 @@
 # layer) and adds the "options" array from src/compat/options.json (every switch the bridge honours: type, default,
 # allowed values, category, status, description, games, min_layer). Shipped as usr/share/blobferry/capabilities.json;
 # the DroidDeck app reads it to show the switch status and the selectable options.
-# Flip "rt_pipeline"/"dxr" in the .in file when the emulation lands (keep rt_pipeline_emulation_available() in step).
+# "rt_pipeline"/"dxr" in the .in file say "supported" (the RT pipeline emulation, MALI_COMPAT_RT_PIPELINE, is in the layer; keep them in step with rt_pipeline_emulation_available()).
 # Keep options.json in step with the code: test/options-drift-check.sh fails when they differ.
 set -eu
 B=$(cd "$(dirname "$0")" && pwd)
