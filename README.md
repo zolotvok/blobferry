@@ -15,12 +15,18 @@ Mali system driver: "Steam and gamescope on it too") runs the whole session on B
 Picture complete and responsive, Oblivion launched from it and ran its menu at ~92 FPS. See
 [Session on the vendor driver](#session-on-the-vendor-driver).
 
-**Using it:** DroidDeck from the fork, version 0.4.0-mali.1 or newer, bundles Blobferry. On a Mali phone it installs
-the files into its Linux runtime at every session start, and "Mali system driver (bridge)" appears on its Runtime
-driver page. No adb or zip import is needed. The steps below are for building and testing Blobferry itself.
+**Using it:** the "DroidDeck Blobferry" APK from the fork (app id `com.droiddeck.launcher.blobferry`, version
+0.6.9-mali.2 or newer) bundles Blobferry. On a Mali phone it installs the files into its Linux runtime at every session
+start, and "Mali system driver (bridge)" appears on its Runtime driver page. No adb or zip import is needed. The steps
+below are for building and testing Blobferry itself.
 
-**Download:** [v0.2.0 pre-release](https://github.com/zolotvok/blobferry/releases/tag/v0.2.0): the DroidDeck Mali APK
-(bundles Blobferry 8c3863e) and the Blobferry zip, each with a `.sha256`.
+**Download:** [v0.3.0](https://github.com/zolotvok/blobferry/releases/tag/v0.3.0):
+- `droiddeck-blobferry-release.apk`: the release APK, app id `com.droiddeck.launcher.blobferry`, label "DroidDeck
+  Blobferry". It installs side by side with the official DroidDeck and with MaliBridge.
+- `blobferry-0.3.0.zip`: the Blobferry package on its own.
+
+Each file comes with a `.sha256`. If you already run Blobferry from the v0.2.0 release, update it in the app with
+"Check for updates".
 
 ## How it works
 
