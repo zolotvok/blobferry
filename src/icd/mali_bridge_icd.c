@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Khronos ICD shim over the phone's Android Vulkan HAL, loaded in process with libhybris. [Claude Sonnet 5.5]
-// Env: MALI_BRIDGE_DEBUG=1 logs to stderr; MALI_BRIDGE_HAL=<path> overrides /vendor/lib64/hw/vulkan.mali.so.
+// Env: MALI_BRIDGE_DEBUG=1 logs to stderr; MALI_BRIDGE_HAL=<path> overrides the HAL lookup; MALI_BRIDGE_HAL_NAMES
+// (comma list of "<property>=<name>" or "<name>", set by the app from ro.hardware.vulkan, ro.board.platform,
+// ro.hardware) names the vulkan.<name>.so files to try before "mali" and a directory scan (hal_find below).
+#include <dirent.h>
 #include <dlfcn.h>
+#include <fnmatch.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <vulkan/vulkan.h>
 
 void *hybris_dlopen(const char *filename, int flag);
@@ -58,20 +63,176 @@ static PFN_vkGetDeviceProcAddr g_real_get_device_proc_addr;
 static void *g_dummy_dispatch_table[512]; // 4096 bytes zero-initialized
 static PFN_vkCreateDevice g_real_create_device;
 static PFN_vkCreateImage g_real_create_image;
+// HAL lookup, logged ALWAYS (one line per chosen or rejected candidate) so a session log shows which file was used.
+// Names like Android's loader (vulkan.<ro.hardware.vulkan>.so, then vulkan.<ro.board.platform>.so): MALI_BRIDGE_HAL if the
+// file exists; each MALI_BRIDGE_HAL_NAMES entry, then "mali", each in /vendor/lib64/hw, then /odm/lib64/hw (vendor first,
+// unlike Android's odm-first sphal order: it keeps the tested pick on phones whose vendor dir has the file); last, every
+// vulkan.?*.so in those dirs (sorted). A candidate is taken when hybris_dlopen succeeds, HMI resolves with an open method
+// and open("vk0") succeeds (an open failure of a module with id "vulkan" ends the lookup, as before); scanned files must
+// also carry the module id "vulkan". Rejected handles stay loaded (dlclose of
+// vendor libs is unsafe here). `root` prefixes the two system dirs (tests only; "" in production).
+#define HAL_LOG(fmt, ...) fprintf(stderr, "mali-bridge: " fmt "\n", ##__VA_ARGS__)
+#define HAL_NAME_MAX 64   // a name or property key, NUL included
+#define HAL_PATH_MAX 512
+#define HAL_MAX_NAMES 8
+#define HAL_MAX_SCAN 32   // per dir
+#define HAL_MAX_TRIED (1 + 2 * (HAL_MAX_NAMES + 1) + 2 * HAL_MAX_SCAN)
+static const char *const k_hal_dirs[] = {"/vendor/lib64/hw", "/odm/lib64/hw"};
+static char g_hal_tried[HAL_MAX_TRIED][HAL_PATH_MAX];
+static int g_hal_ntried;
+static char g_hal_path[HAL_PATH_MAX];
+static char g_hal_found[HAL_MAX_SCAN][256];
+static bool g_hal_stop;
+
+static bool hal_name_ok(const char *s, size_t n) {
+    if (n == 0 || n >= HAL_NAME_MAX) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+            return false;
+    }
+    return true;
+}
+
+// Tries one file; returns the opened device or NULL. Each path is tried once per lookup.
+static hwvulkan_device_t *hal_try(const char *path, const char *via, bool need_id) {
+    if (g_hal_stop) return NULL;
+    for (int i = 0; i < g_hal_ntried; i++)
+        if (strcmp(g_hal_tried[i], path) == 0) return NULL;
+    if (g_hal_ntried < HAL_MAX_TRIED) snprintf(g_hal_tried[g_hal_ntried++], HAL_PATH_MAX, "%s", path);
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        HAL_LOG("vendor HAL candidate rejected: %s (via %s): not a file", path, via);
+        return NULL;
+    }
+    void *h = hybris_dlopen(path, RTLD_NOW);
+    if (!h) {
+        const char *e = hybris_dlerror();
+        HAL_LOG("vendor HAL candidate rejected: %s (via %s): dlopen failed: %.200s", path, via, e ? e : "?");
+        return NULL;
+    }
+    hw_module_t *mod = hybris_dlsym(h, "HMI");
+    if (!mod || !mod->methods || !mod->methods->open) {
+        HAL_LOG("vendor HAL candidate rejected: %s (via %s): no HMI symbol with an open method (left loaded)", path, via);
+        return NULL;
+    }
+    bool id_ok = mod->id && strcmp(mod->id, "vulkan") == 0;
+    if (!id_ok && need_id) {
+        HAL_LOG("vendor HAL candidate rejected: %s (via %s): HMI id is \"%.40s\", not \"vulkan\" (left loaded)", path, via,
+                mod->id ? mod->id : "(null)");
+        return NULL;
+    }
+    hw_device_t *d = NULL;
+    int rc = mod->methods->open(mod, "vk0", &d);
+    if (rc != 0 || !d) {
+        // A real Vulkan HAL that loads but cannot open: stop here (as before) instead of loading a second vendor driver.
+        HAL_LOG("vendor HAL candidate rejected: %s (via %s): open(vk0) rc=%d (left loaded)%s", path, via, rc,
+                id_ok ? "; stopping the lookup" : "");
+        if (id_ok) g_hal_stop = true;
+        return NULL;
+    }
+    HAL_LOG("vendor HAL: %s (via %s)%s", path, via, id_ok ? "" : " [HMI id is not \"vulkan\"]");
+    snprintf(g_hal_path, sizeof g_hal_path, "%s", path);
+    LOG("HAL opened: %s (%s)", mod->name ? mod->name : "?", path);
+    return (hwvulkan_device_t *)d;
+}
+
+static hwvulkan_device_t *hal_try_name(const char *root, const char *name, const char *via) {
+    char path[HAL_PATH_MAX];
+    for (size_t d = 0; d < sizeof k_hal_dirs / sizeof *k_hal_dirs; d++) {
+        int n = snprintf(path, sizeof path, "%s%s/vulkan.%s.so", root, k_hal_dirs[d], name);
+        if (n <= 0 || (size_t)n >= sizeof path) continue;
+        hwvulkan_device_t *dev = hal_try(path, via, false);
+        if (dev) return dev;
+    }
+    return NULL;
+}
+
+static int hal_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+
+static hwvulkan_device_t *hal_find(const char *root) {
+    g_hal_ntried = 0;
+    g_hal_path[0] = 0;
+    g_hal_stop = false;
+    hwvulkan_device_t *dev;
+    const char *env = getenv("MALI_BRIDGE_HAL");
+    if (env && *env && (dev = hal_try(env, "MALI_BRIDGE_HAL", false))) return dev;
+
+    // Named candidates: "<key>=<name>" or "<name>", invalid entries skipped (no '/', bounded length).
+    char names[HAL_MAX_NAMES + 1][HAL_NAME_MAX], vias[HAL_MAX_NAMES + 1][2 * HAL_NAME_MAX];
+    int nn = 0;
+    const char *list = getenv("MALI_BRIDGE_HAL_NAMES");
+    for (const char *p = list ? list : ""; *p;) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        const char *eq = memchr(p, '=', len);
+        const char *nm = eq ? eq + 1 : p;
+        size_t nlen = len - (size_t)(nm - p), klen = eq ? (size_t)(eq - p) : 0;
+        if (hal_name_ok(nm, nlen) && (!eq || hal_name_ok(p, klen))) {
+            bool dup = false;
+            for (int i = 0; i < nn; i++)
+                if (strlen(names[i]) == nlen && memcmp(names[i], nm, nlen) == 0) dup = true;
+            if (!dup && nn == HAL_MAX_NAMES) {
+                HAL_LOG("vendor HAL: more than %d MALI_BRIDGE_HAL_NAMES entries, ignoring \"%.*s\"", HAL_MAX_NAMES, (int)len, p);
+            } else if (!dup) {
+                memcpy(names[nn], nm, nlen);
+                names[nn][nlen] = 0;
+                if (eq) snprintf(vias[nn], sizeof vias[nn], "%.*s=%s", (int)klen, p, names[nn]);
+                else snprintf(vias[nn], sizeof vias[nn], "MALI_BRIDGE_HAL_NAMES=%s", names[nn]);
+                nn++;
+            }
+        } else if (len) {
+            HAL_LOG("vendor HAL: ignoring MALI_BRIDGE_HAL_NAMES entry \"%.*s\"", (int)(len < 80 ? len : 80), p);
+        }
+        p = end ? end + 1 : p + len;
+    }
+    bool have_mali = false;
+    for (int i = 0; i < nn; i++)
+        if (strcmp(names[i], "mali") == 0) have_mali = true;
+    if (!have_mali) {
+        strcpy(names[nn], "mali");
+        strcpy(vias[nn], "built-in default");
+        nn++;
+    }
+    for (int i = 0; i < nn; i++)
+        if ((dev = hal_try_name(root, names[i], vias[i]))) return dev;
+    if (g_hal_stop) return NULL;
+
+    // Last resort: every vulkan.?*.so in the two dirs, sorted, at most HAL_MAX_SCAN each. Loading an unknown file runs
+    // its constructors, so this only runs when no named file worked.
+    for (size_t d = 0; d < sizeof k_hal_dirs / sizeof *k_hal_dirs; d++) {
+        char dir[HAL_PATH_MAX], via[HAL_PATH_MAX + 16];
+        int n = snprintf(dir, sizeof dir, "%s%s", root, k_hal_dirs[d]);
+        if (n <= 0 || (size_t)n >= sizeof dir) continue;
+        DIR *dp = opendir(dir);
+        if (!dp) continue;
+        int nf = 0;
+        struct dirent *e;
+        while ((e = readdir(dp)) != NULL) {
+            if (fnmatch("vulkan.?*.so", e->d_name, 0) != 0 || strlen(e->d_name) >= sizeof g_hal_found[0]) continue;
+            if (nf == HAL_MAX_SCAN) { HAL_LOG("vendor HAL: more than %d files in %s, rest not scanned", HAL_MAX_SCAN, dir); break; }
+            snprintf(g_hal_found[nf++], sizeof g_hal_found[0], "%s", e->d_name);
+        }
+        closedir(dp);
+        if (nf == 0) continue;
+        qsort(g_hal_found, (size_t)nf, sizeof g_hal_found[0], hal_cmp);
+        snprintf(via, sizeof via, "scan of %s", k_hal_dirs[d]);
+        HAL_LOG("vendor HAL: no named file worked, scanning %s (%d files; last resort)", dir, nf);
+        for (int i = 0; i < nf; i++) {
+            char path[HAL_PATH_MAX];
+            n = snprintf(path, sizeof path, "%s/%s", dir, g_hal_found[i]);
+            if (n <= 0 || (size_t)n >= sizeof path) continue;
+            if ((dev = hal_try(path, via, true))) return dev;
+        }
+    }
+    HAL_LOG("vendor HAL: none found (%d candidates tried); set MALI_BRIDGE_HAL=<path> or send the session log", g_hal_ntried);
+    return NULL;
+}
+
 static void hal_init(void) {
     g_debug = getenv("MALI_BRIDGE_DEBUG") != NULL;
     setenv("HYBRIS_USE_VENDOR_NAMESPACE", "1", 0);
-    const char *path = getenv("MALI_BRIDGE_HAL");
-    if (!path || !*path) path = "/vendor/lib64/hw/vulkan.mali.so";
-    void *h = hybris_dlopen(path, RTLD_NOW);
-    if (!h) { LOG("hybris_dlopen(%s) failed: %s", path, hybris_dlerror()); return; }
-    hw_module_t *mod = hybris_dlsym(h, "HMI");
-    if (!mod || !mod->methods) { LOG("no HMI in %s", path); return; }
-    hw_device_t *d = NULL;
-    int rc = mod->methods->open(mod, "vk0", &d);
-    if (rc != 0 || !d) { LOG("open(vk0) rc=%d", rc); return; }
-    g_dev = (hwvulkan_device_t *)d;
-    LOG("HAL opened: %s (%s)", mod->name, path);
+    g_dev = hal_find("");
 }
 
 static hwvulkan_device_t *dev(void) {

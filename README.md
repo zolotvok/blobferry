@@ -295,7 +295,8 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 | Switch | Effect |
 |---|---|
 | `MALI_BRIDGE_DEBUG=1` | ICD shim logs to stderr |
-| `MALI_BRIDGE_HAL=<path>` | load another HAL instead of `/vendor/lib64/hw/vulkan.mali.so` |
+| `MALI_BRIDGE_HAL=<path>` | load this HAL file (if it exists) instead of the lookup below |
+| `MALI_BRIDGE_HAL_NAMES=<list>` | set by the app: comma list of `ro.hardware.vulkan=<name>`, `ro.board.platform=<name>`, `ro.hardware=<name>`. The ICD tries `vulkan.<name>.so` for each, then `vulkan.mali.so`, each in `/vendor/lib64/hw` and then `/odm/lib64/hw` (vendor first, unlike Android's loader), then every `vulkan.*.so` there; a file counts once it loads and opens (a Vulkan HAL that loads but fails to open ends the lookup). It always logs the chosen file and each rejected one (`mali-bridge: vendor HAL: ...`) |
 | `MALI_COMPAT_DEBUG=1`, `MALI_COMPAT_STATS=1` | compat layer logging and counters (`STATS=every`: report on every BC upload instead of every 5 s) |
 | `MALI_WSI_NO_10BIT=1` | hide 10-bit surface formats |
 | `MALI_COMPAT_GPU_TIME=1` | GPU profiler: top passes/dispatches every 5 s, compile times, and STUCK lines for hangs in `/root/mali-gputime-<thread>.txt` |
