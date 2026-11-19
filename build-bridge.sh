@@ -109,7 +109,7 @@ EOF3
     adb shell "run-as com.droiddeck.launcher sh -c 'cat > $D/meta.json'" <<'EOF3'
 {"schemaVersion": 1, "kind": "linux-vulkan-icd", "name": "Mali system driver (bridge)", "driverVersion": "v1.r54p1", "libc": "glibc", "minGlibc": "2.36", "sourceLibraryName": "libvulkan_mali_bridge.so"}
 EOF3
-    echo "$(date +%H:%M) bridge: install $D (shim + icd.json + meta.json) into the app's Linux driver dir; remove with: adb shell run-as com.droiddeck.launcher rm -r $D" >> "$B/../adb-device-changes.txt"
+    echo "$(date +%H:%M) bridge: install $D (shim + icd.json + meta.json) into the app's Linux driver dir; remove with: adb shell run-as com.droiddeck.launcher sh -c \"rm -f -- $D/libvulkan_mali_bridge.so $D/icd.json $D/meta.json $D/.dev; rmdir $D\"" >> "$B/../adb-device-changes.txt"   # delete-lint: ok (undo text; exact names, no rm -r)
     adb shell "run-as com.droiddeck.launcher ls -l $D" ;;
   deploy)
     tar -C "$OUT/stage" -cf "$OUT/mali_bridge.tar" usr

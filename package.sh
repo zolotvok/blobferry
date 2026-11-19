@@ -76,7 +76,8 @@ adb shell "run-as $P sh -c 'cat > files/linux_vulkan_drivers/Mali_Bridge/icd.jso
 {"file_format_version": "1.0.0", "ICD": {"library_path": "/data/user/0/$P/files/linux_vulkan_drivers/Mali_Bridge/libvulkan_mali_bridge.so", "api_version": "1.3.0"}}
 J
 unzip -p "$D/Mali_Bridge.zip" meta.json | adb shell "run-as $P sh -c 'cat > files/linux_vulkan_drivers/Mali_Bridge/meta.json'"
-adb shell "rm -r $T"
+# exact names only, no rm -r (hardened-delete rule 11-12): the two files pushed above, then rmdir (fails if anything else is in there)
+adb shell 'rm -f -- /data/local/tmp/blobferry/rootfs.tar /data/local/tmp/blobferry/libvulkan_mali_bridge.so; rmdir /data/local/tmp/blobferry 2>/dev/null; true'
 rm -f /tmp/blobferry-rootfs.tar
 echo "Installed. In DroidDeck: Components > Runtime driver > Mali system driver (bridge), then start a session."
 EOF
