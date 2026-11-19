@@ -79,6 +79,10 @@ used unchanged as build headers for libhybris. Apache-2.0 is compatible with GPL
 The vendor Mali Vulkan driver (`/vendor/lib64/hw/vulkan.mali.so`) is proprietary. Blobferry loads it from the
 phone at run time and never ships, copies or redistributes it.
 
+`docs/screenshots/` holds screenshots of running third-party games (Quake II RTX, The Witcher 3, Control, Resident Evil
+Village, Watch Dogs). They only document what runs through the bridge. The games, their artwork and their names belong to
+their owners; no game files are included, and no endorsement is implied.
+
 ## Prior art
 
 Running the phone's vendor Vulkan driver from a glibc Linux guest through libhybris is what tawc and

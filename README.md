@@ -62,6 +62,36 @@ Most of these are opt-in, see [Switches](#switches).
 The layer is implicit and turns on only with `ENABLE_MALI_COMPAT=1` (the DroidDeck fork sets it for bridge games and for
 the session on Blobferry).
 
+## Screenshots
+
+Frames from real runs on a vivo X300 Pro (Dimensity 9500, Mali-G1-Ultra) through the bridge. The bar at the top is DroidDeck's
+performance overlay; the round buttons are its on-screen gamepad. The fps in each caption is the measured run average named
+there, not the number the overlay shows in that single frame.
+
+![Quake II RTX, ray tracing on](docs/screenshots/quake2rtx-rt-corridor.jpg)
+
+*Quake II RTX (native Linux build under FEX, Vulkan), ray tracing on (hardware ray queries, `ray_tracing_api query`): 29-30 fps with dynamic resolution scaling (`drs_target 45`), first-light recording 2026-11-07 12:44; about 13 fps at a fixed 1600x720 without scaling (q2rtx-gap-1112, 2026-11-12). vivo X300 Pro, Dimensity 9500.*
+
+![Quake II RTX, ray tracing on, another room](docs/screenshots/quake2rtx-rt-room.jpg)
+
+*Quake II RTX (Vulkan), ray tracing on, same first-light recording (2026-11-07 12:44), 29-30 fps with dynamic resolution scaling. vivo X300 Pro, Dimensity 9500.*
+
+![The Witcher 3 with ray tracing](docs/screenshots/witcher3-dx12-rtx-on.jpg)
+
+*The Witcher 3 (current release, DX12 via vkd3d-proton), DXR ray tracing on (emulated ray tracing pipeline, `MALI_COMPAT_RT_PIPELINE=1`): 11.6 fps average (run w3-rt-1116 R4, 2026-11-16); the same settings with ray tracing off: 38.6 fps (R5). vivo X300 Pro, Dimensity 9500.*
+
+![Control](docs/screenshots/control-low-oldest-house.jpg)
+
+*Control (DX12 via vkd3d-proton), ray tracing off, Low preset: 28.9 fps average (release-gate-1115 R1, 2026-11-15). vivo X300 Pro, Dimensity 9500.*
+
+![Resident Evil Village](docs/screenshots/re-village-house.jpg)
+
+*Resident Evil Village (DX12 via vkd3d-proton), ray tracing off: 30.0 fps average, a 30 fps cap in this scene (release-gate-1115 R3, 2026-11-15). vivo X300 Pro, Dimensity 9500.*
+
+![Watch Dogs](docs/screenshots/watchdogs-street.jpg)
+
+*Watch Dogs (DX11 via DXVK), no ray tracing: 39.4 fps average (release-bisect-1116 R12, 2026-11-16). vivo X300 Pro, Dimensity 9500.*
+
 ## Status
 
 State on 2026-11-06, from the measurements up to 2026-11-06 (one phone, one person testing). Every FPS figure carries its
