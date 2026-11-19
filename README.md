@@ -308,7 +308,9 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 ## Repository layout
 
 - `src/icd/`: ICD shim
-- `src/compat/`: compat layer; `bc/` holds the BC decode shaders and their generated SPIR-V headers
+- `src/compat/`: compat layer; `mali_compat_layer.c` is the one translation unit and includes the `cl_*.h` parts in order
+  (`cl_diag_*.h` = diagnostics) and `mali_rt_emu.h`, which includes the `rt_*.h` parts; `bc/` holds the BC decode
+  shaders and their generated SPIR-V headers
 - `patches/vulkan-wsi-layer/`: changes to the Arm WSI layer (`*.patch` are applied by `build-wsi.sh` in name order, `*-staged` variants are held back)
 - `patches/libhybris/`: change to libhybris (race-free lazy init of static bionic locks), see [NOTICE.md](NOTICE.md)
 - `patches/wine/`: a source patch for Wine's ntdll (async I/O status block written after its memory was freed, seen with Watch Dogs 2); written without a Wine tree at hand, not built or tested, not applied by anything here
@@ -321,7 +323,7 @@ Environment variables, read when a process creates its Vulkan instance. Unset or
 
 Most of the code, the tests and the debugging were done by AI coding agents, directed and tested on the phone by
 zolotvok: Claude Opus 5.5, Claude Fable 5.1 / 5.2 and Claude Sonnet 5.5 (Anthropic), Gemini 3.8 Flash and Gemini 4
-Argon (Google; Argon wrote the DX12 ray tracing emulation, `src/compat/mali_rt_emu.h`, and did reviews) and GPT-6.1
+Argon (Google; Argon wrote the DX12 ray tracing emulation, `src/compat/mali_rt_emu.h` + `rt_*.h`, and did reviews) and GPT-6.1
 Codex (independent code reviews). Code comments carry a `[model]` tag where an agent wrote or changed something.
 
 ## License
