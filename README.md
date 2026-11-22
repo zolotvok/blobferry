@@ -20,7 +20,7 @@ Picture complete and responsive, Oblivion launched from it and ran its menu at ~
 start, and "Mali system driver (bridge)" appears on its Runtime driver page. No adb or zip import is needed. The steps
 below are for building and testing Blobferry itself.
 
-**Download:** [v0.3.4](https://github.com/zolotvok/blobferry/releases/tag/v0.3.4) (replaces the withdrawn v0.3.3: the report zip no longer carries Steam account ids). Files:
+**Download:** [v0.3.5](https://github.com/zolotvok/blobferry/releases/tag/v0.3.5) (games added from a USB stick or SD card now see their whole folder; v0.3.3 stays withdrawn, v0.3.4 fixed its report zip). Files:
 - `droiddeck-blobferry-release.apk`: the release APK, app id `com.droiddeck.launcher.blobferry`, label "DroidDeck
   Blobferry". It installs side by side with the official DroidDeck and with MaliBridge.
 - `blobferry-0.3.1-rc1.zip`: the Blobferry package on its own.
